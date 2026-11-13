@@ -430,7 +430,7 @@ def get_reply(m: dict) -> str:
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 TUI_FOOTER = re.compile(
-    r"(?:✻ Sautéed for (?:\d+[hms]\s*)+· done \d{1,2}:\d{2} (?:AM|PM)"
+    r"(?:✻ [^\W\d_]+ for (?:\d+[hms]\s*)+· done \d{1,2}:\d{2} (?:AM|PM)"
     r"|Worked for (?:\d+[hms]\s*)+• \d{2}:\d{2})"
 )
 

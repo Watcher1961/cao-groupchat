@@ -233,7 +233,11 @@ class CleanOutputTests(ServerTestCase):
                 self.assertEqual(self.server.clean_output(text), "正文")
 
     def test_removes_real_claude_tui_footer(self):
-        self.assertEqual(self.server.clean_output("已完成\n\n✻ Sautéed for 1m 8s · done 3:26 AM"), "已完成")
+        for verb, duration in (("Sautéed", "1m 8s"), ("Cooked", "2m 3s"),
+                               ("Brewed", "3s"), ("Churned", "1m"), ("Cogitated", "1m 33s")):
+            with self.subTest(verb=verb):
+                text = f"已完成\n\n✻ {verb} for {duration} · done 3:26 AM"
+                self.assertEqual(self.server.clean_output(text), "已完成")
 
     def test_removes_real_codex_tui_footer(self):
         self.assertEqual(self.server.clean_output("已完成\nWorked for 4m 55s • 03:19"), "已完成")
@@ -246,6 +250,11 @@ class CleanOutputTests(ServerTestCase):
     def test_preserves_prose_quotes_code_and_non_trailing_footer_examples(self):
         for text in (
             "Worked for a client yesterday", "✻ Sautéed vegetables for dinner",
+            "✻ Cooked for a client yesterday",
+            "✻ Slow Cooked for 2m 3s · done 3:26 AM",
+            "✻ Cooked2 for 2m 3s · done 3:26 AM",
+            "✻ Cooked for 2m 3s · done 3:26 AM\n这里还有正文",
+            "```text\n✻ Brewed for 3s · done 3:26 AM\n```",
             "示例：Worked for 4m 55s • 03:19",
             "Worked for 4m 55s • 03:19\n这里还有正文",
             "```text\nWorked for 4m 55s • 03:19\n```",
