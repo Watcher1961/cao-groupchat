@@ -437,35 +437,45 @@ def delivery_lock(g: dict, m: dict):
         return delivery_locks.setdefault((g["id"], m["id"]), threading.RLock())
 
 
+# CAO's composer extractor treats Try "..." as empty input, including dim ANSI.
 CLAUDE_INPUT_BOX = re.compile(
-    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n"
-    r"(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}", re.M)
+    r'─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯]'
+    r'(?:[ \t\xa0]+Try "[^"\n]*")?[ \t\xa0]*\n'
+    r'(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}', re.M)
 CODEX_READY_FOOTER = re.compile(r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[~/])")
 
 
-def member_ready(m: dict, terminal: dict) -> bool:
+def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bool:
     tid = m.get("terminal_id")
     if not tid:
         return False
     if m.get("ready_terminal") == tid:
         return True
-    if str(terminal.get("status", "")).lower() not in DONE:
+    status = str(terminal.get("status", "")).lower()
+    if status not in DONE:
         m.pop("ready_candidate", None)
         return False
-    raw = get_full_output(m)
-    tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
-    provider = m.get("provider")
-    states = codex_states(raw)
-    if provider == "codex":
-        positive = bool(CODEX_READY_FOOTER.search(tail)) and not (states and states[-1] == "working")
-    elif provider == "claude_code":
-        positive = bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+    if allow_status_only:
+        # Only an explicit retry of a startup timeout may waive the feature gate.
+        # Keep two observations, stable status and the minimum elapsed interval.
+        fingerprint = "manual-status:" + status
     else:
-        positive = bool(tail.strip())
-    if not positive:
-        m.pop("ready_candidate", None)
-        return False
-    fingerprint = hashlib.sha256(tail.encode()).hexdigest()
+        raw = get_full_output(m)
+        tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
+        provider = m.get("provider")
+        states = codex_states(raw)
+        if provider == "codex":
+            positive = bool(CODEX_READY_FOOTER.search(tail)) and not (states and states[-1] == "working")
+        elif provider == "claude_code":
+            legacy = (not re.search(r"─{8,}", tail) and
+                      re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+            positive = bool(CLAUDE_INPUT_BOX.search(tail) or legacy)
+        else:
+            positive = bool(tail.strip())
+        if not positive:
+            m.pop("ready_candidate", None)
+            return False
+        fingerprint = hashlib.sha256(tail.encode()).hexdigest()
     candidate = m.get("ready_candidate", {})
     now = time.time()
     if candidate.get("terminal") != tid or candidate.get("hash") != fingerprint:
@@ -476,6 +486,16 @@ def member_ready(m: dict, terminal: dict) -> bool:
     m["ready_terminal"] = tid
     m.pop("ready_candidate", None)
     return True
+
+
+def runtime_notice(g: dict, m: dict, text: str, exc: Exception) -> None:
+    # add_msg appends in memory before saving; a broken disk must not hide the
+    # recovery state or kill polling. Do not log exception bodies or chat text.
+    print(f"group={g['id']} member={m['id']} error={type(exc).__name__}", flush=True)
+    try:
+        add_msg(g, "system", "系统", text, log=False)
+    except Exception as persist_error:
+        print(f"group={g['id']} member={m['id']} persistence_error={type(persist_error).__name__}", flush=True)
 
 
 def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> None:
@@ -509,7 +529,7 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
                     ready = True
                 elif m.get("terminal_id"):
                     observation = terminal if terminal is not None else cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
-                    ready = member_ready(m, observation)
+                    ready = member_ready(m, observation, allow_status_only=queue[0].get("status_only_retry", False))
                 else:
                     ready = False
             except CaoError:
@@ -547,14 +567,15 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> None:
         # Fresh statuses belong to this dispatch only above CAO's boundary.
         m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
         m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
-    except CaoError as e:
-        ambiguous = attempted and (e.status == 0 or e.status >= 500)
+        save_state()
+    except Exception as e:
+        ambiguous = attempted and (not isinstance(e, CaoError) or e.status == 0 or e.status >= 500)
         m.update(pending=ambiguous, delivery_state="uncertain" if ambiguous else "failed",
                  delivery_warned=True, sent_at=time.time(), last_progress_at=time.time(),
                  delivery_started=False)
         note = "可能未送达，可重发（也可能已送达，请先核对终端）" if ambiguous else "投递失败，可重试"
-        add_msg(g, "system", "系统", f"发给 {m['name']} 失败：{e}；{note}。", log=False)
-    save_state()
+        detail = str(e) if isinstance(e, CaoError) else type(e).__name__
+        runtime_notice(g, m, f"发给 {m['name']} 失败：{detail}；{note}。", e)
 
 
 def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
@@ -601,6 +622,8 @@ def retry_delivery(g: dict, m: dict, token: dict) -> None:
         if (m.get("delivery_state") not in ("uncertain", "failed", "not_ready") or not job
                 or token.get("delivery_id") != job["id"] or token.get("delivery_attempt") != job["attempt"]):
             raise ValueError("投递状态已改变，请刷新后再试")
+        if m.get("delivery_state") == "not_ready":
+            job["status_only_retry"] = True
         if m.get("active_delivery"):
             m.setdefault("outbox", []).insert(0, job)
         job["queued_at"] = time.time()
@@ -777,6 +800,10 @@ def poll_member(g: dict, m: dict) -> None:
                 pass
         return  # This observation predates any new dispatch.
     if m.get("delivery_state") == "dispatching":
+        # Polling owns this member's lock, so a live dispatch cannot be running.
+        m.update(delivery_state="uncertain", delivery_warned=True)
+        runtime_notice(g, m, f"{m['name']} 的投递未正常结束，消息可能未送达。请核对终端后重发。",
+                       RuntimeError("interrupted dispatch"))
         return
     if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
         m["status"] = "processing"
@@ -820,9 +847,23 @@ def poll_loop() -> None:
                         if m.get("terminal_id") or m.get("outbox") or m.get("active_delivery")]
         for g, m in snapshot:
             with delivery_lock(g, m):
-                poll_member(g, m)
+                try:
+                    poll_member(g, m)
+                    m.pop("poll_error_type", None)
+                except Exception as e:
+                    if m.get("active_delivery"):
+                        m["delivery_state"] = "uncertain"
+                    elif m.get("outbox"):
+                        m.update(delivery_state="not_ready", pending=False)
+                    if m.get("poll_error_type") != type(e).__name__:
+                        m["poll_error_type"] = type(e).__name__
+                        runtime_notice(g, m, f"{m['name']} 的状态更新失败（{type(e).__name__}）；"
+                                       "投递可能未送达，请核对终端后重试。", e)
         if snapshot:
-            save_state()
+            try:
+                save_state()
+            except Exception as e:
+                print(f"state_persistence_error={type(e).__name__}", flush=True)
 
 
 # ───────────────────────── 业务操作 ─────────────────────────

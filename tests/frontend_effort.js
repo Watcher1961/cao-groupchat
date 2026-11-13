@@ -70,6 +70,10 @@ const cases = {
     assert.equal(context.retryCall[2].delivery_attempt,1);
     run('S.group.members[0].delivery_state="waiting_ready";S.group.members[0].pending=false');
     assert.equal(run('statusOf(S.group.members[0]).st'),"waiting_ready");
+    run('S.group.members[0].delivery_state="not_ready";ask=text=>{globalThis.retryPrompt=text;return true}');
+    await run('retryDelivery("dev")');
+    assert.match(context.retryPrompt,/空闲/);
+    assert.match(context.retryPrompt,/确认.*CLI.*可输入/);
   },
   choices() {
     for (const [provider, allowed] of [["codex", ["", "low", "medium", "high", "xhigh"]],

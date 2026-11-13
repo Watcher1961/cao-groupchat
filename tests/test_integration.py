@@ -351,6 +351,28 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([m["text"] for m in self.wait_replies(1)],["迟到的本轮回复"])
         self.assertEqual(len(self.terminal(tid)["inputs"]),1)
 
+    def test_unrecognized_prompt_has_an_explicit_manual_retry_exit(self):
+        self.http(self.cao_url,"POST","/_test/config",{"startup_hold":True})
+        self.create_group()
+        member=self.api("POST","/members",{"name":"评审","provider":"claude_code"})
+        original="@评审 未知输入框的原消息"
+        self.api("POST","/messages",{"text":original})
+        tid=self.until("unknown prompt terminal allocated",lambda:self.api("GET")["members"][0]["terminal_id"])
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready",{"prompt":"unrecognized localized input"})
+        self.until("unknown feature startup timeout",lambda:self.api("GET")["members"][0].get("delivery_state")=="not_ready")
+        blocked=self.api("GET")["members"][0]
+        self.assertEqual(self.terminal(tid)["inputs"],[])
+        self.next_turn(tid,"人工兜底完成",complete_on_input=True)
+        token={"delivery_id":blocked["delivery_id"],"delivery_attempt":blocked["delivery_attempt"]}
+        self.api("POST",f"/members/{member['id']}/retry",token)
+        with self.assertRaises(error.HTTPError) as stale:
+            self.api("POST",f"/members/{member['id']}/retry",token)
+        self.assertEqual(stale.exception.code,400)
+        stale.exception.close()
+        self.assertEqual([m["text"] for m in self.wait_replies(1)],["人工兜底完成"])
+        self.assertEqual([turn["message"] for turn in self.terminal(tid)["inputs"]],["[群主] "+original])
+        self.assertEqual(sum(m["kind"]=="owner" for m in self.api("GET")["messages"]),1)
+
     def test_dropped_delivery_warns_once_and_manual_retry_is_idempotent(self):
         self.create_group()
         self.invite("开发","codex","developer")

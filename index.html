@@ -702,7 +702,7 @@ const retrying=new Set();
 async function retryDelivery(id){
   const g=S.group,m=g&&g.members.find(x=>x.id===id);
   if(!m||!m.can_retry||retrying.has(id)) return;
-  if(!ask(m.delivery_state==="uncertain"?"消息也可能已送达且仍在执行。请先核对终端，重发可能重复操作。确认重发原消息？":"终端就绪后将重试投递原消息，确认继续？")) return;
+  if(!ask(m.delivery_state==="uncertain"?"消息也可能已送达且仍在执行。请先核对终端，重发可能重复操作。确认重发原消息？":m.delivery_state==="not_ready"?"请先确认 CLI 已加载且可输入；本次将按稳定的空闲状态重试投递原消息，即使未识别输入框。确认继续？":"终端就绪后将重试投递原消息，确认继续？")) return;
   retrying.add(id);
   try{ await api("POST",`/groups/${g.id}/members/${id}/retry`,{delivery_id:m.delivery_id,delivery_attempt:m.delivery_attempt}); await refresh(); }
   catch(e){ alert(e.message); } finally{ retrying.delete(id); }

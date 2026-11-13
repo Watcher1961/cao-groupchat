@@ -59,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         if provider == "codex":
             return "codex>\n? for shortcuts"
         if provider == "claude_code":
-            return "────────────\n❯ \n────────────\n? for shortcuts"
+            return '────────────\n❯ \x1b[2mTry "fix typecheck errors"\x1b[22m\n────────────\n? for shortcuts'
         return "Ready\n> "
 
     def write_raw(self, terminal, content):
@@ -148,7 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                     terminal["output_generation"] += 1
                     terminal["status_generation"] = terminal["output_generation"]
                     terminal["status"] = "idle"
-                    self.write_raw(terminal, "\n" + self.prompt(terminal["provider"]))
+                    prompt = self.body().get("prompt", self.prompt(terminal["provider"]))
+                    self.write_raw(terminal, "\n" + prompt)
                 elif control[2] == "progress":
                     self.write_raw(terminal, self.body()["text"])
                     terminal["output_generation"] += 1

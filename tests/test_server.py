@@ -476,6 +476,7 @@ class DeliveryTests(ServerTestCase):
             return {"output":self.CODEX_READY}
         self.cao.side_effect=response
         self.server.send_to(self.group,self.developer,"原始消息",0)
+        self.assertEqual(self.developer["delivery_state"],"sent")
 
     def test_restart_turns_an_interrupted_dispatch_into_a_manual_recovery(self):
         self.active()
@@ -488,6 +489,113 @@ class DeliveryTests(ServerTestCase):
         self.assertTrue(member["pending"])
         self.assertTrue(self.server.public_group(restored)["members"][0]["can_retry"])
         self.cao.assert_not_called()
+
+    def test_claude_placeholder_box_is_ready_in_plain_and_dim_output(self):
+        self.cao.side_effect=None
+        for prompt in ('❯ Try "fix typecheck errors"',
+                       '❯ \x1b[2mTry "fix typecheck errors"\x1b[22m',
+                       '❯'):
+            with self.subTest(prompt=prompt):
+                self.developer.update(provider="claude_code",terminal_id="dev-terminal",ready_terminal=None)
+                self.developer.pop("ready_candidate",None)
+                self.cao.return_value={"output":"────────────\n"+prompt+"\n────────────"}
+                for now,expected in ((1000,False),(1000.3,False),(1000.8,True)):
+                    with patch.object(self.server.time,"time",return_value=now):
+                        self.assertEqual(self.server.member_ready(self.developer,{"status":"idle"}),expected)
+        for raw in ('────────────\n❯ fix typecheck errors\n────────────',
+                    '────────────\n❯ Try "fix typecheck errors"\nnot a bottom rail'):
+            self.developer.update(ready_terminal=None)
+            self.developer.pop("ready_candidate",None)
+            self.cao.return_value={"output":raw}
+            for now in (2000,2001):
+                with patch.object(self.server.time,"time",return_value=now):
+                    self.assertFalse(self.server.member_ready(self.developer,{"status":"idle"}))
+
+    def test_not_ready_manual_retry_uses_stable_idle_without_matching_features(self):
+        for provider in ("claude_code","codex"):
+            with self.subTest(provider=provider):
+                self.developer.update(provider=provider,terminal_id="dev-terminal",ready_terminal=None,
+                                      active_delivery=None,pending=False,outbox=[],delivery_state="waiting_ready")
+                self.developer.pop("ready_candidate",None)
+                self.cao.reset_mock()
+                self.cao.side_effect=lambda method,path,*args,**kwargs: (
+                    {"dispatch_boundary":5} if method=="POST" else
+                    {"output":"unrecognized localized input"} if path.endswith("/output") else {"status":"idle"})
+                with patch.object(self.server.time,"time",return_value=1000):
+                    self.server.send_to(self.group,self.developer,"原文兜底",2,True)
+                with patch.object(self.server.time,"time",return_value=1181):
+                    self.server.flush_outbox(self.group,self.developer)
+                self.assertEqual(self.developer["delivery_state"],"not_ready")
+                job=self.developer["outbox"][0]
+                token={"delivery_id":job["id"],"delivery_attempt":job["attempt"]}
+                with patch.object(self.server.time,"time",return_value=1182):
+                    self.server.retry_delivery(self.group,self.developer,token)
+                for now,status in ((1182.4,"processing"),(1183,"idle"),(1183.4,"idle")):
+                    with patch.object(self.server.time,"time",return_value=now):
+                        self.server.flush_outbox(self.group,self.developer,{"status":status})
+                self.assertFalse(any(c.args[0]=="POST" for c in self.cao.call_args_list))
+                with patch.object(self.server.time,"time",return_value=1184):
+                    self.server.flush_outbox(self.group,self.developer,{"status":"idle"})
+                    self.server.flush_outbox(self.group,self.developer,{"status":"idle"})
+                posts=[c for c in self.cao.call_args_list if c.args[0]=="POST"]
+                self.assertEqual(len(posts),1)
+                self.assertEqual(posts[0].args[2],{"message":"原文兜底"})
+                self.assertEqual((self.developer["hops"],self.developer["silent"]),(2,True))
+                with self.assertRaises(ValueError):
+                    self.server.retry_delivery(self.group,self.developer,token)
+
+    def test_unexpected_dispatch_failures_keep_a_recoverable_job(self):
+        for phase in ("before_input","after_input","input_exception"):
+            with self.subTest(phase=phase):
+                self.active(provider="claude_code")
+                self.group["messages"].clear()
+                self.cao.reset_mock()
+                self.cao.side_effect=RuntimeError("private payload") if phase=="input_exception" else None
+                self.cao.return_value={"dispatch_boundary":5}
+                effects=[OSError("private disk detail")] if phase=="before_input" else (
+                    [None,OSError("private disk detail"),OSError("private disk detail")] if phase=="after_input" else [None,None])
+                def save():
+                    effect=effects.pop(0) if len(effects)>1 else effects[0]
+                    if effect:raise effect
+                job={"id":"exception-job","attempt":0,"queued_at":1000,"text":"original","hops":2,"silent":False}
+                with patch.object(self.server,"save_state",side_effect=save),patch("builtins.print") as diagnostic:
+                    self.server.dispatch_delivery(self.group,self.developer,job)
+                ambiguous=phase!="before_input"
+                self.assertEqual(self.developer["delivery_state"],"uncertain" if ambiguous else "failed")
+                self.assertEqual(self.developer["pending"],ambiguous)
+                self.assertIs(self.developer["active_delivery"],job)
+                self.assertEqual(sum(c.args[0]=="POST" for c in self.cao.call_args_list),int(ambiguous))
+                self.assertTrue(self.server.public_group(self.group)["members"][0]["can_retry"])
+                self.assertTrue(any(("可能未送达" if ambiguous else "投递失败") in m["text"] for m in self.group["messages"]))
+                self.assertNotIn("private",str(diagnostic.call_args_list)+str(self.group["messages"]))
+
+    def test_orphan_dispatching_state_does_not_wait_forever(self):
+        self.active()
+        self.developer["delivery_state"]="dispatching"
+        self.cao.side_effect=None
+        self.cao.return_value={"status":"idle"}
+        self.server.poll_member(self.group,self.developer)
+        self.assertEqual(self.developer["delivery_state"],"uncertain")
+        self.assertTrue(self.server.public_group(self.group)["members"][0]["can_retry"])
+        self.assertTrue(any("可能未送达" in m["text"] for m in self.group["messages"]))
+
+    def test_poll_errors_and_persistence_failures_do_not_stop_other_members(self):
+        self.active()
+        self.group["members"].append(self.reviewer)
+        class StopPolling(Exception):pass
+        seen=[]
+        def poll(g,m):
+            seen.append(m["id"])
+            if m is self.developer:raise RuntimeError("private payload")
+        with patch.object(self.server,"poll_member",side_effect=poll), \
+             patch.object(self.server,"save_state",side_effect=OSError("private disk detail")), \
+             patch.object(self.server.time,"sleep",side_effect=[None,None,StopPolling]), \
+             patch("builtins.print") as diagnostic:
+            with self.assertRaises(StopPolling):self.server.poll_loop()
+        self.assertEqual(seen.count(self.reviewer["id"]),2)
+        self.assertEqual(self.developer["delivery_state"],"uncertain")
+        self.assertTrue(self.server.public_group(self.group)["members"][0]["can_retry"])
+        self.assertNotIn("private",str(diagnostic.call_args_list)+str(self.group["messages"]))
 
     def test_startup_queue_keeps_fifo_order_until_each_reply_finishes(self):
         self.server.send_to(self.group,self.developer,"第一条",0)
