@@ -13,7 +13,7 @@ uv tool install cli-agent-orchestrator  # 尚未安装 CAO 时使用
 cao-server                             # 终端 1，默认 http://localhost:9889
 ```
 
-另开终端，在项目目录运行：
+另开终端，在项目目录运行（把占位路径换成你的项目目录）：
 
 ```bash
 cd ~/projects/cao-groupchat

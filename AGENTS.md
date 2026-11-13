@@ -20,7 +20,7 @@
 
 后端零第三方依赖；前端单文件、无构建；界面文案用中文。不要引入包管理、前端构建系统或目录搬迁来完成无关任务。
 
-在 `~/projects/cao-groupchat` 运行：
+在 `~/projects/cao-groupchat` 运行（换成你的项目目录）：
 
 ```bash
 cao-server                 # 终端 1：真实 CAO，默认端口 9889
@@ -46,7 +46,7 @@ python3 -m unittest discover -s tests -v
 
 ## 改动边界
 
-- 按 `docs/TASKS.md` 依次推进，一次只做群主授权的一项。当前任务 2 只改 `AGENTS.md`、`docs/`、`CLAUDE.md`、`README.md`；不改 `server.py`、`index.html`、`tests/` 或 `.gitignore`。
+- 按 `docs/TASKS.md` 依次推进，一次只做群主授权的一项；当前改动范围、禁止改动的文件和提交顺序以该清单及群主本次消息为准。
 - 开工核对已有改动，不覆盖他人的工作。必要的小重构单独提交，且必须属于当前授权范围。
 - `GROUP_LOG.md` 是本机运行数据，保持忽略、不进 Git；只在末尾追加自己的动作，不改他人的行。动作后记录 `- [YYYY-MM-DD HH:MM:SS] [codex] 动作描述`；其他实现者使用自身成员标识。
 - 审查者只读，不修改文件；需记日志时在回复中写 `[日志] 动作描述`，由系统代写。
