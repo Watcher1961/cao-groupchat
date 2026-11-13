@@ -275,6 +275,144 @@ class ReplyTests(ServerTestCase):
         self.assertEqual(self.group["messages"][0]["text"], "（无文字输出）")
 
 
+class CodexCompletionTests(ServerTestCase):
+    WORKING = "\x1b]7501;state=working\x07"
+    DONE = "\x1b]7501;state=done\x07"
+
+    def prepare(self, provider="codex", boundary=0):
+        self.developer.update(provider=provider, status="idle", pending=True,
+                              reply_handled=False, boundary=1, sent_at=0,
+                              codex_dispatch_markers=boundary, codex_dispatch_state=None, codex_saw_working=False)
+        self.group["members"] = [self.developer]
+        self.group["messages"].clear()
+
+    def poll(self, raw, status="idle", generation=2, fail_full=False, last_unsupported=False):
+        def response(method, path, query=None, **kwargs):
+            self.assertEqual(method, "GET")
+            if path.endswith("/output"):
+                if query["mode"] == "full":
+                    if fail_full:
+                        raise self.server.CaoError(503, "temporary output failure")
+                    return {"output": raw}
+                if last_unsupported:
+                    raise self.server.CaoError(422, "last output unavailable")
+                return {"output": "本轮最终回复"}
+            return {"status": status, "status_generation": generation}
+        self.cao.side_effect = response
+        class StopPolling(Exception):
+            pass
+        with patch.object(self.server.time, "sleep", side_effect=[None, StopPolling]):
+            with self.assertRaises(StopPolling):
+                self.server.poll_loop()
+
+    def test_idle_without_any_marker_never_falls_back_to_status_or_elapsed_time(self):
+        self.prepare()
+        self.poll("正在加载，尚无标记")
+        self.assertTrue(self.developer["pending"])
+        self.assertEqual(self.group["messages"], [])
+        self.assertFalse(any(call.args[2] == {"mode": "last"}
+                             for call in self.cao.call_args_list if len(call.args) > 2))
+
+    def test_last_marker_controls_completion_including_split_or_unknown_markers(self):
+        for raw, complete in ((self.DONE + self.WORKING, False),
+                              (self.WORKING + self.DONE, True),
+                              (self.DONE + "\x1b]7501;sta", False),
+                              (self.DONE + "\x1b]7501;state=don", False),
+                              (self.DONE + "\x1b]7501;state=done_later\x07", False),
+                              ("\x1b]7501;state=working\x1b\\正文\x1b]7501;state=done\x1b\\", True),
+                              (self.DONE, True)):
+            with self.subTest(raw=repr(raw)):
+                self.prepare()
+                self.poll(raw)
+                self.assertEqual(self.developer["pending"], not complete)
+                self.assertEqual([m["text"] for m in self.group["messages"]],
+                                 ["本轮最终回复"] if complete else [])
+
+    def test_previous_turn_done_is_not_reused_after_new_dispatch(self):
+        self.prepare(boundary=2)
+        previous = self.WORKING + "上一轮" + self.DONE
+        self.poll(previous + "本轮尚无标记")
+        self.assertTrue(self.developer["pending"])
+        self.assertEqual(self.group["messages"], [])
+        self.poll(previous + "本轮" + self.WORKING + self.DONE)
+        self.assertFalse(self.developer["pending"])
+        self.assertEqual(self.group["messages"][0]["text"], "本轮最终回复")
+
+    def test_completion_of_an_already_working_turn_cannot_finish_the_new_dispatch(self):
+        for old_output in (self.WORKING + self.DONE, self.DONE):
+            with self.subTest(old_output=repr(old_output)):
+                self.prepare(boundary=1)
+                self.developer["codex_dispatch_state"] = "working"
+                self.poll(old_output)
+                self.assertTrue(self.developer["pending"])
+                self.poll(old_output)
+                self.assertTrue(self.developer["pending"])
+                self.poll(old_output + self.WORKING + self.DONE)
+                self.assertFalse(self.developer["pending"])
+
+    def test_observed_working_then_done_survives_a_rolling_output_window(self):
+        self.prepare(boundary=4)
+        self.poll(self.DONE)
+        self.assertTrue(self.developer["pending"])
+        self.poll(self.WORKING)
+        self.assertTrue(self.developer["pending"])
+        self.poll(self.DONE)
+        self.assertFalse(self.developer["pending"])
+
+    def test_codex_done_is_authoritative_even_when_status_or_generation_lags(self):
+        for status in ("idle", "processing"):
+            with self.subTest(status=status):
+                self.prepare()
+                self.poll(self.WORKING + self.DONE, status=status, generation=1)
+                self.assertFalse(self.developer["pending"])
+                self.assertEqual(self.group["messages"][0]["text"], "本轮最终回复")
+
+    def test_other_providers_keep_status_and_generation_behavior_without_markers(self):
+        for provider in ("claude_code", "kiro_cli"):
+            for fresh in (False, True):
+                with self.subTest(provider=provider, fresh=fresh):
+                    self.prepare(provider)
+                    self.poll("没有任何 OSC 标记", generation=2 if fresh else 1)
+                    self.assertEqual(self.developer["pending"], not fresh)
+                    self.assertFalse(any(call.args[2] == {"mode": "full"}
+                                         for call in self.cao.call_args_list if len(call.args) > 2))
+                    self.cao.reset_mock()
+
+    def test_raw_output_failure_does_not_mark_codex_complete(self):
+        self.prepare()
+        self.poll("", fail_full=True)
+        self.assertTrue(self.developer["pending"])
+        self.assertEqual(self.group["messages"], [])
+
+    def test_dispatch_captures_codex_marker_boundary_and_resets_progress(self):
+        previous = self.WORKING + "上一轮" + self.DONE
+        self.prepare()
+        self.developer["codex_saw_working"] = True
+        self.cao.side_effect = [{"output": previous}, {"dispatch_boundary": 7}]
+        self.server.send_to(self.group, self.developer, "新一轮", 0)
+        self.assertEqual(self.developer["codex_dispatch_markers"], 2)
+        self.assertFalse(self.developer["codex_saw_working"])
+        self.assertEqual(self.developer["full_len"], len(previous))
+        self.assertEqual([call.args[0] for call in self.cao.call_args_list], ["GET", "POST"])
+
+    def test_last_output_fallback_keeps_only_new_turn_and_cleans_control_sequences(self):
+        previous = self.WORKING + "上一轮" + self.DONE
+        self.prepare(boundary=2)
+        self.developer["full_len"] = len(previous)
+        self.poll(previous + self.WORKING + "本轮最终回复" + self.DONE, last_unsupported=True)
+        self.assertFalse(self.developer["pending"])
+        self.assertEqual([m["text"] for m in self.group["messages"]], ["本轮最终回复"])
+
+    def test_missing_raw_baseline_prevents_unsafe_dispatch(self):
+        self.prepare()
+        self.developer["pending"] = False
+        self.cao.side_effect = self.server.CaoError(503, "raw output unavailable")
+        self.server.send_to(self.group, self.developer, "新一轮", 0)
+        self.assertEqual(self.cao.call_args.args[0], "GET")
+        self.assertFalse(self.developer["pending"])
+        self.assertIn("发给 开发 失败", self.group["messages"][0]["text"])
+
+
 class CleanOutputTests(ServerTestCase):
     def test_removes_ansi_colors_cursor_and_erase_sequences(self):
         self.assertEqual(self.server.clean_output("\x1b[32m完成\x1b[0m\x1b[2K\x1b[?25h\r\n"), "完成")

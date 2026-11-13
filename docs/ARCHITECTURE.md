@@ -10,9 +10,9 @@
 | CAO 适配与轮询 | 标准库 HTTP 请求、可选 Bearer token、每 2 秒轮询 terminal 状态和完成输出 |
 | 持久化与共享日志 | 群和消息写入数据目录的 `groups.json`；先写临时文件再替换；工作目录内追加 `GROUP_LOG.md` |
 | 用量解析 | 读取本机 Claude Code/Codex CLI JSONL，按成员标记认领，缓存解析并估算费用 |
-| `tests/test_server.py` | 26 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗和 effort/profile |
-| `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，可保持并释放旧 completed；不包含验收断言 |
-| `tests/test_integration.py` | 三个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复以及 effort 编辑/重启的 profile 安装 |
+| `tests/test_server.py` | 37 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
+| `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，可保持旧 completed 或以 idle_stream/advance 分阶段输出 raw 7501；不包含验收断言 |
+| `tests/test_integration.py` | 四个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js` | 可选 Node VM 的 3 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -30,7 +30,7 @@
 1. 浏览器经 `/api/groups` 创建群，提交工作目录与成员配置；后端保存群并异步启动成员。
 2. 每位成员生成独立 agent profile；非空 effort 对 Codex 写入 `codexConfig.model_reasoning_effort`，对 Claude Code 写入 `claudeConfig.effort`，由 CAO 转为对应 CLI 配置；缺字段或空值不写配置。一个群对应一个 CAO session，一位成员对应一个 terminal。权限与职责写入 profile，实际执行由 provider 决定。
 3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时发送给所有有 terminal 的成员。
-4. CAO input 响应的 `dispatch_boundary` 记为本轮边界。轮询读取 `status_generation`，只有大于边界的完成状态才属于本轮；字段缺失时降级为忙碌状态或发送后等待时间判定。
+4. 其他 provider 将 input 响应的 `dispatch_boundary` 记为边界，轮询按 `status_generation` 判断；字段缺失时仍降级为 busy 或发送后等待时间。Codex 发送前读取 raw full 标记基线，排除旧轮 done；只有本轮最后一个 OSC 7501 为 done 才读取最终回复，无标记、working 或探测失败继续等待，不回退相信 idle。追加缓冲使用标记计数，滚动窗口使用发送后观察到的 working→done；原等待确认/错误路径保留。
 5. 读取并清洗回复：去除 ANSI/OSC 控制序列，末尾整行匹配 Claude `✻ <单个字母词> for <时长> · done <时:分> AM/PM` 或 Codex `Worked for <时长> • <时:分>` 格式时去除；Claude 动词支持带重音字母，不写死具体词；引用、代码和非尾部示例保留。同轮回复只处理一次，成功发送下一轮时重置标记；静默通知回复直接丢弃。普通回复写入群消息，行首非空 `[日志]` 仅在同一行代写；成员提及按最长已知名字解析，最多接力 6 跳。
 6. 浏览器获取增量消息、共享日志和成员用量。持久化可加载群记录，但真实 terminal 是否仍存活需后续轮询判断；任务 4 已通过模拟 CAO 验证后端重启后群、成员、会话标识和消息从数据文件恢复，恢复后的轮询不重复发消息；真实 provider 的存活和重连不在该验证范围。
 
@@ -78,4 +78,4 @@
 - 角色和工具列表交由 CAO/provider 执行。前端对 Codex 等标软约束、Cursor 标不执行；这不是本轮验证过的安全隔离保证，`@builtin` 本身也不授予写文件权限。
 - 状态临时文件替换降低部分写入风险，但不提供数据库事务或跨进程并发保证。成员并发重启时可能争抢创建同一 session，后到者报 Session already exists，本轮不修复。
 - 仅监听本机回环，无 GUI 登录鉴权，目录接口可访问本机目录，不适合公开部署。
-- 2026-11-14 真实 cao-server 2.5.4 上 codex、claude_code 的建群、加成员、接力、日志代写已获群主确认。其他 provider 与 waiting_user_answer 交互待验证；任务 3 的隔离单测已通过，任务 4 已实现隔离 HTTP 集成验收，群主于 2026-11-14 完成人工验收，第 7 步窄窗口侧栏不可达，已延期，其余步骤通过；恢复后再收发的补充测试也已由群主确认结案。OSC 7501 当前只在输出清洗时去除，尚未用于完成状态判定，不能据此认定 Codex idle 误判问题已修复。
+- 2026-11-14 真实 cao-server 2.5.4 上 codex、claude_code 的建群、加成员、接力、日志代写已获群主确认。其他 provider 与 waiting_user_answer 交互待验证；任务 3 的隔离单测已通过，任务 4 已实现隔离 HTTP 集成验收，群主于 2026-11-14 完成人工验收，第 7 步窄窗口侧栏不可达，已延期，其余步骤通过；恢复后再收发的补充测试也已由群主确认结案。第二轮第 2 项已实现 Codex raw OSC 7501 完成判定并覆盖隔离回归，待独立审查；没有新增真实 provider 联调证据。

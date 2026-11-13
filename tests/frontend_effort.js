@@ -92,11 +92,13 @@ const cases = {
     assert.equal(member.effort, "max");
     const edited = await run(`demo.call("PUT","/api/groups/${group.id}/members/${member.id}",{name:"评审",provider:"codex",effort:"xhigh",role:"reviewer"})`);
     assert.equal(edited.effort, "xhigh");
+    assert.match(run(`demo.logs["${group.id}"]`), /推理强度=xhigh/);
     run(`S.group=demo.groups["${group.id}"];renderPane()`);
     assert.match(nodes.get("#pane").innerHTML, /推理强度：xhigh/);
     await run(`demo.call("PUT","/api/groups/${group.id}/members/${member.id}",{name:"评审",provider:"codex",effort:"",role:"reviewer"})`);
     run("renderPane()");
     assert.match(nodes.get("#pane").innerHTML, /推理强度：CLI 默认/);
+    assert.match(run(`demo.logs["${group.id}"]`), /推理强度=CLI 默认/);
     for (const [provider, effort] of [["codex", "max"], ["claude_code", "ultra"], ["kiro_cli", "high"]]) {
       await assert.rejects(run(`demo.call("POST","/api/groups/${group.id}/members",{name:"非法",provider:"${provider}",effort:"${effort}"})`));
     }

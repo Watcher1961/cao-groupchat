@@ -37,8 +37,8 @@ python3 server.py
 
 - 一个群对应一个 CAO session，一位成员对应一个 terminal。角色、工具和职责写入生成的 profile，优先经 HTTP 安装，失败时退回 `cao install`。
 - 群主提及已匹配成员时定向发送；无匹配提及或广播时发送给所有已启动成员。成员回复中的提及继续接力，上限 6 跳。
-- 后台每 2 秒轮询 terminal；用 dispatch_boundary/status_generation 区分本轮状态，再读取完成输出。任务 4 的隔离集成测试覆盖上一轮 completed 残留和本轮输出。
-- 邀请和编辑可选推理强度：Codex 为 low/medium/high/xhigh；Claude Code 另有 max；留空用 CLI 默认，其他 provider 不显示。配置随成员保存，卡片和演示模式同步；编辑后重启生成对应 provider 的 profile，真实 CLI 参数生效尚待联调。
+- 后台每 2 秒轮询 terminal；其他 provider 用 dispatch_boundary/status_generation 区分本轮状态。Codex 使用原始输出的 OSC 7501 本轮最后状态，仅 done 完成；没有新标记、仍 working 或输出读取失败继续等待，不相信中途 idle。发送前记录标记边界，排除旧轮 done，完成后才取最终回复。
+- 邀请和编辑可选推理强度：Codex 为 low/medium/high/xhigh；Claude Code 另有 max；留空用 CLI 默认，其他 provider 不显示。配置随成员保存，卡片和演示模式同步；编辑后重启生成对应 provider 的 profile，群主表单/卡片抽查通过，真实 CLI 参数生效尚待联调；编辑日志记录强度值或 CLI 默认。
 - 编辑成员配置会停止旧 terminal 并启动新 terminal，不保证保留旧 CLI 上下文。
 - 共享日志位于群工作目录的 `GROUP_LOG.md`。有写权限的成员直接追加，无写权限者在行首使用 `[日志]` 由后端代写；该文件含本机运行信息，保持 Git 忽略。
 - 工具权限最终由 CAO 和 provider 执行。界面会标注部分 provider 的软约束或不执行限制；这些标注不等于安全隔离已验证。
@@ -66,9 +66,9 @@ python3 -m py_compile server.py tests/fake_cao.py  # 仅语法检查
 python3 -B tests/fake_cao.py --port 0             # 独立模拟 CAO，输出随机端口；非自动断言
 ```
 
-模拟服务支持 `--port 0`（系统分配端口），省略参数仍默认 9889；不要占用或切换当前真实会话。导入不会启动服务。模拟状态按状态查询推进，不依赖固定延迟；`/_test/state` 提供观察，`POST /_test/terminals/{id}/next-turn` 可指定下一轮 `reply`、`hold`、`stale_polls`，`POST /_test/terminals/{id}/release` 释放本轮输出。这些仅用于本机测试。
+模拟服务支持 `--port 0`（系统分配端口），省略参数仍默认 9889；不要占用或切换当前真实会话。导入不会启动服务。模拟状态按状态查询推进，不依赖固定延迟；`/_test/state` 提供观察，`POST /_test/terminals/{id}/next-turn` 可指定下一轮 `reply`、`hold`、`stale_polls`，`POST /_test/terminals/{id}/release` 释放本轮输出。另可用 `idle_stream` 和 `POST /_test/terminals/{id}/advance` 控制无标记/working/done 阶段；raw full 输出与 last 回复分离。这些仅用于本机测试。
 
-自动套件含 26 个隔离后端单测、3 个 HTTP 集成和 3 个可选前端行为测试。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗及 effort 默认/校验/profile。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，以及 effort 编辑、成员重启和清空配置。后者以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
+自动套件含 37 个隔离后端单测、4 个 HTTP 集成和 3 个可选前端行为测试。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗、effort 默认/校验/profile 及 Codex 本轮标记判定。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，effort 编辑、成员重启和清空配置，以及 Codex 全程 idle 时无新标记/working 不提前发言、done 后最终回复可接力。后者以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
 
 前端测试通过可选的本机 Node 执行真实内联脚本，使用最小 DOM 夹具验证强度选项、provider 切换提交、演示邀请编辑和卡片；不安装 npm 包，不增加应用依赖。未安装 Node 时这 3 项会明确跳过，不能记为前端已验证。浏览器排版及真实 provider 联调需单独验收。
 

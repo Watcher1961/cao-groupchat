@@ -476,7 +476,7 @@ class Mock {
     const m=g.members.find(x=>x.id===r[1]); if(!m) throw new Error("成员不存在");
     if(method==="DELETE"){ g.members.splice(g.members.indexOf(m),1); this.log(g,"群主",`将 ${m.name} 移出群`); this.msg(g,"system","系统",`${m.name} 已被移出群。`); return {ok:true}; }
     if(method==="PUT"){ const n=this.member({...body,id:m.id},g); g.members[g.members.indexOf(m)]=n;
-      this.log(g,"群主",`调整 ${n.name} 的配置并重启：角色=${n.role}，权限=${eff(n).join(",")}`); this.boot(g,n); return n; }
+      this.log(g,"群主",`调整 ${n.name} 的配置并重启：角色=${n.role}，权限=${eff(n).join(",")}，推理强度=${n.effort||"CLI 默认"}`); this.boot(g,n); return n; }
     if(r[2]==="restart"){ m.status="starting"; this.boot(g,m); return {ok:true}; }
   }
   pub(g,since){ return {...g,log_file:g.workdir+"/GROUP_LOG.md",members:g.members.map(m=>({...m,effective_tools:eff(m)})),messages:g.messages.filter(m=>m.seq>since)}; }

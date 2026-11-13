@@ -73,7 +73,8 @@ class Handler(BaseHTTPRequestHandler):
                 terminal = {
                     "id": tid, "session_name": query.get("session_name") or path.split("/")[2],
                     "status": "idle", "status_generation": 0,
-                    "profile": query["agent_profile"], "out": "", "inputs": [],
+                    "profile": query["agent_profile"], "provider": query["provider"],
+                    "out": "", "full_out": "", "inputs": [], "full_reads": 0, "last_reads": 0,
                     "pending": None, "next_turn": {}, "output_reads": 0, "status_reads": 0,
                 }
                 self.server.terminals[tid] = terminal
@@ -82,13 +83,23 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_test/state" and method == "GET":
                 return self.respond(200, {"terminals": self.server.terminals,
                                           "profiles": self.server.profiles})
-            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release)", path)
+            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
                 if terminal is None:
                     return self.respond(404, {"detail": "terminal missing"})
                 if control[2] == "next-turn":
                     terminal["next_turn"] = self.body()
+                elif control[2] == "advance" and terminal["pending"]:
+                    turn = terminal["pending"]
+                    if turn["idle_stream"]:
+                        turn["phase"] += 1
+                        if turn["phase"] == 1:
+                            terminal["full_out"] += "\x1b]7501;state=working\x07" + turn["interim"]
+                        else:
+                            terminal["full_out"] += turn["reply"] + "\x1b]7501;state=done\x07"
+                            terminal["out"] = turn["reply"]
+                            terminal["pending"] = None
                 elif terminal["pending"]:
                     terminal["pending"]["held"] = False
                 return self.respond(200, {"ok": True})
@@ -101,7 +112,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not sub and method == "GET":
                     terminal["status_reads"] += 1
                     turn = terminal["pending"]
-                    if turn:
+                    latest = terminal["inputs"][-1] if terminal["inputs"] else None
+                    if latest and latest["idle_stream"]:
+                        latest["phase_reads"][latest["phase"]] += 1
+                        latest["reported_statuses"].append(terminal["status"])
+                    elif turn:
                         if turn["held"] or turn["stale_remaining"] > 0:
                             turn["stale_remaining"] = max(0, turn["stale_remaining"] - 1)
                             if (terminal["status"] == "completed" and
@@ -111,6 +126,11 @@ class Handler(BaseHTTPRequestHandler):
                             terminal["status_generation"] += 1
                             terminal["status"] = "completed"
                             terminal["out"] = turn["reply"]
+                            if terminal["provider"] == "codex":
+                                terminal["full_out"] += ("\x1b]7501;state=working\x07" + turn["reply"] +
+                                                         "\x1b]7501;state=done\x07")
+                            else:
+                                terminal["full_out"] += turn["reply"]
                             terminal["pending"] = None
                     return self.respond(200, self.public(terminal))
                 if not sub and method == "DELETE":
@@ -129,17 +149,27 @@ class Handler(BaseHTTPRequestHandler):
                         "reply": options.get("reply", self.default_reply(terminal, message)),
                         "held": options.get("hold", False),
                         "stale_remaining": options.get("stale_polls", 2) if stale else 0,
-                        "stale_reports": 0,
+                        "stale_reports": 0, "idle_stream": options.get("idle_stream", False),
+                        "interim": options.get("interim", "正在处理"), "phase": 0,
+                        "phase_reads": [0, 0, 0], "reported_statuses": [],
                     }
                     terminal["inputs"].append(turn)
                     terminal["pending"] = turn
-                    if not stale:
+                    if turn["idle_stream"]:
+                        terminal["status"] = "idle"
+                        terminal["status_generation"] += 1
+                        terminal["out"] = turn["interim"]
+                        terminal["full_out"] += turn["interim"]
+                    elif not stale:
                         terminal["status"] = "processing"
                         terminal["status_generation"] += 1
                     return self.respond(200, {"success": True, "dispatch_boundary": boundary})
                 if sub == "/output" and method == "GET":
                     terminal["output_reads"] += 1
-                    return self.respond(200, {"output": terminal["out"], "mode": query.get("mode")})
+                    mode = query.get("mode")
+                    terminal["full_reads" if mode == "full" else "last_reads"] += 1
+                    output = terminal["full_out"] if mode == "full" else terminal["out"]
+                    return self.respond(200, {"output": output, "mode": mode})
             if path.startswith("/sessions/") and method == "DELETE":
                 session = path.split("/")[2]
                 self.server.terminals = {tid: t for tid, t in self.server.terminals.items()

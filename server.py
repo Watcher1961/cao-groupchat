@@ -406,6 +406,7 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> Non
         add_msg(g, "system", "系统", f"{m['name']} 尚未启动，消息未送达。", log=False)
         return
     try:
+        raw = get_full_output(m) if m.get("provider") == "codex" else None
         r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": text})
         with lock:
             # CAO 会把上一轮的 completed 状态保留着；只有 status_generation > dispatch_boundary
@@ -417,6 +418,12 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> Non
             m["saw_busy"] = False
             m["hops"] = hops
             m["silent"] = silent
+            if raw is not None:
+                states = codex_states(raw)
+                m["codex_dispatch_markers"] = len(states)
+                m["codex_dispatch_state"] = states[-1] if states else None
+                m["codex_saw_working"] = False
+                m["full_len"] = len(raw)
         save_state()
     except CaoError as e:
         add_msg(g, "system", "系统", f"发给 {m['name']} 失败：{e}", log=False)
@@ -431,6 +438,51 @@ def find_mentions(g: dict, text: str, exclude: str | None = None) -> list[dict]:
     mentioned = {match.group(1) for match in re.finditer(pattern, text)
                  if not re.match(r"[\w一-鿿]", text[match.end():match.end() + 1])}
     return [x for x in g["members"] if x["id"] != exclude and x["name"] in mentioned]
+
+
+def get_full_output(m: dict) -> str:
+    result = cao("GET", f"/terminals/{m['terminal_id']}/output", {"mode": "full"})
+    raw = result.get("output") if isinstance(result, dict) else result
+    if not isinstance(raw, str):
+        raise CaoError(0, "无法读取终端原始输出")
+    return raw
+
+
+def codex_states(raw: str) -> list[str | None]:
+    # Keep incomplete/unknown final markers: an earlier done must not override them.
+    states = []
+    for tail in raw.split("\x1b]7501;")[1:]:
+        match = re.match(r"state=(\w+)(?=[;\x07\x1b\r\n]|$)", tail)
+        states.append(match.group(1) if match else None)
+    return states
+
+
+def get_codex_reply(m: dict) -> str | None:
+    boundary = m.get("codex_dispatch_markers")
+    if boundary is None:
+        return None  # A pending turn from before this protocol has no proven boundary.
+    raw = get_full_output(m)
+    states = codex_states(raw)
+    if not states:
+        return None
+    if states[-1] == "working":
+        if len(states) > boundary or m.get("codex_dispatch_state") != "working":
+            m["codex_saw_working"] = True
+        return None
+    if states[-1] != "done":
+        return None
+    if (m.get("codex_dispatch_state") == "working" and not m.get("codex_saw_working")
+            and "working" not in states[boundary:]):
+        # Discard the completion of the turn already working at dispatch time.
+        m["codex_dispatch_markers"] = len(states)
+        m["codex_dispatch_state"] = "done"
+        m["full_len"] = len(raw)
+        return None
+    # Count new markers in an append-only buffer; a working->done observation also
+    # handles a rolling terminal window that has discarded the old prefix.
+    if len(states) <= boundary and not m.get("codex_saw_working"):
+        return None
+    return get_reply(m)
 
 
 def get_reply(m: dict) -> str:
@@ -510,7 +562,17 @@ def poll_loop() -> None:
             m["status"] = st
             if not m.get("pending"):
                 continue
-            if st in BUSY:
+            if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
+                m["status"] = "processing"
+                try:
+                    reply = get_codex_reply(m)
+                except CaoError:
+                    continue  # A failed probe is not evidence of completion.
+                if reply is not None:
+                    m["pending"] = False
+                    m["status"] = "completed"
+                    handle_reply(g, m, reply)
+            elif st in BUSY:
                 m["saw_busy"] = True
             elif st == "waiting_user_answer" and prev != st and fresh:
                 try:
@@ -1097,6 +1159,7 @@ class H(BaseHTTPRequestHandler):
                         g["members"][g["members"].index(m)] = new
                         append_log(g, "群主", f"调整 {new['name']} 的配置并重启："
                                              f"角色={new['role']}，权限={','.join(member_tools(new))}，"
+                                             f"推理强度={new.get('effort') or 'CLI 默认'}，"
                                              f"职责={new['duty'] or '未指定'}")
                         run_bg(bootstrap_members, g, [new], False)
                         return self._json(200, new)

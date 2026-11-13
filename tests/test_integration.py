@@ -213,6 +213,48 @@ class IntegrationTests(unittest.TestCase):
         self.assertGreater(resumed_state["status_generation"],
                            resumed_state["inputs"][-1]["dispatch_boundary"])
 
+    def test_codex_idle_stream_waits_for_new_done_then_relays_final_reply(self):
+        self.create_group()
+        dev = self.invite("开发", "codex", "developer")
+        review = self.invite("评审", "claude_code", "reviewer")
+        tid, review_tid = dev["terminal_id"], review["terminal_id"]
+        self.until("silent notice dispatched", lambda: self.terminal(tid)["inputs"])
+        self.until("silent notice consumed", lambda: self.api("GET")["members"][0].get("reply_handled"))
+        previous = self.terminal(tid)
+        self.assertIn("state=done", previous["full_out"])
+        self.assertEqual(self.replies(), [])
+        interim = "仅中途文字，@评审 不应收到这条"
+        final = "本轮最终回复，@评审 请审查。"
+        reviewed = "已收到本轮最终回复。"
+        self.next_turn(tid, final, idle_stream=True, interim=interim)
+        self.next_turn(review_tid, reviewed)
+        self.api("POST", "/messages", {"text": "@开发 处理本轮任务"})
+
+        def observed(phase):
+            state = self.terminal(tid)
+            turn = state["inputs"][-1]
+            return turn["idle_stream"] and turn["phase_reads"][phase] >= 2
+
+        for phase in (0, 1):
+            self.until(f"idle phase {phase} observed twice", lambda: observed(phase))
+            state = self.terminal(tid)
+            self.assertEqual(state["status"], "idle")
+            self.assertGreater(state["status_generation"], state["inputs"][-1]["dispatch_boundary"])
+            self.assertTrue(self.api("GET")["members"][0]["pending"])
+            self.assertEqual(self.replies(), [])
+            self.assertEqual(state["last_reads"], previous["last_reads"])
+            self.assertEqual(self.terminal(review_tid)["inputs"], [])
+            self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
+
+        replies = self.wait_replies(2)
+        self.assertEqual([(m["sender"], m["text"]) for m in replies],
+                         [("开发", final), ("评审", reviewed)])
+        self.assertFalse(any(interim in m["text"] for m in self.api("GET")["messages"]))
+        self.assertEqual([turn["message"] for turn in self.terminal(review_tid)["inputs"]],
+                         ["[来自 开发] " + final])
+        self.assertEqual(set(self.terminal(tid)["inputs"][-1]["reported_statuses"]), {"idle"})
+        self.assertEqual(self.terminal(tid)["last_reads"], previous["last_reads"] + 1)
+
     def test_effort_survives_edit_member_restart_and_server_restore(self):
         self.create_group()
         member = self.invite("强度测试", "codex", "developer", effort="xhigh")
@@ -236,6 +278,7 @@ class IntegrationTests(unittest.TestCase):
         updated = replacement(member["terminal_id"])
         self.assertIn("claudeConfig:\n  effort: max\n", profile(updated))
         self.assertNotIn("codexConfig:", profile(updated))
+        self.assertIn("推理强度=max", self.api("GET", "/log")["content"])
         saved = json.loads((self.data / "groups.json").read_text())
         self.assertEqual(saved[self.group_path.rsplit("/", 1)[1]]["members"][0]["effort"], "max")
         self.stopped_server = self.server
@@ -252,6 +295,7 @@ class IntegrationTests(unittest.TestCase):
         defaulted = replacement(restarted["terminal_id"])
         self.assertEqual(defaulted["effort"], "")
         self.assertNotIn("claudeConfig:", profile(defaulted))
+        self.assertIn("推理强度=CLI 默认", self.api("GET", "/log")["content"])
 
     def test_stale_completed_waits_for_current_turn_output(self):
         self.create_group()
@@ -277,13 +321,13 @@ class IntegrationTests(unittest.TestCase):
         member = self.api("GET")["members"][0]
         self.assertEqual(member["boundary"], boundary)
         self.assertTrue(member["pending"])
-        self.assertEqual(stale["output_reads"], previous["output_reads"])
+        self.assertEqual(stale["last_reads"], previous["last_reads"])
         self.assertEqual([m["text"] for m in self.replies()], [old_reply])
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/release")
         self.assertEqual([m["text"] for m in self.wait_replies(2)], [old_reply, new_reply])
         current = self.terminal(tid)
         self.assertGreater(current["status_generation"], boundary)
-        self.assertEqual(current["output_reads"], previous["output_reads"] + 1)
+        self.assertEqual(current["last_reads"], previous["last_reads"] + 1)
         self.assertFalse(self.api("GET")["members"][0]["pending"])
 
 
