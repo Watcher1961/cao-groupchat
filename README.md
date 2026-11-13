@@ -37,7 +37,7 @@ python3 server.py
 
 - 一个群对应一个 CAO session，一位成员对应一个 terminal。角色、工具和职责写入生成的 profile，优先经 HTTP 安装，失败时退回 `cao install`。
 - 群主提及已匹配成员时定向发送；无匹配提及或广播时发送给所有已启动成员。成员回复中的提及继续接力，上限 6 跳。
-- 后台每 2 秒轮询 terminal；用 dispatch_boundary/status_generation 区分本轮状态，再读取完成输出。该逻辑的隔离自动回归待任务 4。
+- 后台每 2 秒轮询 terminal；用 dispatch_boundary/status_generation 区分本轮状态，再读取完成输出。任务 4 的隔离集成测试覆盖上一轮 completed 残留和本轮输出。
 - 编辑成员配置会停止旧 terminal 并启动新 terminal，不保证保留旧 CLI 上下文。
 - 共享日志位于群工作目录的 `GROUP_LOG.md`。有写权限的成员直接追加，无写权限者在行首使用 `[日志]` 由后端代写；该文件含本机运行信息，保持 Git 忽略。
 - 工具权限最终由 CAO 和 provider 执行。界面会标注部分 provider 的软约束或不执行限制；这些标注不等于安全隔离已验证。
@@ -50,7 +50,7 @@ API 金额按内置价格和数据目录下的 `prices.json` 估算；未知价�
 
 ## 验证范围与已知限制
 
-- **已验证（群主确认）**：2026-11-14 在真实 cao-server 2.5.4 上，使用 codex、claude_code 成员跑通建群、加成员、提及接力、日志代写。以上为历史联调结果；任务 3 仅运行隔离单元测试。
+- **已验证（群主确认）**：2026-11-14 在真实 cao-server 2.5.4 上，使用 codex、claude_code 成员跑通建群、加成员、提及接力、日志代写。以上为历史联调结果；任务 3、4 分别增加隔离单元与集成验收，未重新进行真实 provider 联调。
 - **待验证**：kiro 等其他 provider，以及 waiting_user_answer 权限确认后的回复和恢复交互。代码有相关分支，不代表实测通过。
 - 多成员同时重启时可能争抢新建 session，后到者报 Session already exists；成员推理强度（codexConfig / claudeConfig）尚未支持。本轮不修复这两项。
 - 单测已覆盖Claude 可变动词结束行和 Codex `Worked for …` 结束行的清除，其他 CLI 格式仍可能残留界面字符；消息与日志可能含正文和私人路径，运行数据不提交、不公开。
@@ -60,9 +60,13 @@ API 金额按内置价格和数据目录下的 `prices.json` 估算；未知价�
 共享规则见 [AGENTS.md](AGENTS.md)，Claude Code 通过 [CLAUDE.md](CLAUDE.md) 导入。产品需求、接口和串行任务分别见 [PRD](docs/PRD.md)、[架构](docs/ARCHITECTURE.md)、[任务清单](docs/TASKS.md)。
 
 ```bash
-python3 -m unittest discover -s tests            # 自动单元测试
+python3 -B -m unittest discover -s tests         # 自动单元与集成测试
 python3 -m py_compile server.py tests/fake_cao.py  # 仅语法检查
-python3 tests/fake_cao.py                        # 持续运行的模拟 CAO，非自动测试
+python3 -B tests/fake_cao.py --port 0             # 独立模拟 CAO，输出随机端口；非自动断言
 ```
 
-模拟服务固定监听 9889，仅在隔离验证环境替代真实 CAO，不要占用或切换当前真实会话。任务 3 已增加 22 个标准库 unittest：隔离导入、提及、接力上限、静默回复、日志幂等、ANSI 与 Claude/Codex 两类 TUI 结束行（含多个 Claude 动词）。测试使用临时 HOME/数据目录并阻断真实 CAO 调用；任务 4 的随机端口集成验收尚未实施。文档修改使用链接、隐私、范围和 Git 差异检查验证。
+模拟服务支持 `--port 0`（系统分配端口），省略参数仍默认 9889；不要占用或切换当前真实会话。导入不会启动服务。模拟状态按状态查询推进，不依赖固定延迟；`/_test/state` 提供观察，`POST /_test/terminals/{id}/next-turn` 可指定下一轮 `reply`、`hold`、`stale_polls`，`POST /_test/terminals/{id}/release` 释放本轮输出。这些仅用于本机测试。
+
+自动套件含 22 个隔离单测与 2 个集成测试。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、ANSI 与 Claude/Codex 两类 TUI 结束行。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复。后者以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
+
+中文界面和演示模式的具体人工步骤及待执行状态见[任务清单](docs/TASKS.md)。模拟集成通过不代表真实 provider 或浏览器验收通过。文档修改使用链接、隐私、范围和 Git 差异检查验证。

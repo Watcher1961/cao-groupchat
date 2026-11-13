@@ -14,7 +14,8 @@
 | `docs/TASKS.md` | 串行任务、状态、提交和已知问题 |
 | `server.py` | Python 标准库后端及 CAO HTTP 适配 |
 | `index.html` | 单文件前端与浏览器演示模式 |
-| `tests/fake_cao.py` | 模拟 CAO HTTP 服务；不是自动断言套件 |
+| `tests/fake_cao.py` | 模拟 CAO HTTP 服务，支持随机端口和状态代际；不是自动断言套件 |
+| `tests/test_integration.py` | 隔离子进程与 HTTP 集成验收，覆盖接力、残留状态和重启恢复 |
 | `tests/test_server.py` | 标准库 unittest，隔离导入与群聊行为测试 |
 
 ## 构建、运行与验证
@@ -32,18 +33,18 @@ python3 server.py           # 终端 2：本地 GUI，默认端口 8765
 
 ```bash
 python3 -m py_compile server.py tests/fake_cao.py  # 语法检查，会产生被忽略的缓存
-python3 tests/fake_cao.py                        # 模拟服务，持续运行，固定端口 9889
+python3 -B tests/fake_cao.py --port 0             # 隔离模拟服务，持续运行，输出随机端口
 ```
 
-模拟服务用于隔离的手工验证，不能与同端口真实 CAO 同时运行，也不要让正在工作的 GUI 改连模拟服务。当前模拟脚本会在执行或导入时启动服务，不要把它当作测试模块导入。
+模拟服务用于隔离验证，不要让正在工作的 GUI 改连模拟服务。`--port 0` 由系统分配端口；省略参数仍默认 9889，不能与同端口真实 CAO 同时运行。导入模拟脚本不会启动服务。
 
-运行自动单元测试；使用临时 HOME/数据/日志目录并模拟 CAO，不访问真实会话；发现 0 个测试不算通过：
+运行自动单元与集成测试；使用临时 HOME/数据/日志目录并模拟 CAO，不访问真实会话；发现 0 个测试不算通过：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -B -m unittest discover -s tests -v
 ```
 
-任务 4 再实现临时数据目录、随机端口的集成验收，不接触真实 CAO 会话。文档变更检查相对链接、敏感信息、范围和 `git diff --check`；不要把语法检查、模拟结果或代码走读记作真实 provider 联调。
+集成测试启动真实 Python 后端和模拟 CAO 子进程，使用随机端口、临时 HOME/数据/日志目录及独立环境；结束或断言失败均回收子进程和临时目录，不接触 9889 或真实 CAO 会话。文档变更检查相对链接、敏感信息、范围和 `git diff --check`；不要把语法检查、模拟结果或代码走读记作真实 provider 联调。
 
 ## 改动边界
 
