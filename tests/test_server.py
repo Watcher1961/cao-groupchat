@@ -665,6 +665,46 @@ class CodexCompletionTests(ServerTestCase):
                 self.assertFalse(self.developer["pending"])
                 self.assertEqual(self.group["messages"][0]["text"], "本轮最终回复")
 
+    def test_cleared_done_only_with_new_generation_finishes_without_a_working_poll(self):
+        self.dispatch_from(self.WORKING+"上一轮"+self.DONE+self.DONE)
+        self.developer["boundary"]=20
+        self.developer["delivery_started"]=False
+        self.poll("x"*32700+"本轮"+self.DONE,output_generation=48,generation=48)
+        self.assertTrue(self.developer["codex_buffer_reset"])
+        self.assertFalse(self.developer["codex_saw_working"])
+        self.assertFalse(self.developer["pending"])
+        self.assertTrue(self.developer["delivery_started"])
+        self.assertEqual([m["text"] for m in self.group["messages"]],["本轮最终回复"])
+
+    def test_cleared_done_only_needs_new_output_not_just_new_status(self):
+        self.dispatch_from(self.WORKING+"旧回复"+self.DONE)
+        raw="本轮仅剩done"+self.DONE
+        for generation in (None,6,7):
+            self.poll(raw,output_generation=generation,generation=99)
+            self.assertTrue(self.developer["pending"])
+            self.assertEqual(self.group["messages"],[])
+        self.poll(raw,output_generation=8,generation=99)
+        self.assertFalse(self.developer["pending"])
+
+    def test_fresh_old_done_never_forgets_that_dispatch_began_during_working(self):
+        self.dispatch_from(self.WORKING+"旧轮仍在执行")
+        for generation in (8,9,10):
+            self.poll("旧轮结束"+self.DONE,output_generation=generation)
+            self.assertTrue(self.developer["pending"])
+            self.assertEqual(self.developer["codex_dispatch_state"],"working")
+            self.assertEqual(self.group["messages"],[])
+        self.poll(self.WORKING+"本轮"+self.DONE,output_generation=11)
+        self.assertFalse(self.developer["pending"])
+
+    def test_fast_completion_counts_as_started_for_codex_and_other_providers(self):
+        for provider in ("codex","claude_code"):
+            with self.subTest(provider=provider):
+                self.prepare(provider)
+                self.developer["delivery_started"]=False
+                self.poll(self.WORKING+"快速完成"+self.DONE,output_generation=2)
+                self.assertFalse(self.developer["pending"])
+                self.assertTrue(self.developer["delivery_started"])
+
     def test_identical_short_reply_needs_fresh_output_not_fresh_status(self):
         raw = self.WORKING + "收到" + self.DONE
         self.dispatch_from(raw)

@@ -416,6 +416,69 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(all(not m["pending"] and not m["can_retry"] for m in settled["members"]))
         self.assertEqual(sum("可能未送达" in m["text"] for m in settled["messages"]),2)
 
+    def assert_fast_replies_remain_complete(self, expected):
+        def terminal_states():
+            members=self.api("GET")["members"]
+            return members if all(m.get("delivery_state") in ("completed","uncertain") for m in members) else None
+        members=self.until("fast completion or erroneous watchdog warning",terminal_states)
+        self.assertEqual({m["text"] for m in self.replies()},set(expected))
+        self.assertTrue(all(m["delivery_state"]=="completed" and not m["pending"] and
+                            m["delivery_started"] and not m["can_retry"] for m in members))
+        reads={m["terminal_id"]:self.terminal(m["terminal_id"])["status_reads"] for m in members}
+        # Observe polling beyond the actual dispatch deadlines, without a fixed sleep.
+        deadline=max(m["sent_at"] for m in members)+float(self.env["GROUPCHAT_DELIVERY_TIMEOUT"])
+        self.until("completed deliveries remain settled beyond watchdog deadline",lambda:
+                   time.time()>deadline and all(self.terminal(tid)["status_reads"]>=count+2 for tid,count in reads.items()))
+        self.assertFalse(any("可能未送达" in m["text"] for m in self.api("GET")["messages"]))
+        self.assertEqual({m["text"] for m in self.replies()},set(expected))
+
+    def test_both_providers_complete_before_first_poll_during_cold_start(self):
+        self.http(self.cao_url,"POST","/_test/config",{"hold_create":True,"startup_hold":True})
+        group=self.http(self.server_url,"POST","/api/groups",{
+            "name":"冷启动快回复","workdir":str(self.root/"project"),"members":[
+                {"name":"cx","provider":"codex","effort":"low"},
+                {"name":"cc","provider":"claude_code","model":"sonnet","effort":"low"}]})
+        self.group_path=f"/api/groups/{group['id']}"
+        self.until("cold creation blocked",lambda:self.http(self.cao_url,"GET","/_test/state")["create_waiting"])
+        text="@所有人 只回复：收到，我是<名字>"
+        self.api("POST","/messages",{"text":text})
+        self.until("broadcast queued before allocation",lambda:all(m.get("queued_count")==1 for m in self.api("GET")["members"]))
+        self.http(self.cao_url,"POST","/_test/config",{"hold_create":False})
+        self.until("both cold terminals allocated",lambda:all(m["terminal_id"] for m in self.api("GET")["members"]))
+        members=self.api("GET")["members"]
+        for m in members:
+            tid=m["terminal_id"]
+            self.assertEqual(self.terminal(tid)["inputs"],[])
+            self.next_turn(tid,"收到，我是"+m["name"],complete_on_input=True)
+            self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready")
+        self.assert_fast_replies_remain_complete(["收到，我是cx","收到，我是cc"])
+        for m in members:
+            state=self.terminal(m["terminal_id"])
+            self.assertEqual([turn["message"] for turn in state["inputs"]],["[群主] "+text])
+            self.assertTrue(state["inputs"][0]["complete_on_input"])
+            self.assertGreater(state["output_generation"],state["inputs"][0]["dispatch_boundary"])
+
+    def test_fast_codex_done_survives_eviction_before_the_first_poll(self):
+        self.http(self.cao_url,"POST","/_test/config",{"startup_hold":True})
+        self.create_group()
+        self.api("POST","/members",{"name":"cx","provider":"codex","effort":"low"})
+        self.api("POST","/messages",{"text":"@所有人 只回复：收到，我是cx"})
+        tid=self.until("cold codex terminal allocated",lambda:self.api("GET")["members"][0]["terminal_id"])
+        self.next_turn(tid,"收到，我是cx",complete_on_input=True,padding_bytes=40000)
+        previous="\x1b]7501;state=working\x07旧回复\x1b]7501;state=done\x07\x1b]7501;state=done\x07"
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready",{"prompt":previous+"\ncodex>\n? for shortcuts"})
+        self.assert_fast_replies_remain_complete(["收到，我是cx"])
+        member=self.api("GET")["members"][0]
+        state=self.terminal(tid)
+        self.assertEqual(member["codex_dispatch_markers"],3)
+        self.assertTrue(member["codex_buffer_reset"])
+        self.assertFalse(member["codex_saw_working"])
+        self.assertEqual(len(state["full_out"].encode()),32768)
+        self.assertNotIn("state=working",state["full_out"])
+        self.assertEqual(state["full_out"].count("state=done"),1)
+        self.assertTrue(state["inputs"][0]["complete_on_input"])
+        self.assertEqual(len(state["inputs"]),1)
+
     def test_codex_buffer_clear_allows_fast_and_identical_short_replies(self):
         self.create_group()
         member = self.invite("开发", "codex", "developer")

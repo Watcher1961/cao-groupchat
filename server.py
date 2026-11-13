@@ -670,11 +670,11 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
     raw = get_full_output(m)
     states = codex_states(raw)
     snapshot_len, snapshot_hash = m.get("codex_snapshot_len"), m.get("codex_snapshot_hash")
+    fresh_bytes = (isinstance(output_generation, int) and isinstance(m.get("boundary"), int)
+                   and output_generation > m["boundary"])
     if snapshot_len is not None and snapshot_hash is not None:
         same_prefix = (len(raw) >= snapshot_len and
                        hashlib.sha256(raw[:snapshot_len].encode()).hexdigest() == snapshot_hash)
-        fresh_bytes = (isinstance(output_generation, int) and isinstance(m.get("boundary"), int)
-                       and output_generation > m["boundary"])
         # CAO clears its FIFO before input. A byte-identical fast reply is also
         # new when the output counter advanced; status_generation is not used.
         identical_new_turn = (len(raw) == snapshot_len and same_prefix and fresh_bytes
@@ -682,7 +682,7 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
         if not same_prefix or identical_new_turn:
             m["codex_buffer_reset"] = True
     reset = m.get("codex_buffer_reset", False)
-    dispatch_state = None if reset else m.get("codex_dispatch_state")
+    dispatch_state = m.get("codex_dispatch_state")  # Immutable evidence of an already-active old turn.
     if reset:
         boundary = 0
         m["full_len"] = 0
@@ -697,16 +697,23 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
     if (dispatch_state == "working" and not m.get("codex_saw_working")
             and "working" not in states[boundary:]):
         # Discard the completion of the turn already working at dispatch time.
-        m["codex_dispatch_markers"] = len(states)
-        m["codex_dispatch_state"] = "done"
-        m["full_len"] = len(raw)
+        if not reset:
+            m["codex_dispatch_markers"] = len(states)
+            m["full_len"] = len(raw)
         return None
     # Count new markers in an append-only buffer; a working->done observation also
     # handles a rolling terminal window that has discarded the old prefix.
     if len(states) <= boundary and not m.get("codex_saw_working"):
         return None
-    if not m.get("codex_saw_working") and "working" not in states[boundary:-1]:
-        return None  # A lone late done can still belong to the previous turn.
+    current_working = "working" in states[boundary:-1]
+    # A fast turn can redraw >32KB before the first poll and evict working.
+    # A cleared buffer plus fresh bytes proves its remaining done is new, unless
+    # the preceding turn was still working when we sent the input.
+    fresh_reset_done = reset and fresh_bytes and dispatch_state != "working"
+    if not m.get("codex_saw_working") and not current_working and not fresh_reset_done:
+        return None
+    if current_working:
+        m["codex_saw_working"] = True
     if reset:
         starts = [match.start() for match in re.finditer(
             r"\x1b\]7501;state=working(?=[;\x07\x1b\r\n]|$)", raw)]
@@ -752,7 +759,8 @@ def clean_output(s: str) -> str:
 def handle_reply(g: dict, m: dict, text: str) -> None:
     if m.get("reply_handled"):
         return
-    m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed")
+    m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed",
+             delivery_started=True, last_progress_at=time.time())
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
     if not text:

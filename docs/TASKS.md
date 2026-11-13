@@ -19,7 +19,7 @@
 | --- | --- | --- | --- |
 | 1 | 成员推理强度 | 新增并保存 `effort`；Codex 选 low/medium/high/xhigh 并写入 `codexConfig.model_reasoning_effort`；Claude Code 选 low/medium/high/xhigh/max 并写入 `claudeConfig.effort`，由 CAO 转为 `--effort`；留空沿用 CLI 默认；其他 provider 不显示；邀请/编辑、成员卡片及演示模式一致；保存、编辑重启及恢复有回归证据 | 审查与群主浏览器抽查通过：`f369734`；编辑强度日志由 claude 确认无问题（`116851a`） |
 | 2 | Codex 完成判定 | 以本轮输出最后一个 OSC 7501 标记为准，只有 done 完成；fake 模拟 status=idle 且仍 working，集成断言不提前读取为最终回复 | 审查通过（群主确认）：`116851a`、`092021c`；附带长输出回归本次补充 |
-| 3 | 启动即发丢失与无限等待 | 写清终端就绪信号及依据，只在就绪后投递；投递后长期无本轮进展须提示“可能未送达”并允许重发；隔离测试覆盖正常就绪、丢失及重发恢复 | `52a3e93` 审查不通过：占位输入框/兜底阻塞；本次独立修复待 Claude 复审，真实就绪联调待执行 |
+| 3 | 启动即发丢失与无限等待 | 写清终端就绪信号及依据，只在就绪后投递；投递后长期无本轮进展须提示“可能未送达”并允许重发；隔离测试覆盖正常就绪、丢失及重发恢复 | `aad5a16` 复审通过（群主确认）；真实冷启动 Codex 漏收快速回复，已重开；本次独立修复待审查 |
 | 4 | 并发重启竞态 | 同一群启动串行化或加入已有会话；无在线终端时并发启动多成员，所有成员最终进入同一会话，不出现 Session already exists | 待前项结案及群主授权 |
 | 5 | 窄窗口面板不可达 | 小于 1100px 可由按钮抽屉打开成员/日志，小于 760px 可打开群列表；手机宽度仍可建群、查看成员和日志，有具体浏览器验收记录 | 待前项结案及群主授权 |
 
@@ -77,13 +77,13 @@ OK
 
 独立修复提交为 `092021c`，未改写 `116851a`；群主已确认两提交审查通过。群主另报告真实 full 缓冲区达到 32768 字节，仅剩 done，此前观察 working 的记忆仍可完成；该数据只证明这一长输出场景，不代替后续启动就绪联调。
 
-### 第 3 项：启动投递与无进展恢复（待审查）
+### 第 3 项：启动投递与无进展恢复（真实联调重开，修复待审查）
 
 本次只做第 3 项和群主明确附带的两项小事，不实现第 4 项群启动竞态或第 5 项抽屉布局。每个提交仍交 Claude 审查；调度只快速核对，不自审；额度耗尽时本地标待审，不进入依赖项。
 
 就绪设计依据：本机 CAO `providers/codex.py` 的 `TUI_FOOTER_PATTERN` 注明 raw FIFO 不一定有可见提示箭头，使用 shortcuts/context/path 页脚辅助识别；Codex initialize 等待 CLI 状态并排除启动对话框。`providers/claude_code.py:1045` 的 `wait_until_input_ready` 在渲染屏幕上检查输入框及两次约 0.5 秒稳定捕获，且 initialize 在 gate 超时后仍可能继续。公开 terminal 模型没有统一 input-ready 字段。因此 GUI 使用 raw full 尾部的正向提示特征、idle/completed 状态、至少两次且间隔达标的稳定观察；不是固定 sleep 到点就发。
 
-Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 TUI 横线输入框（空或带 Try 占位提示）或旧版行尾空提示符。raw 稳定不等价于渲染屏幕稳定，版本/主题/启动权限菜单及两种 CLI 的键盘可输入时机仍标“待真实联调”。其他 provider 仅有非空输出加稳定 ready 状态的兼容路径，不新增真实兼容承诺。
+Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 TUI 横线输入框（空或带 Try 占位提示）或旧版行尾空提示符。raw 稳定不等价于渲染屏幕稳定，版本/主题/启动权限菜单仍待真实联调；群主在 aad5a16 的 Claude 冷启动已通过，Codex 消息虽送达但 GUI 漏收，重开记录见下文。其他 provider 仅有非空输出加稳定 ready 状态的兼容路径，不新增真实兼容承诺。
 
 消息设计：未取得 terminal 或未证明就绪时保存成员待投递队列；就绪后按顺序投递。投递后以本轮工作证据确认启动（Codex working；Claude fresh busy/等待确认），再由新输出刷新无进展时钟；不以重复 idle/busy 或无启动证据的重绘无限续期。超时提示“可能未送达”，UI 显示可重发状态；不自动重发，保留原消息及跳数，并用投递 ID/次数防止重复点击。
 
@@ -107,7 +107,7 @@ Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 T
 
 首组三连虽全部通过，但 Python 3.15 提示新并发测试的 HTTPError 响应未显式关闭；补齐 context/close 后得到上表无警告结果。所有子进程和临时目录均回收，随机端口不连接真实 9889 或 `~/.cao-groupchat`；不启动真实 CLI。文档相对链接/围栏/私人路径、`git diff --check`、共享日志忽略状态及 CSS 未变检查通过。第 3 项及附带事项原提交为 `52a3e93`；上述通过结果未覆盖带占位输入框及无匹配特征的人工出口，后经 Claude 审查不通过。未进入第 4/5 项、不推送，独立修复记录见下文。
 
-#### `52a3e93` 审查修复：占位输入框、人工出口与异常恢复（待复审）
+#### `52a3e93` 审查修复：占位输入框、人工出口与异常恢复（`aad5a16` 复审通过）
 
 2026-11-14，claude 审查不通过：空输入框正则误将 `❯ Try "fix typecheck errors"` 视为未就绪；未知特征的手动重试仍走相同硬门槛；发送的非 CaoError / 写盘异常可能卡在 dispatching，轮询线程也可能退出。审查者另以 `-W error::ResourceWarning` 复跑首版 71 项在 10.066 秒通过（审查者来源，仅为原版隔离结果）。
 
@@ -127,9 +127,34 @@ Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 T
 | 2 | 12.566 秒 | 77 项，OK |
 | 3 | 12.760 秒 | 77 项，OK |
 
-差异空白、文档链接/围栏/私人路径及共享日志忽略检查通过；AST 确认原 Codex 完成判定、输出提取、成员启停和 profile 未变，CSS 未变。子进程、临时目录清理沿用隔离夹具；不连接真实 9889，不启动真实 provider，没有新增真实联调记录。本次独立提交（交接给出哈希），不改写 `52a3e93`，只修上述问题，等待 Claude 复审。
+差异空白、文档链接/围栏/私人路径及共享日志忽略检查通过；AST 确认原 Codex 完成判定、输出提取、成员启停和 profile 未变，CSS 未变。子进程、临时目录清理沿用隔离夹具；不连接真实 9889，不启动真实 provider，没有新增真实联调记录。独立修复提交为 `aad5a16`，未改写 `52a3e93`；群主确认该项审查通过，随后真实冷启动发现下述阻塞并重开。
 
-待群主真实联调（本次未执行，不算通过）：
+#### `aad5a16` 真实冷启动联调重开：首次轮询只剩 done（修复待审查）
+
+2026-11-14，群主在 `aad5a16` 另起独立端口/临时数据目录实例，建群拉入 codex low、claude_code sonnet low，立即发送 `@所有人 只回复：收到，我是<名字>`。以下为群主提供的真实结果，本次实现者没有重复操作真实 CAO：
+
+| 成员 | 群主联调观察 |
+| --- | --- |
+| Claude Code | 就绪后投递，7 秒内回复进入群聊，通过该冷启动场景。 |
+| Codex | 消息已送达，2 秒内回复“收到，我是cx”，终端完成 working → done；CAO status=completed，status_generation/output_generation=48 > boundary=20。GUI 未收下，约 2 分钟后提示“可能未送达”，pending 未解除，阻塞。 |
+
+出错时 delivery_state=uncertain、delivery_started=False、codex_saw_working=False、codex_buffer_reset=True、codex_dispatch_markers=3。Claude 后续用真实函数只读复现：TUI 重绘超过 32KB，首次轮询前 working 已被挤出，raw 窗口仅剩 done；直接原因是 get_codex_reply 的“必须有 working”保护返回 None，delivery_started=False 是伴随状态，并不是拦截完成的门槛。原 32KB 用例只覆盖先前轮询见过 working，未覆盖此前完全没观察到的情况。
+
+本次修复：保留发送时 codex_dispatch_state 原值，不在缓冲区重置时丢弃，也不在忽略旧完成时改写它。若已识别缓冲区清空/重置、发送时不是 working、最后标记是 done 且 output_generation > dispatch_boundary，则不要求看到 working，即可收下本轮回复。发送时旧轮仍 working 的场景仍须本轮 working 证据；只有状态代际前进、输出代际未前进/缺失，或无重置证据，不能用孤立 done 完成。完整 W/D、追加及此前见过 working 的滚动路径保留。统一回复处理（含普通 provider）将 delivery_started 标为 True，解除 pending，不自动重发。
+
+失败先行：新增 4 个单测和 2 个 HTTP 集成，在生产代码未改时运行 6 项，1.467 秒，6 个失败子项、无错误；旧 working 负向保护用例通过。fake 同步完成路径在写 working 与 done 之间增加可控 40KB 重绘，产生恰为 32768 字节、无 working、仅一个 done 的窗口。集成在建群立即广播、尚未分配 terminal 时排队，分别覆盖 Codex/Claude 首次轮询前完成及首次轮询前 working 滚出；断言回复、started、pending、单次投递，并带截止时间轮询至实际 watchdog 期限之后，确认不告警。另以单测验证 20 → 48 代际及发送时旧 working 不被忘记。首次全量 83 项在 14.849 秒通过，无跳过。
+
+最终验证（2026-11-14，codex）：连续三次执行 `python3 -B -W error::ResourceWarning -m unittest discover -s tests`，均退出 0，83 项通过（65 后端单测、14 HTTP 集成、4 Node 前端回归），无跳过/资源警告，单轮低于一分钟。
+
+| 次数 | unittest 耗时 | 结果 |
+| --- | --- | --- |
+| 1 | 14.922 秒 | 83 项，OK |
+| 2 | 14.476 秒 | 83 项，OK |
+| 3 | 14.596 秒 | 83 项，OK |
+
+文档相对链接、围栏、私人路径扫描、`git diff --check` 及日志忽略检查通过；AST 确认生产代码仅改变 get_codex_reply 和 handle_reply，未改就绪/超时/启停、前端及第 4/5 项。测试使用随机端口、隔离临时目录并清理子进程，不连接真实 9889 或启动真实 CLI。仅做本次冷启动修复，独立提交（本节所属提交，交接给出哈希），待 Claude 审查及群主在修复版重新真实联调；不进入第 4/5 项、不推送。
+
+后续真实联调清单（Claude 冷启动在 `aad5a16` 已通过上述单一场景，Codex 修复版及其余场景仍待执行）：
 
 | 场景 | 操作与预期 |
 | --- | --- |
