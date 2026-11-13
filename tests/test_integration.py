@@ -226,7 +226,7 @@ class IntegrationTests(unittest.TestCase):
         interim = "仅中途文字，@评审 不应收到这条"
         final = "本轮最终回复，@评审 请审查。"
         reviewed = "已收到本轮最终回复。"
-        self.next_turn(tid, final, idle_stream=True, interim=interim)
+        self.next_turn(tid, final, idle_stream=True, interim=interim, append_output=True)
         self.next_turn(review_tid, reviewed)
         self.api("POST", "/messages", {"text": "@开发 处理本轮任务"})
 
@@ -254,6 +254,54 @@ class IntegrationTests(unittest.TestCase):
                          ["[来自 开发] " + final])
         self.assertEqual(set(self.terminal(tid)["inputs"][-1]["reported_statuses"]), {"idle"})
         self.assertEqual(self.terminal(tid)["last_reads"], previous["last_reads"] + 1)
+
+    def test_codex_buffer_clear_allows_fast_and_identical_short_replies(self):
+        self.create_group()
+        member = self.invite("开发", "codex", "developer")
+        tid = member["terminal_id"]
+        warmup = "上一轮足够长的正文，作为发送前缓冲区"
+        self.next_turn(tid, warmup)
+        self.api("POST", "/messages", {"text": "@开发 准备上一轮"})
+        self.assertEqual(self.wait_replies(1)[0]["text"], warmup)
+        for count in (2, 3):
+            previous = self.terminal(tid)
+            self.assertIn("state=done", previous["full_out"])
+            self.next_turn(tid, "收到", complete_on_input=True)
+            self.api("POST", "/messages", {"text": f"@开发 第{count}轮短回复"})
+            replies = self.wait_replies(count)
+            self.assertEqual([m["text"] for m in replies], [warmup] + ["收到"] * (count - 1))
+            state = self.terminal(tid)
+            self.assertTrue(state["inputs"][-1]["complete_on_input"])
+            self.assertFalse(state["inputs"][-1]["append_output"])
+            self.assertNotIn(warmup, state["full_out"])
+            self.assertEqual(state["full_out"].count("state=working"), 1)
+            self.assertEqual(state["full_out"].count("state=done"), 1)
+            if count == 3:
+                self.assertEqual(state["full_out"], previous["full_out"])
+            self.assertFalse(self.api("GET")["members"][0]["pending"])
+
+    def test_codex_cleared_late_old_done_waits_for_new_working_and_done(self):
+        self.create_group()
+        member = self.invite("开发", "codex", "developer")
+        tid = member["terminal_id"]
+        self.next_turn(tid, "旧轮不应入群", idle_stream=True, interim="旧轮执行中")
+        self.api("POST", "/messages", {"text": "@开发 旧任务"})
+        self.until("old input dispatched", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
+        self.until("old working observed", lambda: self.api("GET")["members"][0].get("codex_saw_working"))
+        final = "只有新轮最终回复可以入群"
+        self.next_turn(tid, final, idle_stream=True, interim="旧轮收尾文字",
+                       raw_prefix="\x1b]7501;state=done\x07")
+        self.api("POST", "/messages", {"text": "@开发 新任务"})
+        self.until("old done polled twice after buffer clear", lambda:
+                   len(self.terminal(tid)["inputs"]) == 2 and
+                   self.terminal(tid)["inputs"][-1]["phase_reads"][0] >= 2)
+        self.assertEqual(self.replies(), [])
+        self.assertTrue(self.api("GET")["members"][0]["pending"])
+        self.assertNotIn("state=working", self.terminal(tid)["full_out"])
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
+        self.assertEqual([m["text"] for m in self.wait_replies(1)], [final])
 
     def test_effort_survives_edit_member_restart_and_server_restore(self):
         self.create_group()

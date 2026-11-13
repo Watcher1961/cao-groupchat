@@ -17,8 +17,8 @@
 
 | 顺序 | 项目 | 可观察的验收标准 | 状态 / 提交 |
 | --- | --- | --- | --- |
-| 1 | 成员推理强度 | 新增并保存 `effort`；Codex 选 low/medium/high/xhigh 并写入 `codexConfig.model_reasoning_effort`；Claude Code 选 low/medium/high/xhigh/max 并写入 `claudeConfig.effort`，由 CAO 转为 `--effort`；留空沿用 CLI 默认；其他 provider 不显示；邀请/编辑、成员卡片及演示模式一致；保存、编辑重启及恢复有回归证据 | 审查与群主浏览器抽查通过：`f369734`；编辑强度日志本次补充，待复审 |
-| 2 | Codex 完成判定 | 以本轮输出最后一个 OSC 7501 标记为准，只有 done 完成；fake 模拟 status=idle 且仍 working，集成断言不提前读取为最终回复 | 已实现，44 项测试通过，待独立审查；本清单所属提交 |
+| 1 | 成员推理强度 | 新增并保存 `effort`；Codex 选 low/medium/high/xhigh 并写入 `codexConfig.model_reasoning_effort`；Claude Code 选 low/medium/high/xhigh/max 并写入 `claudeConfig.effort`，由 CAO 转为 `--effort`；留空沿用 CLI 默认；其他 provider 不显示；邀请/编辑、成员卡片及演示模式一致；保存、编辑重启及恢复有回归证据 | 审查与群主浏览器抽查通过：`f369734`；编辑强度日志由 claude 确认无问题（`116851a`） |
+| 2 | Codex 完成判定 | 以本轮输出最后一个 OSC 7501 标记为准，只有 done 完成；fake 模拟 status=idle 且仍 working，集成断言不提前读取为最终回复 | `116851a` 审查不通过：清空缓冲区时短回复卡住；独立修复 50 项通过，待复审（本清单所属提交） |
 | 3 | 启动即发丢失与无限等待 | 写清终端就绪信号及依据，只在就绪后投递；投递后长期无本轮进展须提示“可能未送达”并允许重发；隔离测试覆盖正常就绪、丢失及重发恢复 | 待前项结案及群主授权 |
 | 4 | 并发重启竞态 | 同一群启动串行化或加入已有会话；无在线终端时并发启动多成员，所有成员最终进入同一会话，不出现 Session already exists | 待前项结案及群主授权 |
 | 5 | 窄窗口面板不可达 | 小于 1100px 可由按钮抽屉打开成员/日志，小于 760px 可打开群列表；手机宽度仍可建群、查看成员和日志，有具体浏览器验收记录 | 待前项结案及群主授权 |
@@ -46,22 +46,36 @@
 
 仅对 `provider=codex` 使用 OSC 7501；其他 provider 的 status、generation、busy、等待确认及错误路径保持原行为。第 3–5 项不实现。第 1 项附带日志补充：真实与演示编辑日志记录 `推理强度=<值或 CLI 默认>`，HTTP/前端回归同时覆盖。
 
-- 发送前读取 raw full 输出，记录 7501 标记数、最后状态与 full 降级偏移；只保存计数/状态，不持久化或记录原始终端正文。读取基线失败则通过原发送失败路径报告，不盲目投递。
+- 发送前读取 raw full 输出，记录长度、SHA-256 指纹、7501 标记数/末状态及 full 降级偏移；只保存元数据，不持久化或记录原始终端正文。读取基线失败则通过原发送失败路径报告，不盲目投递。
 - 轮询只在原始输出上解析，先判定完成再清洗正文。无本轮标记、最后是 working、未知/拆分的最后标记或输出请求失败，均保持 pending，不因 CAO idle、busy、代际或等待时长提前完成。
-- 排除发送前旧 done；如果发送时旧轮仍 working，先排除其迟到的 done，等新一轮 working/done。追加缓冲以标记数越过边界识别新轮；滚动窗口以发送后观察到的 working→done 补足。无法证明属于新轮时继续等待，升级前 pending 且缺少基线的轮次需新输入建立边界。
-- 满足本轮最后标记 done 后才读取 last 回复、写入群聊并沿用原提及转发；last 不支持时仍用 full 新增部分降级。Codex 完成以 raw 标记为准，可处理 status/generation 滞后；其他 provider 继续原规则。
-- fake 新增 `idle_stream` 和 `advance`：本轮 status 始终 idle，先输出无新标记的中途文字，再出现 working，最后出现 done；完整输出和 last 回复分离，并提供各阶段轮询及读取计数。状态推进不依赖固定 sleep。原旧 completed 回归改为确认 last 未读取，允许 raw 探测标记。
+- 默认按 CAO input 清空 FIFO 的语义处理：原前缀不再匹配或长度缩短时将有效边界归零，若本轮 working 与最后 done 在首次轮询中同时出现也能完成。若连续短回复字节完全相同，用新的 `output_generation > dispatch_boundary` 证明有新输出，再结合 raw working/done；不以 status 或 status_generation 代替标记。只追加兼容路径保留原前缀/标记边界。无新 working 的迟到旧 done 继续等待，滚动窗口中已观察过本轮 working 后的 done 可完成。无法证明属于新轮时继续等待，升级前 pending 且缺少基线的轮次需新输入建立边界。
+- 满足本轮最后标记 done 后才读取 last 回复、写入群聊并沿用原提及转发；last 不支持时按当前轮 full 的起点降级；清空后不再沿用上一轮长度偏移。Codex 完成以 raw 标记为准，可处理 status/generation 滞后；其他 provider 继续原规则。
+- fake 的 input 默认清空 `full_out`（与已安装 CAO 源码一致），以 `append_output=true` 显式测试只追加兼容；`complete_on_input=true` 在首次轮询前同步产生 working+done。`output_generation` 仅在产生原始输出时递增。保留 `idle_stream` 和 `advance`：本轮 status 始终 idle，先输出无新标记的中途文字，再出现 working，最后出现 done；完整输出和 last 回复分离，并提供各阶段轮询及读取计数。状态推进不依赖固定 sleep。原旧 completed 回归改为确认 last 未读取，允许 raw 探测标记。
 
 测试先行记录（2026-11-14，codex）：生产代码未改时运行 13 项针对性检查（10 个新单测、新 idle 集成、既有强度 HTTP/演示检查），`Ran 13 tests in 6.805s`，15 个失败子项、无错误/跳过。实现后该 13 项在 12.969 秒全部通过。再补“发送时旧轮 working”的边界测试，先在 0.030 秒复现 1 个失败子项，再修复。
 
-最终运行 `python3 -B -m unittest discover -s tests -v`：
+首版 `116851a` 的隔离测试结果（该版未覆盖真实 CAO 的 input 清空行为，已被审查阻塞）：
 
 ```text
 Ran 44 tests in 38.177s
 OK
 ```
 
-包含 37 个后端单测、4 个 HTTP 集成、3 个 Node 前端回归，无跳过，整套低于一分钟。fake/GUI 均使用随机端口、临时 HOME/数据/工作目录，结束回收，不访问真实 9889 或 `~/.cao-groupchat`。文档链接、围栏、隐私和 `git diff --check` 通过；AST 确认非 Codex 原判定分支及成员启动函数未改，前端仅增加编辑日志强度字段。提交为本清单所属提交，交接报告实际哈希。本项及日志补充待独立审查；没有新增真实 CAO/provider 联调结果。
+包含 37 个后端单测、4 个 HTTP 集成、3 个 Node 前端回归，无跳过，整套低于一分钟。fake/GUI 均使用随机端口、临时 HOME/数据/工作目录，结束回收，不访问真实 9889 或 `~/.cao-groupchat`。文档链接、围栏、隐私和 `git diff --check` 通过；AST 确认非 Codex 原判定分支及成员启动函数未改，前端仅增加编辑日志强度字段。首版提交为 `116851a`，claude 审查不通过；日志补充确认无问题。清空语义的修复记录如下，没有新增真实 CAO/provider 联调结果。
+
+#### `116851a` 审查修复：发送清空与快速完成
+
+审查来源：claude 复现发送前 `W 上一轮 D`、发送后清空为 `W 收到 D` 时，首版按旧标记数 2 一直等待。本次只读核对本机已安装 CAO 源码：`terminal_service.py:4746` 在按键前调用 `clear_rolling_buffer`，`4930` 起 full 读取 FIFO 原始字节，默认上限 32KB；`status_monitor.clear_rolling_buffer` 保留状态但清空字节，输出响应不含 epoch。`output_generation` 是实际输出计数，状态改变本身不代表新字节。
+
+修复范围：`server.py` 的快照边界/回复降级及 fake、测试、相关文档；不重改已通过的强度日志，不实现第 3–5 项。保留只追加、无标记/working、未知/拆分标记、输出读取失败和非 Codex 回归。
+
+测试先行：修改 fake 为默认 input 清空、增加同步完成及迟到旧 done 场景后，生产代码未改时运行 7 项针对性检查，`Ran 7 tests in 25.506s`，7 个失败子项、无错误；复现短回复等待超时、不同长度/等长新缓冲、相同短回复及 full 旧偏移问题。另保留旧轮 working 的负向保护回归。
+
+新增 4 个单测和 2 个 HTTP 集成：首次轮询前已同时出现 W/D；连续两轮完全相同的“收到”；旧轮 working 时发送、清空后仅旧 D 不提前完成，新 W/D 才回复；full 降级仅保留新轮。原 idle 流测试显式选择追加模式。首次完整运行 50 项在 52.349 秒全部通过；随后校准 fake 的 output_generation，使只有原始字节到达才递增；最终 `python3 -B -m unittest discover -s tests -v`：`Ran 50 tests in 52.520s`、`OK`，无跳过。包含 41 个后端单测、6 个 HTTP 集成、3 个 Node 前端回归，整套低于一分钟。
+
+文档链接、围栏、隐私及 `git diff --check` 通过；AST 核对非 Codex 原分支、成员启停与原回复提取不变，前端/日志代码与 `116851a` 一致。fake/GUI 均以随机端口及临时目录运行并清理，不访问真实 CAO。
+
+本次使用独立修复提交（本清单所属提交，交接给出实际哈希），待 claude 复审，不改写 `116851a`；真实 provider 联调仍待执行。
 
 ## 任务 3 提交顺序与边界
 
@@ -192,10 +206,10 @@ OK
 | 问题或待办 | 当前事实 / 后续可观察的验收 | 安排 |
 | --- | --- | --- |
 | 多成员同时重启争抢新建 CAO 会话 | 当前可能各自调用 POST /sessions，后到者报 Session already exists；未来应验证并发重启后成员均进入同一群会话 | 第二轮第 4 项，待前项结案及群主授权 |
-| 成员推理强度 | `f369734` 已审查通过，群主表单/卡片抽查通过；本次补编辑强度日志 | 日志补充待复审；真实 provider 参数联调待验证 |
+| 成员推理强度 | `f369734` 已审查通过，群主表单/卡片抽查通过；本次补编辑强度日志 | 日志补充审查无问题；真实 provider 参数联调待验证 |
 | 启动后立即发消息可能丢失 | 群主在第一轮运行中发现；后续需验证终端就绪前后的投递与恢复 | 第二轮第 3 项，待前项结案及群主授权 |
 | 丢消息后一直“思考中” | 群主观察到消息丢失后没有超时，成员持续显示思考中；后续需验证超时反馈与恢复 | 第二轮第 3 项，待前项结案及群主授权 |
-| Codex 的 CAO status 不可靠 | 群主观察到干活中也可能报 idle，导致中途输出被当作回复；可靠信号为 Codex 终端输出里的 OSC 7501 序列 `state=working` / `state=done`；第二轮第 2 项实现 raw 标记及本轮边界判定，待独立审查 | 本次范围；真实 provider 联调待验证 |
+| Codex 的 CAO status 不可靠 | 群主观察到干活中也可能报 idle，导致中途输出被当作回复；可靠信号为 Codex 终端输出里的 OSC 7501 序列 `state=working` / `state=done`；`116851a` 的固定标记数边界被审查阻塞，本次修复清空/快速完成语义，待复审 | 本次范围；真实 provider 联调待验证 |
 | kiro 等其他 provider | 尚未真实联调；需逐一核对启动、权限、输出和接力 | 待验证，非当前兼容性承诺 |
 | waiting_user_answer | 代码有提示与定向回复路径，真实权限确认能否恢复交互尚待验证 | 待验证，不算已通过 |
 | 集成验收 | 原 22 个单测与 2 个隔离集成已审查通过；现补充恢复后再次收发。群主人工第 1–6、8 步通过，第 7 步部分失败 | 任务 4 已结案（群主确认）；窄窗口问题延期 |

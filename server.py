@@ -19,6 +19,7 @@ CAO 群聊 GUI 后端 —— 把 CLI Agent Orchestrator (CAO) 包装成"项目�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -423,6 +424,9 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> Non
                 m["codex_dispatch_markers"] = len(states)
                 m["codex_dispatch_state"] = states[-1] if states else None
                 m["codex_saw_working"] = False
+                m["codex_snapshot_len"] = len(raw)
+                m["codex_snapshot_hash"] = hashlib.sha256(raw.encode()).hexdigest()
+                m["codex_buffer_reset"] = False
                 m["full_len"] = len(raw)
         save_state()
     except CaoError as e:
@@ -457,21 +461,38 @@ def codex_states(raw: str) -> list[str | None]:
     return states
 
 
-def get_codex_reply(m: dict) -> str | None:
+def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None:
     boundary = m.get("codex_dispatch_markers")
     if boundary is None:
         return None  # A pending turn from before this protocol has no proven boundary.
     raw = get_full_output(m)
     states = codex_states(raw)
+    snapshot_len, snapshot_hash = m.get("codex_snapshot_len"), m.get("codex_snapshot_hash")
+    if snapshot_len is not None and snapshot_hash is not None:
+        same_prefix = (len(raw) >= snapshot_len and
+                       hashlib.sha256(raw[:snapshot_len].encode()).hexdigest() == snapshot_hash)
+        fresh_bytes = (isinstance(output_generation, int) and isinstance(m.get("boundary"), int)
+                       and output_generation > m["boundary"])
+        # CAO clears its FIFO before input. A byte-identical fast reply is also
+        # new when the output counter advanced; status_generation is not used.
+        identical_new_turn = (len(raw) == snapshot_len and same_prefix and fresh_bytes
+                              and states and states[-1] == "done" and "working" in states[:-1])
+        if not same_prefix or identical_new_turn:
+            m["codex_buffer_reset"] = True
+    reset = m.get("codex_buffer_reset", False)
+    dispatch_state = None if reset else m.get("codex_dispatch_state")
+    if reset:
+        boundary = 0
+        m["full_len"] = 0
     if not states:
         return None
     if states[-1] == "working":
-        if len(states) > boundary or m.get("codex_dispatch_state") != "working":
+        if len(states) > boundary or dispatch_state != "working":
             m["codex_saw_working"] = True
         return None
     if states[-1] != "done":
         return None
-    if (m.get("codex_dispatch_state") == "working" and not m.get("codex_saw_working")
+    if (dispatch_state == "working" and not m.get("codex_saw_working")
             and "working" not in states[boundary:]):
         # Discard the completion of the turn already working at dispatch time.
         m["codex_dispatch_markers"] = len(states)
@@ -482,6 +503,12 @@ def get_codex_reply(m: dict) -> str | None:
     # handles a rolling terminal window that has discarded the old prefix.
     if len(states) <= boundary and not m.get("codex_saw_working"):
         return None
+    if not m.get("codex_saw_working") and "working" not in states[boundary:-1]:
+        return None  # A lone late done can still belong to the previous turn.
+    if reset:
+        starts = [match.start() for match in re.finditer(
+            r"\x1b\]7501;state=working(?=[;\x07\x1b\r\n]|$)", raw)]
+        m["full_len"] = starts[-1] if starts else 0
     return get_reply(m)
 
 
@@ -565,7 +592,7 @@ def poll_loop() -> None:
             if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
                 m["status"] = "processing"
                 try:
-                    reply = get_codex_reply(m)
+                    reply = get_codex_reply(m, output_generation=t.get("output_generation"))
                 except CaoError:
                     continue  # A failed probe is not evidence of completion.
                 if reply is not None:

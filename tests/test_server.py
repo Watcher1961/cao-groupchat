@@ -286,7 +286,7 @@ class CodexCompletionTests(ServerTestCase):
         self.group["members"] = [self.developer]
         self.group["messages"].clear()
 
-    def poll(self, raw, status="idle", generation=2, fail_full=False, last_unsupported=False):
+    def poll(self, raw, status="idle", generation=2, fail_full=False, last_unsupported=False, output_generation=None):
         def response(method, path, query=None, **kwargs):
             self.assertEqual(method, "GET")
             if path.endswith("/output"):
@@ -297,13 +297,53 @@ class CodexCompletionTests(ServerTestCase):
                 if last_unsupported:
                     raise self.server.CaoError(422, "last output unavailable")
                 return {"output": "本轮最终回复"}
-            return {"status": status, "status_generation": generation}
+            return {"status": status, "status_generation": generation,
+                    "output_generation": output_generation}
         self.cao.side_effect = response
         class StopPolling(Exception):
             pass
         with patch.object(self.server.time, "sleep", side_effect=[None, StopPolling]):
             with self.assertRaises(StopPolling):
                 self.server.poll_loop()
+
+    def dispatch_from(self, previous):
+        self.prepare()
+        self.cao.side_effect = [{"output": previous}, {"dispatch_boundary": 7}]
+        self.server.send_to(self.group, self.developer, "新一轮", 0)
+
+    def test_cleared_buffer_finishes_short_reply_before_any_working_poll(self):
+        for previous, current in (("上一轮很长的内容", "短回复"),
+                                  ("短", "本轮更长的最终回复"),
+                                  ("旧内容", "新内容")):
+            with self.subTest(previous=previous, current=current):
+                self.dispatch_from(self.WORKING + previous + self.DONE)
+                self.poll(self.WORKING + current + self.DONE)
+                self.assertFalse(self.developer["pending"])
+                self.assertEqual(self.group["messages"][0]["text"], "本轮最终回复")
+
+    def test_identical_short_reply_needs_fresh_output_not_fresh_status(self):
+        raw = self.WORKING + "收到" + self.DONE
+        self.dispatch_from(raw)
+        self.poll(raw, generation=8, output_generation=7)
+        self.assertTrue(self.developer["pending"])
+        self.poll(raw, generation=7, output_generation=8)
+        self.assertFalse(self.developer["pending"])
+        self.assertEqual(self.group["messages"][0]["text"], "本轮最终回复")
+
+    def test_cleared_old_done_without_working_cannot_finish_new_input(self):
+        self.dispatch_from(self.WORKING + "旧轮仍在执行")
+        self.poll("旧轮结束" + self.DONE)
+        self.assertTrue(self.developer["pending"])
+        self.poll("旧轮结束" + self.DONE)
+        self.assertTrue(self.developer["pending"])
+        self.poll("旧轮结束" + self.DONE + self.WORKING + "新轮" + self.DONE)
+        self.assertFalse(self.developer["pending"])
+
+    def test_cleared_full_fallback_drops_old_turn_offset(self):
+        self.dispatch_from(self.WORKING + "上一轮很长的正文" + self.DONE)
+        self.poll(self.WORKING + "短" + self.DONE, last_unsupported=True)
+        self.assertFalse(self.developer["pending"])
+        self.assertEqual([m["text"] for m in self.group["messages"]], ["短"])
 
     def test_idle_without_any_marker_never_falls_back_to_status_or_elapsed_time(self):
         self.prepare()
@@ -320,7 +360,7 @@ class CodexCompletionTests(ServerTestCase):
                               (self.DONE + "\x1b]7501;state=don", False),
                               (self.DONE + "\x1b]7501;state=done_later\x07", False),
                               ("\x1b]7501;state=working\x1b\\正文\x1b]7501;state=done\x1b\\", True),
-                              (self.DONE, True)):
+                              (self.DONE, False)):
             with self.subTest(raw=repr(raw)):
                 self.prepare()
                 self.poll(raw)
