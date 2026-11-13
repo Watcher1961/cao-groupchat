@@ -394,6 +394,20 @@ let MODELS = {claude_code:[
   {id:"team",label:"Team / Enterprise",models:[{id:"opus",label:"Opus"},{id:"sonnet",label:"Sonnet（推荐）"},{id:"haiku",label:"Haiku"}]},
   {id:"api",label:"API Key（按量计费）",models:[{id:"claude-opus-5-5",label:"Claude Opus 5.5"},{id:"claude-sonnet-5-5",label:"Claude Sonnet 5.5"},{id:"claude-haiku-5-5",label:"Claude Haiku 5.5"},{id:"claude-fable-5-2",label:"Claude Fable 5.2"}]}
 ]};
+const EFFORTS = {codex:["low","medium","high","xhigh"],claude_code:["low","medium","high","xhigh","max"]};
+function cleanEffort(provider,value){
+  if(value==null) return "";
+  if(typeof value!=="string") throw new Error("推理强度必须是字符串");
+  const effort=value.trim();
+  if(effort && !(EFFORTS[provider]||[]).includes(effort)) throw new Error("该模型 CLI 不支持所选推理强度");
+  return effort;
+}
+function effortRowHTML(provider,value){
+  const choices=EFFORTS[provider]; if(!choices) return "";
+  const current=choices.includes(value)?value:"";
+  return `<div class="field"><label>推理强度</label><select name="effort">${["",...choices].map(v=>`<option value="${v}" ${v===current?"selected":""}>${v||"默认（CLI 自己的默认强度）"}</option>`).join("")}</select></div>`;
+}
+function effortCaption(m){ return EFFORTS[m.provider]?`推理强度：${m.effort||"CLI 默认"}`:""; }
 const CUSTOM="__custom";
 function lsGet(k){ try{ return localStorage.getItem(k)||""; }catch{ return ""; } }
 function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch{} }
@@ -414,7 +428,8 @@ class Mock {
     g.messages.push(m); if(kind!=="system") this.log(g,sender,`发言${to&&to.length?`（→ ${to.join(", ")}）`:""}：${text.split("\n")[0].slice(0,120)}`); return m; }
   member(raw,g){ const name=(raw.name||"").trim(); if(!name) throw new Error("成员需要名字");
     if(g.members.some(x=>x.name===name&&x.id!==raw.id)) throw new Error(`群里已经有叫 ${name} 的成员`);
-    return {id:raw.id||("m"+Math.random().toString(16).slice(2,8)),name,provider:raw.provider||"claude_code",model:raw.model||"",plan:raw.plan||"",
+    const provider=raw.provider||"claude_code", effort=cleanEffort(provider,raw.effort);
+    return {id:raw.id||("m"+Math.random().toString(16).slice(2,8)),name,provider,effort,model:raw.model||"",plan:raw.plan||"",
       role:raw.role||"developer",tools:raw.tools||[],duty:raw.duty||"",permission_mode:raw.permission_mode||"",color:raw.color||"",
       terminal_id:null,status:"starting"}; }
   boot(g,m){ setTimeout(()=>{ m.terminal_id=Math.random().toString(16).slice(2,10); m.status="idle";
@@ -667,6 +682,7 @@ function renderPane(){
         <div style="min-width:0"><div class="nm">${esc(m.name)}</div><div class="pv">${esc(provLabel(m.provider))}${m.model?" · "+esc(m.model):""}</div></div>
         <div class="mstat ${dc==="ok"?"":dc}">${esc(STATUS_TXT[st]||st)}</div></div>
         <div class="duty"><b>${esc((ROLE_LABEL[m.tools&&m.tools.length?"custom":m.role]||m.role).split(" ")[0])}</b> · ${esc(m.duty||"未指定职责")}</div>
+        ${effortCaption(m)?`<div class="note">${esc(effortCaption(m))}</div>`:""}
         <div class="tools">${toolChips(m)}</div>${enf}${usageHTML(m)}
         <div class="mact"><button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
       </div>`;}).join("")}
@@ -701,7 +717,7 @@ async function refresh(){
     const top=S.msgs.length?S.msgs.at(-1).seq:0;
     const fresh=g.messages.filter(m=>m.seq>top);
     S.group=g; S.msgs=S.msgs.concat(fresh);
-    const sig=JSON.stringify(g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model]));
+    const sig=JSON.stringify(g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort]));
     if(fresh.length){ renderMsgs(); await loadGroups(); renderGroups(); if(S.tab==="log") loadLog();
       if(fresh.some(m=>m.kind==="agent")) setTimeout(loadUsage,1500); }
     if(sig!==lastSig){ lastSig=sig; renderHead(); renderComposer(); if(S.tab==="members") renderPane(); }
@@ -722,6 +738,7 @@ function memberFormHTML(m,i,removable){
       <div class="field"><label>模型 CLI（provider）</label><select name="provider">${PROVIDERS.map(p=>`<option value="${p.id}" ${p.id===(m.provider||"claude_code")?"selected":""}>${esc(p.label)}${p.installed===false?"（本机未安装）":""}</option>`).join("")}</select></div>
     </div>
     <div class="mdl">${modelRowHTML(m.provider||"claude_code",m.plan,m.model)}</div>
+    <div class="effort">${effortRowHTML(m.provider||"claude_code",m.effort)}</div>
     <div class="field"><label>职责</label><textarea name="duty" rows="2" placeholder="例如：负责拆分任务、分派给其他成员、汇总进度；不直接写代码">${esc(m.duty||"")}</textarea></div>
     <div class="grid2">
       <div class="field"><label>角色（决定默认权限）</label><select name="role">${Object.keys(ROLE_LABEL).map(r=>`<option value="${r}" ${r===role?"selected":""}>${ROLE_LABEL[r]}</option>`).join("")}</select></div>
@@ -770,7 +787,8 @@ function readMember(el){
   const preset=ROLES[role];
   const norm=a=>{ const s=new Set(a); if(s.has("fs_*")){s.delete("fs_*");["fs_read","fs_write","fs_list"].forEach(x=>s.add(x));} return [...s].sort().join(","); };
   const custom = role==="custom" || !preset || norm(checked)!==norm(preset);
-  return {name:v("name"),provider:v("provider"),model:readModel(el),plan:v("plan"),duty:v("duty"),permission_mode:v("permission_mode"),
+  const effort=cleanEffort(v("provider"),el.querySelector("[name=effort]")?.value);
+  return {name:v("name"),provider:v("provider"),effort,model:readModel(el),plan:v("plan"),duty:v("duty"),permission_mode:v("permission_mode"),
     role: role==="custom"?"developer":role, tools: custom?checked:[]};
 }
 function wireMemberForm(el){
@@ -782,6 +800,8 @@ function wireMemberForm(el){
     const exp=t?[...new Set(t.flatMap(x=>x==="fs_*"?["fs_read","fs_write","fs_list"]:[x]))].sort().join(","):"";
     if(now!==exp) roleSel.value="custom"; });
   prov.onchange=()=>{ el.querySelector(".cc").style.display=prov.value==="claude_code"?"":"none";
+    const effort=el.querySelector("[name=effort]")?.value;
+    el.querySelector(".effort").innerHTML=effortRowHTML(prov.value,effort);
     el.querySelector(".mdl").innerHTML=modelRowHTML(prov.value,"",""); wireModelRow(el); };
   wireModelRow(el);
   const nm=el.querySelector("[name=name]"); nm.oninput=()=>{ el.querySelector(".hd span:nth-child(2)").textContent=nm.value||"新成员"; el.querySelector(".hd .av").textContent=(nm.value||"新").slice(0,2); };

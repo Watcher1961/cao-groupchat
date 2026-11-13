@@ -15,7 +15,8 @@
 | `server.py` | Python 标准库后端及 CAO HTTP 适配 |
 | `index.html` | 单文件前端与浏览器演示模式 |
 | `tests/fake_cao.py` | 模拟 CAO HTTP 服务，支持随机端口和状态代际；不是自动断言套件 |
-| `tests/test_integration.py` | 隔离子进程与 HTTP 集成验收，覆盖接力、残留状态和重启恢复 |
+| `tests/test_integration.py` | 隔离子进程与 HTTP 集成验收，覆盖接力、残留状态、恢复及成员 effort/profile |
+| `tests/test_frontend.py`、`tests/frontend_effort.js` | 可选 Node 的前端行为回归；无 npm 包，不替代浏览器验收 |
 | `tests/test_server.py` | 标准库 unittest，隔离导入与群聊行为测试 |
 
 ## 构建、运行与验证
@@ -43,6 +44,8 @@ python3 -B tests/fake_cao.py --port 0             # 隔离模拟服务，持续�
 ```bash
 python3 -B -m unittest discover -s tests -v
 ```
+
+前端行为回归使用可选 Node 执行页面脚本，无第三方包；缺少 Node 时明确跳过对应测试，不能记为前端已验证。应用本身仍不需要 Node 或前端构建。
 
 集成测试启动真实 Python 后端和模拟 CAO 子进程，使用随机端口、临时 HOME/数据/日志目录及独立环境；结束或断言失败均回收子进程和临时目录，不接触 9889 或真实 CAO 会话。文档变更检查相对链接、敏感信息、范围和 `git diff --check`；不要把语法检查、模拟结果或代码走读记作真实 provider 联调。
 

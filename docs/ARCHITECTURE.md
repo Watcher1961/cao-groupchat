@@ -10,15 +10,17 @@
 | CAO 适配与轮询 | 标准库 HTTP 请求、可选 Bearer token、每 2 秒轮询 terminal 状态和完成输出 |
 | 持久化与共享日志 | 群和消息写入数据目录的 `groups.json`；先写临时文件再替换；工作目录内追加 `GROUP_LOG.md` |
 | 用量解析 | 读取本机 Claude Code/Codex CLI JSONL，按成员标记认领，缓存解析并估算费用 |
-| `tests/test_server.py` | 22 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为与输出清洗 |
+| `tests/test_server.py` | 26 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗和 effort/profile |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，可保持并释放旧 completed；不包含验收断言 |
-| `tests/test_integration.py` | 两个真实子进程 HTTP 集成测试：入群、定向收发、接力、残留状态屏障、数据文件及重启恢复 |
+| `tests/test_integration.py` | 三个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复以及 effort 编辑/重启的 profile 安装 |
+| `tests/test_frontend.py`、`tests/frontend_effort.js` | 可选 Node VM 的 3 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
 
 ## 前端与交互约定
 
 - 前端颜色全部走 `:root` 设计令牌；主题支持浅色、深色与跟随系统，选择存入 localStorage 的 `theme` 键。
+- 成员 `effort` 按 provider 校验并持久化；表单提供 CLI 默认及指定选项，切换 provider 清除不兼容值；卡片显示配置或 CLI 默认，Mock 使用相同选择与校验语义。
 - 对话区采用 Telegram 式气泡；同一人 5 分钟内连续发言合并为一组，系统消息和日期分隔单独显示。
 - 成员 `plan` 决定用量展示：订阅计划显示可取得的账号额度与本群 token（可附 API 价折算，订阅不另收费）；`api` 显示估算金额与 token，未知价格提示补充；未选计划时提供可取得的额度与费用参考。
 - 选目录通过 `osascript` 打开 macOS 原生对话框；非 macOS 或缺少该命令、原生选择失败时，前端退回页面内目录浏览。用户取消时不打开降级浏览器。
@@ -26,7 +28,7 @@
 ## 数据流
 
 1. 浏览器经 `/api/groups` 创建群，提交工作目录与成员配置；后端保存群并异步启动成员。
-2. 每位成员生成独立 agent profile；一个群对应一个 CAO session，一位成员对应一个 terminal。权限与职责写入 profile，实际执行由 provider 决定。
+2. 每位成员生成独立 agent profile；非空 effort 对 Codex 写入 `codexConfig.model_reasoning_effort`，对 Claude Code 写入 `claudeConfig.effort`，由 CAO 转为对应 CLI 配置；缺字段或空值不写配置。一个群对应一个 CAO session，一位成员对应一个 terminal。权限与职责写入 profile，实际执行由 provider 决定。
 3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时发送给所有有 terminal 的成员。
 4. CAO input 响应的 `dispatch_boundary` 记为本轮边界。轮询读取 `status_generation`，只有大于边界的完成状态才属于本轮；字段缺失时降级为忙碌状态或发送后等待时间判定。
 5. 读取并清洗回复：去除 ANSI/OSC 控制序列，末尾整行匹配 Claude `✻ <单个字母词> for <时长> · done <时:分> AM/PM` 或 Codex `Worked for <时长> • <时:分>` 格式时去除；Claude 动词支持带重音字母，不写死具体词；引用、代码和非尾部示例保留。同轮回复只处理一次，成功发送下一轮时重置标记；静默通知回复直接丢弃。普通回复写入群消息，行首非空 `[日志]` 仅在同一行代写；成员提及按最长已知名字解析，最多接力 6 跳。

@@ -121,6 +121,59 @@ class ServerTestCase(unittest.TestCase):
         return (Path(self.group["workdir"]) / "GROUP_LOG.md").read_text(encoding="utf-8")
 
 
+class EffortTests(ServerTestCase):
+    def member(self, provider="codex", **extra):
+        member = self.server.clean_member({"name": "强度测试", "provider": provider, **extra}, [])
+        self.group["members"] = [member]
+        return member
+
+    def test_supported_efforts_round_trip_into_provider_profile(self):
+        for provider, values, config, key in (
+            ("codex", ("low", "medium", "high", "xhigh"), "codexConfig", "model_reasoning_effort"),
+            ("claude_code", ("low", "medium", "high", "xhigh", "max"), "claudeConfig", "effort"),
+        ):
+            for value in values:
+                with self.subTest(provider=provider, effort=value):
+                    member = self.member(provider, effort=value)
+                    self.assertEqual(member["effort"], value)
+                    frontmatter = self.server.build_profile(self.group, member).split("---")[1]
+                    self.assertIn(f"{config}:\n  {key}: {value}\n", frontmatter)
+                    other = "claudeConfig" if provider == "codex" else "codexConfig"
+                    self.assertNotIn(other, frontmatter)
+
+    def test_omitted_empty_and_legacy_effort_keep_cli_default(self):
+        for provider in ("codex", "claude_code", "kiro_cli"):
+            for extra in ({}, {"effort": ""}, {"effort": None}, {"effort": "   "}):
+                with self.subTest(provider=provider, extra=extra):
+                    member = self.member(provider, **extra)
+                    self.assertEqual(member["effort"], "")
+                    for legacy in (False, True):
+                        if legacy:
+                            member.pop("effort")
+                        profile = self.server.build_profile(self.group, member)
+                        self.assertNotIn("codexConfig:", profile)
+                        self.assertNotIn("claudeConfig:", profile)
+
+    def test_invalid_or_unsupported_effort_is_rejected(self):
+        for provider, value in (("codex", "max"), ("claude_code", "ultra"),
+                                ("kiro_cli", "high"), ("codex", "HIGH"),
+                                ("codex", "high\nmodel: injected"), ("codex", []),
+                                ("claude_code", {}), ("codex", 1)):
+            with self.subTest(provider=provider, value=value):
+                with self.assertRaises(ValueError):
+                    self.member(provider, effort=value)
+
+    def test_effort_is_trimmed_persisted_and_exposed(self):
+        member = self.member(effort=" xhigh ")
+        self.group["members"] = [member]
+        self.server.save_state()
+        self.server.groups.clear()
+        self.server.load_state()
+        restored = self.server.groups[self.group["id"]]
+        self.assertEqual(restored["members"][0]["effort"], "xhigh")
+        self.assertEqual(self.server.public_group(restored)["members"][0]["effort"], "xhigh")
+
+
 class MentionTests(ServerTestCase):
     def test_matches_multiple_members_once_and_preserves_roster_order(self):
         found = self.server.find_mentions(self.group, "@评审 再请 @开发，@评审")

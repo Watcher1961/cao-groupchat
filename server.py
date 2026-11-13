@@ -249,6 +249,23 @@ def member_tools(m: dict) -> list[str]:
     return ROLES.get(m.get("role", "developer"), ROLES["developer"])
 
 
+EFFORTS = {
+    "codex": ("low", "medium", "high", "xhigh"),
+    "claude_code": ("low", "medium", "high", "xhigh", "max"),
+}
+
+
+def clean_effort(provider: str, value) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("推理强度必须是字符串")
+    effort = value.strip()
+    if effort and effort not in EFFORTS.get(provider, ()):
+        raise ValueError("该模型 CLI 不支持所选推理强度")
+    return effort
+
+
 def profile_name(g: dict, m: dict) -> str:
     return f"grp_{g['id']}_{m['id']}"
 
@@ -269,6 +286,12 @@ def build_profile(g: dict, m: dict) -> str:
     ]
     if m.get("model"):
         fm.append(f"model: {m['model']}")
+    effort = clean_effort(m["provider"], m.get("effort"))
+    if effort:
+        if m["provider"] == "codex":
+            fm += ["codexConfig:", f"  model_reasoning_effort: {effort}"]
+        elif m["provider"] == "claude_code":
+            fm += ["claudeConfig:", f"  effort: {effort}"]
     if m.get("role") in ROLES and not m.get("tools"):
         fm.append(f"role: {m['role']}")
     fm.append("allowedTools:")
@@ -520,10 +543,13 @@ def clean_member(raw: dict, existing: list[dict]) -> dict:
     if any(x["name"] == name for x in existing if x.get("id") != raw.get("id")):
         raise ValueError(f"群里已经有叫 {name} 的成员")
     tools = [t for t in raw.get("tools") or [] if isinstance(t, str) and t.strip()]
+    provider = raw.get("provider") or "claude_code"
+    effort = clean_effort(provider, raw.get("effort"))
     return {
         "id": raw.get("id") or slug(name) + "_" + uuid.uuid4().hex[:4],
         "name": name,
-        "provider": raw.get("provider") or "claude_code",
+        "provider": provider,
+        "effort": effort,
         "model": (raw.get("model") or "").strip(),
         "plan": (raw.get("plan") or "").strip(),
         "role": raw.get("role") or "developer",

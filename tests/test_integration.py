@@ -116,8 +116,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(group["members"], [])
         return group
 
-    def invite(self, name, provider, role):
-        member = self.api("POST", "/members", {"name": name, "provider": provider, "role": role})
+    def invite(self, name, provider, role, **extra):
+        member = self.api("POST", "/members", {"name": name, "provider": provider, "role": role, **extra})
         def joined():
             group = self.api("GET")
             current = next(m for m in group["members"] if m["id"] == member["id"])
@@ -212,6 +212,46 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(resumed_state["inputs"][-1]["message"], "[群主] " + resumed_text)
         self.assertGreater(resumed_state["status_generation"],
                            resumed_state["inputs"][-1]["dispatch_boundary"])
+
+    def test_effort_survives_edit_member_restart_and_server_restore(self):
+        self.create_group()
+        member = self.invite("强度测试", "codex", "developer", effort="xhigh")
+        self.assertEqual(member["effort"], "xhigh")
+
+        def profile(current):
+            state = self.http(self.cao_url, "GET", "/_test/state")
+            terminal = state["terminals"][current["terminal_id"]]
+            return state["profiles"][terminal["profile"]]
+
+        def replacement(previous):
+            def ready():
+                current = self.api("GET")["members"][0]
+                return current if current["terminal_id"] and current["terminal_id"] != previous else None
+            return self.until("replacement terminal ready", ready)
+
+        self.assertIn("codexConfig:\n  model_reasoning_effort: xhigh\n", profile(member))
+        updated = self.api("PUT", f"/members/{member['id']}", {
+            "name": "强度测试", "provider": "claude_code", "role": "reviewer", "effort": "max"})
+        self.assertEqual(updated["effort"], "max")
+        updated = replacement(member["terminal_id"])
+        self.assertIn("claudeConfig:\n  effort: max\n", profile(updated))
+        self.assertNotIn("codexConfig:", profile(updated))
+        saved = json.loads((self.data / "groups.json").read_text())
+        self.assertEqual(saved[self.group_path.rsplit("/", 1)[1]]["members"][0]["effort"], "max")
+        self.stopped_server = self.server
+        self.stop_process(self.stopped_server)
+        self.start_server()
+        restored = self.api("GET")["members"][0]
+        self.assertEqual((restored["id"], restored["effort"]), (member["id"], "max"))
+        self.api("POST", f"/members/{member['id']}/restart")
+        restarted = replacement(restored["terminal_id"])
+        self.assertEqual(restarted["effort"], "max")
+        self.assertIn("claudeConfig:\n  effort: max\n", profile(restarted))
+        self.api("PUT", f"/members/{member['id']}", {
+            "name": "强度测试", "provider": "claude_code", "role": "reviewer", "effort": ""})
+        defaulted = replacement(restarted["terminal_id"])
+        self.assertEqual(defaulted["effort"], "")
+        self.assertNotIn("claudeConfig:", profile(defaulted))
 
     def test_stale_completed_waits_for_current_turn_output(self):
         self.create_group()

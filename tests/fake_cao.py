@@ -80,7 +80,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(201, self.public(terminal))
             # Test-only controls/observations do not advance terminal status.
             if path == "/_test/state" and method == "GET":
-                return self.respond(200, {"terminals": self.server.terminals})
+                return self.respond(200, {"terminals": self.server.terminals,
+                                          "profiles": self.server.profiles})
             control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
