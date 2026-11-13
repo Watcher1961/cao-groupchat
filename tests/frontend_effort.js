@@ -52,6 +52,25 @@ function form(member) {
   }, querySelectorAll() { return []; }};
 }
 const cases = {
+  async delivery() {
+    run(`S.group={id:"g",members:[{id:"dev",name:"开发",provider:"codex",role:"developer",
+      status:"processing",pending:true,delivery_state:"uncertain",can_retry:true,
+      delivery_id:"job",delivery_attempt:1}],messages:[]}; S.cur="g"`);
+    assert.equal(run('statusOf(S.group.members[0]).st'),"delivery_uncertain");
+    run("renderPane();renderComposer()");
+    assert.match(nodes.get("#pane").innerHTML,/可能未送达/);
+    assert.match(nodes.get("#pane").innerHTML,/data-retry="dev"/);
+    assert.doesNotMatch(nodes.get("#typing").innerHTML,/正在思考/);
+    run(`api=async(...args)=>{globalThis.retryCall=args;return {ok:true}};
+      ask=()=>true;refresh=async()=>{}`);
+    await run('retryDelivery("dev")');
+    assert.equal(context.retryCall[0],"POST");
+    assert.equal(context.retryCall[1],"/groups/g/members/dev/retry");
+    assert.equal(context.retryCall[2].delivery_id,"job");
+    assert.equal(context.retryCall[2].delivery_attempt,1);
+    run('S.group.members[0].delivery_state="waiting_ready";S.group.members[0].pending=false');
+    assert.equal(run('statusOf(S.group.members[0]).st'),"waiting_ready");
+  },
   choices() {
     for (const [provider, allowed] of [["codex", ["", "low", "medium", "high", "xhigh"]],
       ["claude_code", ["", "low", "medium", "high", "xhigh", "max"]]]) {

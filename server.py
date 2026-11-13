@@ -16,11 +16,16 @@ CAO 群聊 GUI 后端 —— 把 CLI Agent Orchestrator (CAO) 包装成"项目�
     CAO_TOKEN        若 CAO 开启了本地 token 鉴权，填 CAO_AUTH_LOCAL_TOKEN 的值
     GROUPCHAT_PORT   本程序端口，默认 8765
     GROUPCHAT_DATA   群数据保存目录，默认 ~/.cao-groupchat
+    GROUPCHAT_POLL_SECONDS       轮询间隔，默认 2 秒
+    GROUPCHAT_READY_SECONDS      就绪特征稳定时长，默认 0.75 秒
+    GROUPCHAT_STARTUP_TIMEOUT    启动等待时限，默认 180 秒
+    GROUPCHAT_DELIVERY_TIMEOUT   投递无进展时限，默认 120 秒
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -42,7 +47,17 @@ DATA_DIR = Path(os.environ.get("GROUPCHAT_DATA", "~/.cao-groupchat")).expanduser
 STATE_FILE = DATA_DIR / "groups.json"
 HERE = Path(__file__).resolve().parent
 
-POLL_SECONDS = 2.0
+def seconds_setting(name: str, default: float) -> float:
+    value = float(os.environ.get(name, default))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} 必须是正数秒数")
+    return value
+
+
+POLL_SECONDS = seconds_setting("GROUPCHAT_POLL_SECONDS", 2.0)
+READY_SECONDS = seconds_setting("GROUPCHAT_READY_SECONDS", 0.75)
+STARTUP_TIMEOUT = seconds_setting("GROUPCHAT_STARTUP_TIMEOUT", 180)
+DELIVERY_TIMEOUT = seconds_setting("GROUPCHAT_DELIVERY_TIMEOUT", 120)
 MAX_RELAY_HOPS = 6          # 一条群主消息最多引发多少次 agent 之间的 @ 转发，防止无限对话
 LOG_FILENAME = "GROUP_LOG.md"
 
@@ -133,6 +148,7 @@ DONE = {"completed", "idle"}
 
 lock = threading.RLock()
 groups: dict[str, dict] = {}
+delivery_locks: dict[tuple[str, str], threading.RLock] = {}
 
 
 # ───────────────────────── 工具函数 ─────────────────────────
@@ -158,6 +174,12 @@ def load_state() -> None:
     if STATE_FILE.exists():
         try:
             groups = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            for group in groups.values():
+                for member in group["members"]:
+                    if member.get("delivery_state") == "dispatching":
+                        # The process may have died after CAO accepted the input.
+                        # Keep polling and permit manual recovery; never auto-resend.
+                        member.update(delivery_state="uncertain", pending=True, delivery_warned=False)
         except Exception:
             groups = {}
 
@@ -383,10 +405,15 @@ def start_member(g: dict, m: dict) -> None:
             # 老版本没有 :operator 路由，以群里第一个成员的身份创建
             t = cao("POST", path, {**q, "caller_id": live[0]["terminal_id"]},
                     body={"description": m["name"]}, timeout=180)
-    m["terminal_id"] = t.get("id") or t.get("terminal_id")
-    m["status"] = t.get("status", "starting")
-    m["pending"] = False
-    save_state()
+    with delivery_lock(g, m):
+        m["terminal_id"] = t.get("id") or t.get("terminal_id")
+        m["status"] = t.get("status", "starting")
+        m["ready_terminal"] = None
+        m.pop("ready_candidate", None)
+        m["pending"] = False
+        if m.get("active_delivery"):
+            m["delivery_state"] = "failed"
+        save_state()
 
 
 def stop_member(m: dict) -> None:
@@ -399,38 +426,190 @@ def stop_member(m: dict) -> None:
         except CaoError:
             pass
     m["terminal_id"] = None
-    m["status"] = "stopped"
+    m.update(status="stopped", pending=False, ready_terminal=None)
+    if m.get("active_delivery"):
+        m["delivery_state"] = "failed"
+
+
+def delivery_lock(g: dict, m: dict):
+    # Serializes only this member's queue/input/retry, not group session creation.
+    with lock:
+        return delivery_locks.setdefault((g["id"], m["id"]), threading.RLock())
+
+
+CLAUDE_INPUT_BOX = re.compile(
+    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n"
+    r"(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}", re.M)
+CODEX_READY_FOOTER = re.compile(r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[~/])")
+
+
+def member_ready(m: dict, terminal: dict) -> bool:
+    tid = m.get("terminal_id")
+    if not tid:
+        return False
+    if m.get("ready_terminal") == tid:
+        return True
+    if str(terminal.get("status", "")).lower() not in DONE:
+        m.pop("ready_candidate", None)
+        return False
+    raw = get_full_output(m)
+    tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
+    provider = m.get("provider")
+    states = codex_states(raw)
+    if provider == "codex":
+        positive = bool(CODEX_READY_FOOTER.search(tail)) and not (states and states[-1] == "working")
+    elif provider == "claude_code":
+        positive = bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+    else:
+        positive = bool(tail.strip())
+    if not positive:
+        m.pop("ready_candidate", None)
+        return False
+    fingerprint = hashlib.sha256(tail.encode()).hexdigest()
+    candidate = m.get("ready_candidate", {})
+    now = time.time()
+    if candidate.get("terminal") != tid or candidate.get("hash") != fingerprint:
+        m["ready_candidate"] = {"terminal": tid, "hash": fingerprint, "since": now}
+        return False
+    if now - candidate["since"] < READY_SECONDS:
+        return False
+    m["ready_terminal"] = tid
+    m.pop("ready_candidate", None)
+    return True
 
 
 def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> None:
-    if not m.get("terminal_id"):
-        add_msg(g, "system", "系统", f"{m['name']} 尚未启动，消息未送达。", log=False)
-        return
+    with delivery_lock(g, m):
+        job = {"id": uuid.uuid4().hex, "attempt": 0, "queued_at": time.time(),
+               "text": text, "hops": hops, "silent": silent}
+        # An explicit owner answer must still reach a live permission prompt.
+        if m.get("pending") and m.get("status") == "waiting_user_answer" and hops == 0 and not silent:
+            m["active_delivery"] = None
+            m["pending"] = False
+            m["delivery_state"] = "waiting_ready"
+            m.setdefault("outbox", []).insert(0, job)
+        else:
+            m.setdefault("outbox", []).append(job)
+        if not m.get("active_delivery") and m.get("delivery_state") != "not_ready":
+            m["delivery_state"] = "waiting_ready"
+        save_state()
+        flush_outbox(g, m)
+
+
+def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
+    with delivery_lock(g, m):
+        queue = m.get("outbox", [])
+        if not queue or m.get("active_delivery") or m.get("delivery_state") == "not_ready":
+            return False
+        if time.time() - queue[0]["queued_at"] >= STARTUP_TIMEOUT and not m.get("terminal_id"):
+            ready = False
+        else:
+            try:
+                if m.get("ready_terminal") == m.get("terminal_id") and m.get("terminal_id"):
+                    ready = True
+                elif m.get("terminal_id"):
+                    observation = terminal if terminal is not None else cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
+                    ready = member_ready(m, observation)
+                else:
+                    ready = False
+            except CaoError:
+                ready = False
+        if not ready:
+            if time.time() - queue[0]["queued_at"] >= STARTUP_TIMEOUT:
+                m["delivery_state"] = "not_ready"
+                add_msg(g, "system", "系统", f"{m['name']} 启动尚未就绪，消息尚未投递；处理终端后可重试投递。", log=False)
+            save_state()
+            return False
+        job = queue.pop(0)
+        dispatch_delivery(g, m, job)
+        return True
+
+
+def dispatch_delivery(g: dict, m: dict, job: dict) -> None:
+    job["attempt"] += 1
+    m.update(active_delivery=job, pending=True, delivery_state="dispatching", delivery_warned=False)
+    attempted = False
     try:
         raw = get_full_output(m) if m.get("provider") == "codex" else None
-        r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": text})
-        with lock:
-            # CAO 会把上一轮的 completed 状态保留着；只有 status_generation > dispatch_boundary
-            # 的状态才属于这次发送（见 POST /terminals/{id}/input 的说明，#735/#407）
-            m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
-            m["pending"] = True
-            m["reply_handled"] = False
-            m["sent_at"] = time.time()
-            m["saw_busy"] = False
-            m["hops"] = hops
-            m["silent"] = silent
-            if raw is not None:
-                states = codex_states(raw)
-                m["codex_dispatch_markers"] = len(states)
-                m["codex_dispatch_state"] = states[-1] if states else None
-                m["codex_saw_working"] = False
-                m["codex_snapshot_len"] = len(raw)
-                m["codex_snapshot_hash"] = hashlib.sha256(raw.encode()).hexdigest()
-                m["codex_buffer_reset"] = False
-                m["full_len"] = len(raw)
-        save_state()
+        m.update(boundary=None, reply_handled=False, sent_at=time.time(), saw_busy=False,
+                 hops=job["hops"], silent=job["silent"], dispatch_confirmed=False,
+                 delivery_started=False, last_progress_at=time.time(), progress_generation=None)
+        m.pop("progress_hash", None)
+        if raw is not None:
+            states = codex_states(raw)
+            m.update(codex_dispatch_markers=len(states), codex_dispatch_state=states[-1] if states else None,
+                     codex_saw_working=False, codex_snapshot_len=len(raw),
+                     codex_snapshot_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                     codex_buffer_reset=False, full_len=len(raw))
+        save_state()  # Persist the in-flight job before CAO can accept it.
+        attempted = True
+        r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})
+        # Fresh statuses belong to this dispatch only above CAO's boundary.
+        m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
+        m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
     except CaoError as e:
-        add_msg(g, "system", "系统", f"发给 {m['name']} 失败：{e}", log=False)
+        ambiguous = attempted and (e.status == 0 or e.status >= 500)
+        m.update(pending=ambiguous, delivery_state="uncertain" if ambiguous else "failed",
+                 delivery_warned=True, sent_at=time.time(), last_progress_at=time.time(),
+                 delivery_started=False)
+        note = "可能未送达，可重发（也可能已送达，请先核对终端）" if ambiguous else "投递失败，可重试"
+        add_msg(g, "system", "系统", f"发给 {m['name']} 失败：{e}；{note}。", log=False)
+    save_state()
+
+
+def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
+    if not m.get("active_delivery") or not m.get("pending") or m.get("delivery_state") == "dispatching":
+        return
+    now = time.time()
+    st = str(terminal.get("status", "")).lower()
+    gen, boundary = terminal.get("status_generation"), m.get("boundary")
+    fresh = gen is None or boundary is None or gen > boundary
+    started = (m.get("codex_saw_working") if m.get("provider") == "codex" else fresh and st in BUSY)
+    if fresh and st == "waiting_user_answer":
+        m.update(delivery_started=True, last_progress_at=now, delivery_state="waiting_user")
+        return
+    output_gen = terminal.get("output_generation")
+    progressed = False
+    if started and not m.get("delivery_started"):
+        progressed = True
+        m.update(delivery_started=True, last_progress_at=now)
+    if m.get("delivery_started"):
+        if isinstance(output_gen, int) and (boundary is None or output_gen > boundary):
+            if output_gen != m.get("progress_generation"):
+                progressed = True
+                m.update(progress_generation=output_gen, last_progress_at=now)
+        elif output_gen is None and m.get("terminal_id"):
+            try:
+                digest = hashlib.sha256(get_full_output(m).encode()).hexdigest()
+                if digest != m.get("progress_hash"):
+                    progressed = True
+                    m.update(progress_hash=digest, last_progress_at=now)
+            except CaoError:
+                pass
+    if now - m.get("last_progress_at", m.get("sent_at", now)) >= DELIVERY_TIMEOUT:
+        m["delivery_state"] = "uncertain"
+        if not m.get("delivery_warned"):
+            m["delivery_warned"] = True
+            add_msg(g, "system", "系统", f"{m['name']} 长时间没有本轮进展，消息可能未送达。可在成员卡片重发；也可能仍在执行，请先核对终端，避免重复操作。", log=False)
+    elif progressed and m.get("delivery_state") in ("uncertain", "waiting_user"):
+        m.update(delivery_state="sent", delivery_warned=False)
+
+
+def retry_delivery(g: dict, m: dict, token: dict) -> None:
+    with delivery_lock(g, m):
+        job = m.get("active_delivery") or next(iter(m.get("outbox", [])), None)
+        if (m.get("delivery_state") not in ("uncertain", "failed", "not_ready") or not job
+                or token.get("delivery_id") != job["id"] or token.get("delivery_attempt") != job["attempt"]):
+            raise ValueError("投递状态已改变，请刷新后再试")
+        if m.get("active_delivery"):
+            m.setdefault("outbox", []).insert(0, job)
+        job["queued_at"] = time.time()
+        m.update(active_delivery=None, pending=False, delivery_state="waiting_ready", delivery_warned=False)
+        # An uncertain terminal may still be working; require a new idle prompt.
+        m["ready_terminal"] = None
+        m.pop("ready_candidate", None)
+        save_state()
+        flush_outbox(g, m)
 
 
 def find_mentions(g: dict, text: str, exclude: str | None = None) -> list[dict]:
@@ -550,7 +729,7 @@ def clean_output(s: str) -> str:
 def handle_reply(g: dict, m: dict, text: str) -> None:
     if m.get("reply_handled"):
         return
-    m["reply_handled"] = True
+    m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed")
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
     if not text:
@@ -568,58 +747,80 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
                 f"已达到自动转发上限（{MAX_RELAY_HOPS} 次），请群主决定下一步。", log=False)
 
 
+def poll_member(g: dict, m: dict) -> None:
+    if not m.get("terminal_id"):
+        flush_outbox(g, m)
+        return
+    try:
+        t = cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
+    except CaoError as e:
+        if e.status == 404:
+            m.update(status="gone", terminal_id=None, ready_terminal=None, pending=False)
+            if m.get("active_delivery"):
+                m["delivery_state"] = "failed"
+            add_msg(g, "system", "系统", f"{m['name']} 的终端已不存在。", log=False)
+        else:
+            watch_delivery(g, m, {})
+        return
+    st = str(t.get("status", "")).lower()
+    prev = m.get("status")
+    gen, boundary = t.get("status_generation"), m.get("boundary")
+    fresh = gen is None or boundary is None or gen > boundary
+    m["status"] = st
+    if not m.get("pending"):
+        if m.get("outbox"):
+            flush_outbox(g, m, t)
+        elif m.get("ready_terminal") != m.get("terminal_id"):
+            try:
+                member_ready(m, t)
+            except CaoError:
+                pass
+        return  # This observation predates any new dispatch.
+    if m.get("delivery_state") == "dispatching":
+        return
+    if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
+        m["status"] = "processing"
+        try:
+            reply = get_codex_reply(m, output_generation=t.get("output_generation"))
+        except CaoError:
+            reply = None  # A failed probe is not evidence of completion.
+        if reply is not None:
+            m["status"] = "completed"
+            handle_reply(g, m, reply)
+    elif st in BUSY:
+        m["saw_busy"] = True
+    elif st == "waiting_user_answer" and prev != st and fresh:
+        try:
+            tail = get_reply(m)[-800:]
+        except CaoError:
+            tail = ""
+        add_msg(g, "system", "系统",
+                f"{m['name']} 在等待确认。可以 @{m['name']} 回复它（例如“同意”或“1”）。\n\n{tail}", log=False)
+    elif (st in DONE and fresh and (m.get("dispatch_confirmed") is not False or m.get("delivery_started"))
+          and (m.get("saw_busy") or boundary is not None or time.time() - m.get("sent_at", 0) > 8)):
+        try:
+            reply = get_reply(m)
+        except CaoError:
+            watch_delivery(g, m, t)
+            return
+        handle_reply(g, m, reply)
+    elif st == "error" and fresh:
+        m.update(pending=False, delivery_state="failed")
+        add_msg(g, "system", "系统", f"{m['name']} 出错了，可在终端里查看。", log=False)
+    watch_delivery(g, m, t)
+    if not m.get("pending"):
+        flush_outbox(g, m)
+
+
 def poll_loop() -> None:
     while True:
         time.sleep(POLL_SECONDS)
         with lock:
-            snapshot = [(g, m) for g in groups.values() for m in g["members"] if m.get("terminal_id")]
+            snapshot = [(g, m) for g in groups.values() for m in g["members"]
+                        if m.get("terminal_id") or m.get("outbox") or m.get("active_delivery")]
         for g, m in snapshot:
-            try:
-                t = cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
-            except CaoError as e:
-                if e.status == 404:
-                    m["status"] = "gone"
-                    m["terminal_id"] = None
-                    add_msg(g, "system", "系统", f"{m['name']} 的终端已不存在。", log=False)
-                continue
-            st = str(t.get("status", "")).lower()
-            prev = m.get("status")
-            gen, boundary = t.get("status_generation"), m.get("boundary")
-            fresh = gen is None or boundary is None or gen > boundary
-            m["status"] = st
-            if not m.get("pending"):
-                continue
-            if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
-                m["status"] = "processing"
-                try:
-                    reply = get_codex_reply(m, output_generation=t.get("output_generation"))
-                except CaoError:
-                    continue  # A failed probe is not evidence of completion.
-                if reply is not None:
-                    m["pending"] = False
-                    m["status"] = "completed"
-                    handle_reply(g, m, reply)
-            elif st in BUSY:
-                m["saw_busy"] = True
-            elif st == "waiting_user_answer" and prev != st and fresh:
-                try:
-                    tail = get_reply(m)[-800:]
-                except CaoError:
-                    tail = ""
-                add_msg(g, "system", "系统",
-                        f"{m['name']} 在等待确认。可以 @{m['name']} 回复它（例如“同意”或“1”）。\n\n{tail}",
-                        log=False)
-            elif st in DONE and fresh and (m.get("saw_busy") or boundary is not None
-                                           or time.time() - m.get("sent_at", 0) > 8):
-                m["pending"] = False
-                try:
-                    reply = get_reply(m)
-                except CaoError as e:
-                    reply = f"（读取输出失败：{e}）"
-                handle_reply(g, m, reply)
-            elif st == "error" and fresh:
-                m["pending"] = False
-                add_msg(g, "system", "系统", f"{m['name']} 出错了，可在终端里查看。", log=False)
+            with delivery_lock(g, m):
+                poll_member(g, m)
         if snapshot:
             save_state()
 
@@ -704,7 +905,7 @@ def post_message(g: dict, text: str) -> dict:
         raise ValueError("消息为空")
     targets = find_mentions(g, text)
     if re.search(r"@(所有人|all)\b", text, flags=re.I) or not targets:
-        targets = [x for x in g["members"] if x.get("terminal_id")]
+        targets = list(g["members"])
     msg = add_msg(g, "owner", "群主", text, to=[t["name"] for t in targets])
     for t in targets:
         run_bg(send_to, g, t, f"[群主] {text}", 0)
@@ -715,7 +916,14 @@ def public_group(g: dict, since: int = 0) -> dict:
     out = {k: v for k, v in g.items() if k != "messages"}
     out["messages"] = [m for m in g["messages"] if m["seq"] > since]
     out["log_file"] = str(log_path(g))
-    out["members"] = [{**m, "effective_tools": member_tools(m)} for m in g["members"]]
+    out["members"] = []
+    for m in g["members"]:
+        member = {k: v for k, v in m.items() if k not in ("outbox", "active_delivery")}
+        job = m.get("active_delivery") or next(iter(m.get("outbox", [])), None)
+        member.update(effective_tools=member_tools(m), queued_count=len(m.get("outbox", [])),
+                      delivery_id=job["id"] if job else None, delivery_attempt=job["attempt"] if job else None,
+                      can_retry=bool(job and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
+        out["members"].append(member)
     return out
 
 
@@ -1190,6 +1398,12 @@ class H(BaseHTTPRequestHandler):
                                              f"职责={new['duty'] or '未指定'}")
                         run_bg(bootstrap_members, g, [new], False)
                         return self._json(200, new)
+                if len(rest) == 3 and rest[0] == "members" and rest[2] == "retry" and method == "POST":
+                    m = next((x for x in g["members"] if x["id"] == rest[1]), None)
+                    if not m:
+                        return self._json(404, {"error": "成员不存在"})
+                    retry_delivery(g, m, self._body())
+                    return self._json(200, {"ok": True})
                 if len(rest) == 3 and rest[0] == "members" and rest[2] == "restart" and method == "POST":
                     m = next((x for x in g["members"] if x["id"] == rest[1]), None)
                     if not m:

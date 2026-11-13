@@ -1,6 +1,7 @@
 """Isolated standard-library unit tests; never use a running CAO instance."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -109,8 +110,8 @@ class ServerTestCase(unittest.TestCase):
         blocker = patch.object(self.server, "cao", side_effect=AssertionError("unexpected CAO call"))
         self.cao = blocker.start()
         self.addCleanup(blocker.stop)
-        self.developer = {"id": "dev", "name": "开发", "terminal_id": "dev-terminal", "hops": 0}
-        self.reviewer = {"id": "review", "name": "评审", "terminal_id": "review-terminal"}
+        self.developer = {"id": "dev", "name": "开发", "terminal_id": "dev-terminal", "ready_terminal": "dev-terminal", "hops": 0}
+        self.reviewer = {"id": "review", "name": "评审", "terminal_id": "review-terminal", "ready_terminal": "review-terminal"}
         self.group = {
             "id": "test-group", "name": "测试群", "workdir": str(root / "work"),
             "members": [self.developer, self.reviewer], "messages": [],
@@ -273,6 +274,241 @@ class ReplyTests(ServerTestCase):
     def test_empty_reply_keeps_placeholder(self):
         self.server.handle_reply(self.group, self.developer, "")
         self.assertEqual(self.group["messages"][0]["text"], "（无文字输出）")
+
+
+class DeliveryTests(ServerTestCase):
+    CODEX_READY = "codex>\n? for shortcuts"
+    CLAUDE_READY = "────────────\n❯ \n────────────\n? for shortcuts"
+
+    def setUp(self):
+        super().setUp()
+        self.developer.update(provider="codex", terminal_id=None, ready_terminal=None,
+                              outbox=[], status="starting")
+        self.group["members"] = [self.developer]
+
+    def active(self, provider="codex", started=False):
+        self.developer.update(provider=provider, terminal_id="dev-terminal", ready_terminal="dev-terminal",
+            active_delivery={"id": "job", "attempt": 1, "queued_at": 900,
+                             "text": "[群主] 原始消息", "hops": 2, "silent": False},
+            pending=True, delivery_state="sent", delivery_warned=False,
+            delivery_started=started, last_progress_at=1000, progress_generation=2,
+            sent_at=1000, boundary=1, codex_saw_working=started)
+
+    def test_messages_without_a_terminal_are_queued_persisted_and_publicly_summarized(self):
+        with patch.object(self.server.time, "time", return_value=1000):
+            self.server.send_to(self.group, self.developer, "[群主] 启动即发", 0)
+        self.cao.assert_not_called()
+        self.assertEqual(len(self.developer["outbox"]), 1)
+        self.assertEqual(self.developer["outbox"][0]["text"], "[群主] 启动即发")
+        self.server.save_state()
+        self.server.groups.clear()
+        self.server.load_state()
+        restored=self.server.groups[self.group["id"]]
+        public=self.server.public_group(restored)["members"][0]
+        self.assertEqual(public["queued_count"], 1)
+        self.assertNotIn("outbox", public)
+        self.assertNotIn("active_delivery", public)
+
+    def test_both_providers_need_a_positive_prompt_and_stable_observations(self):
+        self.cao.side_effect = None
+        for provider, prompt in (("codex", self.CODEX_READY), ("claude_code", self.CLAUDE_READY)):
+            with self.subTest(provider=provider):
+                self.developer.update(provider=provider, terminal_id="dev-terminal", ready_terminal=None)
+                self.cao.return_value={"output":"CLI loading"}
+                with patch.object(self.server.time, "time", return_value=1000):
+                    self.assertFalse(self.server.member_ready(self.developer, {"status":"idle"}))
+                self.cao.return_value={"output":prompt}
+                with patch.object(self.server.time, "time", return_value=1001):
+                    self.assertFalse(self.server.member_ready(self.developer, {"status":"idle"}))
+                with patch.object(self.server.time, "time", return_value=1001.3):
+                    self.assertFalse(self.server.member_ready(self.developer, {"status":"idle"}))
+                with patch.object(self.server.time, "time", return_value=1001.8):
+                    self.assertTrue(self.server.member_ready(self.developer, {"status":"idle"}))
+
+    def test_changing_prompt_or_a_new_terminal_restarts_the_stability_check(self):
+        self.cao.side_effect = None
+        self.developer.update(terminal_id="dev-terminal")
+        for now, raw, expected in ((1000,self.CODEX_READY,False),
+                                   (1001,"new banner\n"+self.CODEX_READY,False),
+                                   (1001.8,"new banner\n"+self.CODEX_READY,True)):
+            self.cao.return_value={"output":raw}
+            with patch.object(self.server.time,"time",return_value=now):
+                self.assertEqual(self.server.member_ready(self.developer,{"status":"idle"}),expected)
+        self.developer["terminal_id"]="replacement"
+        self.cao.return_value={"output":"loading"}
+        with patch.object(self.server.time,"time",return_value=1002):
+            self.assertFalse(self.server.member_ready(self.developer,{"status":"idle"}))
+
+    def test_a_queued_job_is_dispatched_only_once_after_readiness(self):
+        with patch.object(self.server.time,"time",return_value=1000):
+            self.server.send_to(self.group,self.developer,"原文",3,True)
+        self.developer["terminal_id"]="dev-terminal"
+        def response(method,path,query=None,**kwargs):
+            return {"dispatch_boundary":5} if method=="POST" else {"output":self.CODEX_READY}
+        self.cao.side_effect=response
+        with patch.object(self.server.time,"time",return_value=1000):
+            self.server.flush_outbox(self.group,self.developer,{"status":"idle"})
+        self.assertFalse(any(c.args[0]=="POST" for c in self.cao.call_args_list))
+        with patch.object(self.server.time,"time",return_value=1001):
+            self.server.flush_outbox(self.group,self.developer,{"status":"idle"})
+            self.server.flush_outbox(self.group,self.developer,{"status":"idle"})
+        posts=[c for c in self.cao.call_args_list if c.args[0]=="POST"]
+        self.assertEqual(len(posts),1)
+        self.assertEqual(posts[0].args[2],{"message":"原文"})
+        self.assertEqual((self.developer["hops"],self.developer["silent"]),(3,True))
+
+    def test_startup_timeout_reports_undelivered_once_instead_of_discarding(self):
+        with patch.object(self.server.time,"time",return_value=1000):
+            self.server.send_to(self.group,self.developer,"尚未投递",0)
+        for now in (1181,1190):
+            with patch.object(self.server.time,"time",return_value=now):
+                self.server.flush_outbox(self.group,self.developer)
+        self.assertEqual(self.developer["delivery_state"],"not_ready")
+        self.assertEqual(len(self.group["messages"]),1)
+        self.assertIn("尚未投递",self.group["messages"][0]["text"])
+        self.assertEqual(len(self.developer["outbox"]),1)
+
+    def test_idle_redraws_without_start_evidence_do_not_postpone_warning(self):
+        for provider in ("codex","claude_code"):
+            with self.subTest(provider=provider):
+                self.group["messages"].clear()
+                self.active(provider)
+                for now,generation in ((1121,99),(1130,100)):
+                    with patch.object(self.server.time,"time",return_value=now):
+                        self.server.watch_delivery(self.group,self.developer,
+                            {"status":"idle","status_generation":1,"output_generation":generation})
+                self.assertEqual(self.developer["delivery_state"],"uncertain")
+                self.assertEqual(len(self.group["messages"]),1)
+                self.assertIn("可能未送达",self.group["messages"][0]["text"])
+                self.assertTrue(self.server.public_group(self.group)["members"][0]["can_retry"])
+
+    def test_started_work_only_refreshes_timeout_on_new_output(self):
+        self.active(started=True)
+        for now,generation in ((1119,3),(1200,3)):
+            with patch.object(self.server.time,"time",return_value=now):
+                self.server.watch_delivery(self.group,self.developer,
+                    {"status":"idle","status_generation":1,"output_generation":generation})
+        self.assertEqual(self.group["messages"],[])
+        with patch.object(self.server.time,"time",return_value=1240):
+            self.server.watch_delivery(self.group,self.developer,
+                {"status":"idle","status_generation":1,"output_generation":3})
+        self.assertEqual(self.developer["delivery_state"],"uncertain")
+
+    def test_retry_preserves_payload_and_rejects_the_same_attempt_twice(self):
+        self.active()
+        self.developer.update(delivery_state="uncertain",delivery_warned=True)
+        self.cao.side_effect=lambda method,path,*args,**kwargs: (
+            {"dispatch_boundary":5} if method=="POST" else
+            {"output":self.CODEX_READY} if path.endswith("/output") else {"status":"idle"})
+        token={"delivery_id":"job","delivery_attempt":1}
+        with patch.object(self.server.time,"time",return_value=1000):
+            self.server.retry_delivery(self.group,self.developer,token)
+        self.assertIsNone(self.developer["active_delivery"])
+        with self.assertRaises(ValueError):
+            self.server.retry_delivery(self.group,self.developer,token)
+        with patch.object(self.server.time,"time",return_value=1001):
+            self.server.flush_outbox(self.group,self.developer)
+        self.assertEqual(self.developer["active_delivery"]["attempt"],2)
+        self.assertEqual(self.developer["hops"],2)
+        with self.assertRaises(ValueError):
+            self.server.retry_delivery(self.group,self.developer,token)
+        posts=[c for c in self.cao.call_args_list if c.args[0]=="POST"]
+        self.assertEqual(len(posts),1)
+        self.assertEqual(posts[0].args[2],{"message":"[群主] 原始消息"})
+
+    def test_ambiguous_input_failure_cannot_reuse_previous_codex_reply(self):
+        self.developer.update(terminal_id="dev-terminal",ready_terminal="dev-terminal",
+                              reply_handled=False,codex_dispatch_markers=0,codex_dispatch_state=None,
+                              codex_saw_working=True,full_len=0)
+        raw="\x1b]7501;state=working\x07旧回复\x1b]7501;state=done\x07"
+        def response(method,path,*args,**kwargs):
+            if method=="POST":
+                raise self.server.CaoError(0,"input response timed out")
+            return {"output":raw} if path.endswith("/output") else {
+                "status":"idle","status_generation":10,"output_generation":10}
+        self.cao.side_effect=response
+        self.server.send_to(self.group,self.developer,"新消息",0)
+        self.server.poll_member(self.group,self.developer)
+        self.assertTrue(self.developer["pending"])
+        self.assertFalse(any(m["kind"]=="agent" for m in self.group["messages"]))
+        self.assertTrue(self.server.public_group(self.group)["members"][0]["can_retry"])
+
+    def test_ambiguous_input_failure_cannot_reuse_previous_claude_reply(self):
+        self.active(provider="claude_code")
+        self.developer.update(active_delivery=None,pending=False)
+        def response(method,path,*args,**kwargs):
+            if method=="POST":
+                raise self.server.CaoError(0,"input response timed out")
+            return {"output":"旧回复"} if path.endswith("/output") else {
+                "status":"completed","status_generation":10,"output_generation":10}
+        self.cao.side_effect=response
+        self.server.send_to(self.group,self.developer,"新消息",0)
+        self.server.poll_member(self.group,self.developer)
+        self.assertTrue(self.developer["pending"])
+        self.assertFalse(any(m["kind"]=="agent" for m in self.group["messages"]))
+
+    def test_watchdog_still_expires_when_terminal_or_output_queries_fail(self):
+        for failing in ("terminal","output"):
+            with self.subTest(failing=failing):
+                self.active()
+                self.developer["codex_dispatch_markers"]=0
+                self.group["messages"].clear()
+                def response(method,path,*args,**kwargs):
+                    if failing=="terminal" or path.endswith("/output"):
+                        raise self.server.CaoError(503,"temporary probe failure")
+                    return {"status":"idle","status_generation":1,"output_generation":1}
+                self.cao.side_effect=response
+                with patch.object(self.server.time,"time",return_value=1121):
+                    self.server.poll_member(self.group,self.developer)
+                    self.server.poll_member(self.group,self.developer)
+                self.assertEqual(self.developer["delivery_state"],"uncertain")
+                self.assertEqual(sum("可能未送达" in m["text"] for m in self.group["messages"]),1)
+
+    def test_dispatch_is_persisted_before_any_input_can_be_accepted(self):
+        self.developer.update(terminal_id="dev-terminal",ready_terminal="dev-terminal")
+        def response(method,path,*args,**kwargs):
+            if method=="POST":
+                saved=json.loads(self.server.STATE_FILE.read_text())[self.group["id"]]["members"][0]
+                self.assertEqual(saved["delivery_state"],"dispatching")
+                self.assertEqual(saved["outbox"],[])
+                self.assertEqual(saved["active_delivery"]["text"],"原始消息")
+                return {"dispatch_boundary":5}
+            return {"output":self.CODEX_READY}
+        self.cao.side_effect=response
+        self.server.send_to(self.group,self.developer,"原始消息",0)
+
+    def test_restart_turns_an_interrupted_dispatch_into_a_manual_recovery(self):
+        self.active()
+        self.developer.update(delivery_state="dispatching",dispatch_confirmed=False)
+        self.server.save_state()
+        self.server.load_state()
+        restored=self.server.groups[self.group["id"]]
+        member=restored["members"][0]
+        self.assertEqual(member["delivery_state"],"uncertain")
+        self.assertTrue(member["pending"])
+        self.assertTrue(self.server.public_group(restored)["members"][0]["can_retry"])
+        self.cao.assert_not_called()
+
+    def test_startup_queue_keeps_fifo_order_until_each_reply_finishes(self):
+        self.server.send_to(self.group,self.developer,"第一条",0)
+        self.server.send_to(self.group,self.developer,"第二条",0)
+        self.developer.update(terminal_id="dev-terminal",ready_terminal="dev-terminal")
+        self.cao.side_effect=lambda method,*args,**kwargs: ({"dispatch_boundary":1}
+                               if method=="POST" else {"output":self.CODEX_READY})
+        self.server.flush_outbox(self.group,self.developer)
+        self.assertEqual(len(self.developer["outbox"]),1)
+        self.server.handle_reply(self.group,self.developer,"第一条回复")
+        self.server.flush_outbox(self.group,self.developer)
+        posts=[c.args[2]["message"] for c in self.cao.call_args_list if c.args[0]=="POST"]
+        self.assertEqual(posts,["第一条","第二条"])
+
+    def test_owner_broadcast_includes_members_without_terminals(self):
+        self.reviewer.update(provider="claude_code",terminal_id=None,ready_terminal=None,outbox=[])
+        self.group["members"].append(self.reviewer)
+        with patch.object(self.server,"run_bg",side_effect=lambda fn,*args:fn(*args)):
+            message=self.server.post_message(self.group,"所有成员启动后处理")
+        self.assertEqual(message["to"],["开发","评审"])
+        self.assertEqual([len(m["outbox"]) for m in self.group["members"]],[1,1])
 
 
 class CodexCompletionTests(ServerTestCase):

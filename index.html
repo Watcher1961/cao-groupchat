@@ -417,6 +417,7 @@ const NONE = new Set(["cursor_cli"]);                                          /
 const COLORS = ["#e0703f","#4b74e8","#169e6c","#8b5cf0","#d9487a","#c8920c","#1497ad","#6b7a8f"];
 const ico=(n,cls)=>`<svg class="ic ${cls||""}"><use href="#i-${n}"/></svg>`;
 const STATUS_TXT = {new:"未启动",starting:"启动中",idle:"空闲",completed:"空闲",processing:"思考中",running:"思考中",
+  waiting_ready:"等待就绪",delivery_uncertain:"可能未送达",not_ready:"尚未投递",delivery_failed:"投递失败",
   waiting_user_answer:"等你确认",error:"出错",failed:"启动失败",stopped:"已停止",gone:"终端已关闭"};
 
 /* ═════════════ 演示模式（没有后端时在浏览器里模拟） ═════════════ */
@@ -549,8 +550,9 @@ function renderHead(){
     await api("DELETE",`/groups/${g.id}`); S.cur=null; S.group=null; S.msgs=[]; await loadGroups(); renderAll(); };
 }
 function statusOf(m){
-  const st=m.pending&&!["processing","running"].includes(m.status)?"processing":m.status;
-  const dc=["idle","completed"].includes(st)?"ok":["processing","running","starting","new","waiting_user_answer"].includes(st)?"busy":"bad";
+  const delivery={uncertain:"delivery_uncertain",not_ready:"not_ready",failed:"delivery_failed",waiting_ready:"waiting_ready",waiting_user:"waiting_user_answer"};
+  const st=delivery[m.delivery_state]||(m.pending&&!['processing','running','waiting_user_answer'].includes(m.status)?"processing":m.status);
+  const dc=["idle","completed"].includes(st)?"ok":["processing","running","starting","new","waiting_ready","waiting_user_answer"].includes(st)?"busy":"bad";
   return {st,dc};
 }
 function avHTML(m,size,withStatus){
@@ -567,7 +569,7 @@ function msgHTML(m,prev,next){
   const g=S.group, mem=g.members.find(x=>x.id===m.member_id||x.name===m.sender);
   const sep=(!prev||prev.ts.slice(0,10)!==m.ts.slice(0,10))?`<div class="daysep"><span>${esc(dayLabel(m.ts))}</span></div>`:"";
   if(m.kind==="system"){
-    const warn=/失败|出错|等待确认|不存在|上限/.test(m.text);
+    const warn=/失败|出错|等待确认|不存在|上限|未送达|未投递/.test(m.text);
     const first=!prev||prev.kind!=="system";
     return `${sep}<div class="sys ${warn?"warn":""} ${first?"first":""}"><div class="svc">${esc(m.text)}<time>${esc(m.ts.slice(11,16))}</time></div></div>`;
   }
@@ -609,8 +611,8 @@ function renderComposer(){
   const g=S.group, on=!!g;
   $("#input").disabled=!on; $("#send").disabled=!on;
   $("#chips").innerHTML=on?['所有人',...g.members.map(m=>m.name)].map(n=>`<button class="chip" data-at="${esc(n)}">@${esc(n)}</button>`).join(""):"";
-  const busy=on?g.members.filter(m=>["processing","running"].includes(m.status)||m.pending).map(m=>m.name):[];
-  const wait=on?g.members.filter(m=>m.status==="waiting_user_answer").map(m=>m.name):[];
+  const busy=on?g.members.filter(m=>["processing","running"].includes(statusOf(m).st)).map(m=>m.name):[];
+  const wait=on?g.members.filter(m=>statusOf(m).st==="waiting_user_answer").map(m=>m.name):[];
   $("#typing").innerHTML=(busy.length?`<span class="dots"><i></i><i></i><i></i></span><span>${esc(busy.join("、"))} 正在思考…</span>`:"")+
     (wait.length?`<span class="warn">${esc(wait.join("、"))} 在等你确认</span>`:"");
 }
@@ -684,15 +686,26 @@ function renderPane(){
         <div class="duty"><b>${esc((ROLE_LABEL[m.tools&&m.tools.length?"custom":m.role]||m.role).split(" ")[0])}</b> · ${esc(m.duty||"未指定职责")}</div>
         ${effortCaption(m)?`<div class="note">${esc(effortCaption(m))}</div>`:""}
         <div class="tools">${toolChips(m)}</div>${enf}${usageHTML(m)}
-        <div class="mact"><button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
+        ${m.queued_count?`<div class="note">待投递：${m.queued_count} 条</div>`:""}
+        <div class="mact">${m.can_retry?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
       </div>`;}).join("")}
     <button class="addm" id="invite">${ico("plus")}邀请模型进群</button>
     <p class="note" style="margin:12px 4px 0">修改权限或职责会重启该成员（新会话），以便新的 profile 生效。</p>`;
   $("#invite").onclick=()=>openMemberModal(null);
   pane.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openMemberModal(g.members.find(m=>m.id===b.dataset.edit)));
+  pane.querySelectorAll("[data-retry]").forEach(b=>b.onclick=()=>retryDelivery(b.dataset.retry));
   pane.querySelectorAll("[data-restart]").forEach(b=>b.onclick=async()=>{ await api("POST",`/groups/${g.id}/members/${b.dataset.restart}/restart`); refresh(); });
   pane.querySelectorAll("[data-kick]").forEach(b=>b.onclick=async()=>{ const m=g.members.find(x=>x.id===b.dataset.kick);
     if(!ask(`把 ${m.name} 移出群并关闭它的终端？`)) return; await api("DELETE",`/groups/${g.id}/members/${m.id}`); refresh(); });
+}
+const retrying=new Set();
+async function retryDelivery(id){
+  const g=S.group,m=g&&g.members.find(x=>x.id===id);
+  if(!m||!m.can_retry||retrying.has(id)) return;
+  if(!ask(m.delivery_state==="uncertain"?"消息也可能已送达且仍在执行。请先核对终端，重发可能重复操作。确认重发原消息？":"终端就绪后将重试投递原消息，确认继续？")) return;
+  retrying.add(id);
+  try{ await api("POST",`/groups/${g.id}/members/${id}/retry`,{delivery_id:m.delivery_id,delivery_attempt:m.delivery_attempt}); await refresh(); }
+  catch(e){ alert(e.message); } finally{ retrying.delete(id); }
 }
 async function loadLog(){
   if(!S.group||S.tab!=="log") return;
@@ -717,7 +730,7 @@ async function refresh(){
     const top=S.msgs.length?S.msgs.at(-1).seq:0;
     const fresh=g.messages.filter(m=>m.seq>top);
     S.group=g; S.msgs=S.msgs.concat(fresh);
-    const sig=JSON.stringify(g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort]));
+    const sig=JSON.stringify(g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort,m.delivery_state,m.can_retry,m.delivery_id,m.delivery_attempt,m.queued_count]));
     if(fresh.length){ renderMsgs(); await loadGroups(); renderGroups(); if(S.tab==="log") loadLog();
       if(fresh.some(m=>m.kind==="agent")) setTimeout(loadUsage,1500); }
     if(sig!==lastSig){ lastSig=sig; renderHead(); renderComposer(); if(S.tab==="members") renderPane(); }

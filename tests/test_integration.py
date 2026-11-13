@@ -1,6 +1,8 @@
 """Real HTTP/subprocess acceptance tests using only disposable local resources."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import subprocess
@@ -26,6 +28,8 @@ class IntegrationTests(unittest.TestCase):
             "HOME": str(self.home), "PATH": str(self.root / "empty-bin"),
             "CAO_TOKEN": "", "GROUPCHAT_DATA": str(self.data),
             "PYTHONIOENCODING": "utf-8", "NO_PROXY": "*",
+            "GROUPCHAT_POLL_SECONDS": "0.03", "GROUPCHAT_READY_SECONDS": "0.06",
+            "GROUPCHAT_STARTUP_TIMEOUT": "2", "GROUPCHAT_DELIVERY_TIMEOUT": "0.6",
         }
         self.opener = request.build_opener(request.ProxyHandler({}))
         self.processes = []
@@ -121,7 +125,7 @@ class IntegrationTests(unittest.TestCase):
         def joined():
             group = self.api("GET")
             current = next(m for m in group["members"] if m["id"] == member["id"])
-            return current if current["terminal_id"] and any(
+            return current if current["terminal_id"] and current.get("ready_terminal")==current["terminal_id"] and any(
                 f"{name} 已入群" in msg["text"] for msg in group["messages"]) else None
         return self.until(f"{name} joins", joined)
 
@@ -255,6 +259,141 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(set(self.terminal(tid)["inputs"][-1]["reported_statuses"]), {"idle"})
         self.assertEqual(self.terminal(tid)["last_reads"], previous["last_reads"] + 1)
 
+    def test_codex_long_output_remembers_working_after_fifo_eviction(self):
+        self.create_group()
+        member=self.invite("开发","codex","developer")
+        tid=member["terminal_id"]
+        final="长任务最终回复"
+        self.next_turn(tid,final,idle_stream=True,interim="长任务进行中",padding_bytes=40000)
+        self.api("POST","/messages",{"text":"@开发 长任务"})
+        self.until("long task input dispatched",lambda:self.terminal(tid)["inputs"])
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/advance")
+        self.until("working remembered",lambda:self.api("GET")["members"][0].get("codex_saw_working"))
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/advance")
+        self.assertEqual([m["text"] for m in self.wait_replies(1)],[final])
+        state=self.http(self.cao_url,"GET","/_test/state")
+        raw=state["terminals"][tid]["full_out"]
+        self.assertEqual(len(raw.encode()),state["buffer_limit"])
+        self.assertEqual(state["buffer_limit"],32768)
+        self.assertNotIn("state=working",raw)
+        self.assertEqual(raw.count("state=done"),1)
+
+    def test_startup_messages_wait_for_both_cli_prompts_and_deliver_once(self):
+        self.http(self.cao_url,"POST","/_test/config",{"hold_create":True,"startup_hold":True})
+        group=self.http(self.server_url,"POST","/api/groups",{
+            "name":"启动验收","workdir":str(self.root/"project"),"members":[
+                {"name":"开发","provider":"codex"},{"name":"评审","provider":"claude_code"}]})
+        self.group_path=f"/api/groups/{group['id']}"
+        self.until("create blocked before terminal exists",lambda:
+                   self.http(self.cao_url,"GET","/_test/state")["create_waiting"])
+        text="@开发 @评审 启动后执行"
+        self.api("POST","/messages",{"text":text})
+        def queued():
+            members=self.api("GET")["members"]
+            return members if all(m.get("queued_count")==1 for m in members) else None
+        members=self.until("both messages queued before terminal creation",queued)
+        self.assertTrue(all(m["terminal_id"] is None for m in members))
+        self.http(self.cao_url,"POST","/_test/config",{"hold_create":False})
+        self.until("terminals allocated",lambda:all(m["terminal_id"] for m in self.api("GET")["members"]))
+        members=self.api("GET")["members"]
+        self.until("false idle loading observed",lambda:all(
+            self.terminal(m["terminal_id"])["status_reads"]>=2 for m in members))
+        for m in members:
+            self.assertEqual(self.terminal(m["terminal_id"])["inputs"],[])
+            self.next_turn(m["terminal_id"],m["name"]+"启动后完成")
+            self.http(self.cao_url,"POST",f"/_test/terminals/{m['terminal_id']}/ready")
+        replies=self.wait_replies(2)
+        self.assertEqual({m["text"] for m in replies},{"开发启动后完成","评审启动后完成"})
+        for m in members:
+            state=self.terminal(m["terminal_id"])
+            self.assertEqual(state["early_inputs"],0)
+            self.assertEqual([x["message"] for x in state["inputs"]],["[群主] "+text])
+
+    def test_startup_timeout_and_restart_preserve_the_job_for_manual_retry(self):
+        self.http(self.cao_url,"POST","/_test/config",{"startup_hold":True})
+        self.create_group()
+        member=self.api("POST","/members",{"name":"开发","provider":"codex"})
+        original="@开发 启动超时后恢复原消息"
+        self.api("POST","/messages",{"text":original})
+        self.until("startup timeout visible",lambda:self.api("GET")["members"][0].get("delivery_state")=="not_ready")
+        blocked=self.api("GET")["members"][0]
+        self.assertEqual(blocked["queued_count"],1)
+        self.assertTrue(blocked["can_retry"])
+        self.assertEqual(self.terminal(blocked["terminal_id"])["inputs"],[])
+        self.stopped_server=self.server
+        self.stop_process(self.stopped_server)
+        self.start_server()
+        restored=self.api("GET")["members"][0]
+        self.assertEqual((restored["delivery_id"],restored["queued_count"]),(blocked["delivery_id"],1))
+        tid=restored["terminal_id"]
+        self.next_turn(tid,"启动恢复后完成",complete_on_input=True)
+        reads=self.terminal(tid)["status_reads"]
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready")
+        self.until("ready observed without automatic retry",lambda:self.terminal(tid)["status_reads"]>=reads+2)
+        self.assertEqual(self.terminal(tid)["inputs"],[])
+        self.api("POST",f"/members/{member['id']}/retry",{
+            "delivery_id":restored["delivery_id"],"delivery_attempt":restored["delivery_attempt"]})
+        self.assertEqual([m["text"] for m in self.wait_replies(1)],["启动恢复后完成"])
+        self.assertEqual([x["message"] for x in self.terminal(tid)["inputs"]],["[群主] "+original])
+        self.assertEqual(sum(m["kind"]=="owner" for m in self.api("GET")["messages"]),1)
+
+    def test_late_working_and_done_recover_after_warning_without_resend(self):
+        self.create_group()
+        member=self.invite("开发","codex","developer")
+        tid=member["terminal_id"]
+        self.next_turn(tid,"迟到的本轮回复",idle_stream=True,interim="尚无本轮工作标记")
+        self.api("POST","/messages",{"text":"@开发 等待迟到进展"})
+        self.until("no progress warning",lambda:self.api("GET")["members"][0].get("can_retry"))
+        self.assertEqual(self.replies(),[])
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/advance")
+        self.until("late progress clears warning state",lambda:not self.api("GET")["members"][0].get("can_retry"))
+        self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/advance")
+        self.assertEqual([m["text"] for m in self.wait_replies(1)],["迟到的本轮回复"])
+        self.assertEqual(len(self.terminal(tid)["inputs"]),1)
+
+    def test_dropped_delivery_warns_once_and_manual_retry_is_idempotent(self):
+        self.create_group()
+        self.invite("开发","codex","developer")
+        self.invite("评审","claude_code","reviewer")
+        self.until("silent notice consumed",lambda:self.api("GET")["members"][0].get("reply_handled"))
+        members=self.api("GET")["members"]
+        for m in members:
+            self.next_turn(m["terminal_id"],"不会到达",drop=True)
+        original="@开发 @评审 这轮投递被丢弃"
+        self.api("POST","/messages",{"text":original})
+        self.until("both deliveries visibly uncertain",lambda:all(
+            m.get("delivery_state")=="uncertain" for m in self.api("GET")["members"]))
+        warned=self.api("GET")
+        self.assertEqual(sum("可能未送达" in m["text"] for m in warned["messages"]),2)
+        self.assertTrue(all(m["can_retry"] for m in warned["members"]))
+        for m in warned["members"]:
+            before=len(self.terminal(m["terminal_id"])["inputs"])
+            self.next_turn(m["terminal_id"],m["name"]+"重发后完成",complete_on_input=True)
+            token={"delivery_id":m["delivery_id"],"delivery_attempt":m["delivery_attempt"]}
+            gate=threading.Barrier(2)
+            def retry_once():
+                gate.wait(timeout=2)
+                try:
+                    self.api("POST",f"/members/{m['id']}/retry",token)
+                    return 200
+                except error.HTTPError as exc:
+                    with exc:
+                        return exc.code
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(lambda _:retry_once(),range(2)))
+            self.assertEqual(sorted(results),[200,400])
+            with self.assertRaises(error.HTTPError) as failed:
+                self.api("POST",f"/members/{m['id']}/retry",token)
+            self.assertEqual(failed.exception.code,400)
+            failed.exception.close()
+            self.until("retry dispatched after prompt stability", lambda: len(
+                self.terminal(m["terminal_id"])["inputs"])==before+1)
+            self.assertEqual(self.terminal(m["terminal_id"])["inputs"][-1]["message"],"[群主] "+original)
+        self.assertEqual({m["text"] for m in self.wait_replies(2)}, {"开发重发后完成","评审重发后完成"})
+        settled=self.api("GET")
+        self.assertTrue(all(not m["pending"] and not m["can_retry"] for m in settled["members"]))
+        self.assertEqual(sum("可能未送达" in m["text"] for m in settled["messages"]),2)
+
     def test_codex_buffer_clear_allows_fast_and_identical_short_replies(self):
         self.create_group()
         member = self.invite("开发", "codex", "developer")
@@ -285,10 +424,11 @@ class IntegrationTests(unittest.TestCase):
         member = self.invite("开发", "codex", "developer")
         tid = member["terminal_id"]
         self.next_turn(tid, "旧轮不应入群", idle_stream=True, interim="旧轮执行中")
-        self.api("POST", "/messages", {"text": "@开发 旧任务"})
-        self.until("old input dispatched", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        # Simulate work begun outside the GUI. New GUI jobs now queue while its
+        # own delivery is pending, so they must not overwrite that delivery.
+        self.http(self.cao_url, "POST", f"/terminals/{tid}/input?message=external-old-turn")
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
-        self.until("old working observed", lambda: self.api("GET")["members"][0].get("codex_saw_working"))
+        self.assertIn("state=working", self.terminal(tid)["full_out"])
         final = "只有新轮最终回复可以入群"
         self.next_turn(tid, final, idle_stream=True, interim="旧轮收尾文字",
                        raw_prefix="\x1b]7501;state=done\x07")

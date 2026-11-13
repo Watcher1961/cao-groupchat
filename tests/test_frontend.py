@@ -29,6 +29,9 @@ class FrontendEffortTests(unittest.TestCase):
     def test_provider_switching_and_form_payload(self):
         self.check_ui("switching")
 
+    def test_uncertain_delivery_has_manual_retry_without_endless_typing(self):
+        self.check_ui("delivery")
+
     def test_demo_invitation_editing_and_member_cards(self):
         self.check_ui("demo")
 

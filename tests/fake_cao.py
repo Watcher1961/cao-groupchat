@@ -16,6 +16,11 @@ class FakeCAO(ThreadingHTTPServer):
         self.lock = threading.RLock()
         self.profiles = {}
         self.terminals = {}
+        self.config = {"startup_hold": False, "hold_create": False}
+        self.creation_gate = threading.Event()
+        self.creation_gate.set()
+        self.create_waiting = 0
+        self.buffer_limit = 32768
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,23 +54,52 @@ class Handler(BaseHTTPRequestHandler):
             return "已实现 \x1b[32mauth.ts\x1b[0m，@评审 请看。"
         return f"回复：{message[:40]}\n[日志] 审查完成"
 
+    @staticmethod
+    def prompt(provider):
+        if provider == "codex":
+            return "codex>\n? for shortcuts"
+        if provider == "claude_code":
+            return "────────────\n❯ \n────────────\n? for shortcuts"
+        return "Ready\n> "
+
+    def write_raw(self, terminal, content):
+        raw = (terminal["full_out"] + content).encode()
+        terminal["full_out"] = raw[-self.server.buffer_limit:].decode(errors="ignore")
+
     def complete(self, terminal, turn):
         terminal["output_generation"] += 1
         terminal["status_generation"] = terminal["output_generation"]
         terminal["status"] = "completed"
         terminal["out"] = turn["reply"]
         if terminal["provider"] == "codex":
-            terminal["full_out"] += ("\x1b]7501;state=working\x07" + turn["reply"] +
-                                     "\x1b]7501;state=done\x07")
+            self.write_raw(terminal, "\x1b]7501;state=working\x07" + turn["reply"] +
+                           "\x1b]7501;state=done\x07\n" + self.prompt(terminal["provider"]))
         else:
-            terminal["full_out"] += turn["reply"]
+            self.write_raw(terminal, turn["reply"] + "\n" + self.prompt(terminal["provider"]))
         terminal["pending"] = None
 
     def route(self, method):
         url = parse.urlparse(self.path)
         query = {k: v[0] for k, v in parse.parse_qs(url.query).items()}
         path = url.path
+        creating = method == "POST" and (path == "/sessions" or
+                   re.fullmatch(r"/sessions/[^/]+/terminals:operator", path))
+        if creating and self.server.config["hold_create"]:
+            with self.server.lock:
+                self.server.create_waiting += 1
+            released = self.server.creation_gate.wait(timeout=10)
+            with self.server.lock:
+                self.server.create_waiting -= 1
+            if not released:
+                return self.respond(503, {"detail": "create gate timed out"})
         with self.server.lock:
+            if path == "/_test/config" and method == "POST":
+                self.server.config.update(self.body())
+                if self.server.config["hold_create"]:
+                    self.server.creation_gate.clear()
+                else:
+                    self.server.creation_gate.set()
+                return self.respond(200, {"ok": True})
             if path == "/health" and method == "GET":
                 return self.respond(200, {"status": "ok"})
             if path == "/agents/providers" and method == "GET":
@@ -88,29 +122,46 @@ class Handler(BaseHTTPRequestHandler):
                     "profile": query["agent_profile"], "provider": query["provider"],
                     "out": "", "full_out": "", "inputs": [], "full_reads": 0, "last_reads": 0,
                     "pending": None, "next_turn": {}, "output_reads": 0, "status_reads": 0,
+                    "startup_ready": not self.server.config["startup_hold"], "early_inputs": 0,
                 }
+                terminal["full_out"] = (self.prompt(terminal["provider"]) if terminal["startup_ready"]
+                                        else "CLI loading")
+                terminal["output_generation"] = 1
+                terminal["status_generation"] = 1 if terminal["startup_ready"] else 0
                 self.server.terminals[tid] = terminal
                 return self.respond(201, self.public(terminal))
             # Test-only controls/observations do not advance terminal status.
             if path == "/_test/state" and method == "GET":
                 return self.respond(200, {"terminals": self.server.terminals,
-                                          "profiles": self.server.profiles})
-            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance)", path)
+                                          "profiles": self.server.profiles,
+                                          "create_waiting": self.server.create_waiting,
+                                          "buffer_limit": self.server.buffer_limit})
+            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
                 if terminal is None:
                     return self.respond(404, {"detail": "terminal missing"})
                 if control[2] == "next-turn":
                     terminal["next_turn"] = self.body()
+                elif control[2] == "ready":
+                    terminal["startup_ready"] = True
+                    terminal["output_generation"] += 1
+                    terminal["status_generation"] = terminal["output_generation"]
+                    terminal["status"] = "idle"
+                    self.write_raw(terminal, "\n" + self.prompt(terminal["provider"]))
+                elif control[2] == "progress":
+                    self.write_raw(terminal, self.body()["text"])
+                    terminal["output_generation"] += 1
                 elif control[2] == "advance" and terminal["pending"]:
                     turn = terminal["pending"]
                     if turn["idle_stream"]:
                         turn["phase"] += 1
                         terminal["output_generation"] += 1
                         if turn["phase"] == 1:
-                            terminal["full_out"] += "\x1b]7501;state=working\x07" + turn["interim"]
+                            self.write_raw(terminal, "\x1b]7501;state=working\x07" + turn["interim"])
                         else:
-                            terminal["full_out"] += turn["reply"] + "\x1b]7501;state=done\x07"
+                            self.write_raw(terminal, "x" * turn["padding_bytes"] + turn["reply"] +
+                                           "\x1b]7501;state=done\x07\n" + self.prompt(terminal["provider"]))
                             terminal["out"] = turn["reply"]
                             terminal["pending"] = None
                 elif terminal["pending"]:
@@ -163,17 +214,26 @@ class Handler(BaseHTTPRequestHandler):
                         "phase_reads": [0, 0, 0], "reported_statuses": [], "polls": 0,
                         "append_output": options.get("append_output", False),
                         "complete_on_input": options.get("complete_on_input", False),
+                        "padding_bytes": options.get("padding_bytes", 0), "drop": options.get("drop", False),
                     }
                     terminal["inputs"].append(turn)
                     terminal["pending"] = turn
-                    if turn["complete_on_input"]:
+                    if turn["drop"] or not terminal["startup_ready"]:
+                        if not terminal["startup_ready"]:
+                            terminal["early_inputs"] += 1
+                        terminal["pending"] = None
+                        if terminal["startup_ready"]:
+                            terminal["status"] = "idle"
+                            terminal["output_generation"] += 1
+                            self.write_raw(terminal, self.prompt(terminal["provider"]))
+                    elif turn["complete_on_input"]:
                         self.complete(terminal, turn)
                     elif turn["idle_stream"]:
                         terminal["status"] = "idle"
                         terminal["output_generation"] += 1
                         terminal["status_generation"] = terminal["output_generation"]
                         terminal["out"] = turn["interim"]
-                        terminal["full_out"] += options.get("raw_prefix", "") + turn["interim"]
+                        self.write_raw(terminal, options.get("raw_prefix", "") + turn["interim"])
                     elif not stale:
                         terminal["status"] = "processing"
                         # No raw bytes have arrived yet; a status value is not output.
