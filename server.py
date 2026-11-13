@@ -654,13 +654,21 @@ def get_full_output(m: dict) -> str:
     return raw
 
 
+CODEX_STATE = re.compile(r"state=(\w+)(?=[:;\x07\x1b\r\n]|$)")
+
+
+def codex_markers(raw: str) -> list[tuple[int, str | None]]:
+    # Codex 0.164.0 uses state=...:app=codex + ST. Keep no-app/BEL support.
+    # Retain incomplete/unknown final markers so an earlier done cannot win.
+    markers = []
+    for marker in re.finditer(re.escape("\x1b]7501;"), raw):
+        state = CODEX_STATE.match(raw, marker.end())
+        markers.append((marker.start(), state.group(1) if state else None))
+    return markers
+
+
 def codex_states(raw: str) -> list[str | None]:
-    # Keep incomplete/unknown final markers: an earlier done must not override them.
-    states = []
-    for tail in raw.split("\x1b]7501;")[1:]:
-        match = re.match(r"state=(\w+)(?=[;\x07\x1b\r\n]|$)", tail)
-        states.append(match.group(1) if match else None)
-    return states
+    return [state for _, state in codex_markers(raw)]
 
 
 def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None:
@@ -668,7 +676,8 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
     if boundary is None:
         return None  # A pending turn from before this protocol has no proven boundary.
     raw = get_full_output(m)
-    states = codex_states(raw)
+    markers = codex_markers(raw)
+    states = [state for _, state in markers]
     snapshot_len, snapshot_hash = m.get("codex_snapshot_len"), m.get("codex_snapshot_hash")
     fresh_bytes = (isinstance(output_generation, int) and isinstance(m.get("boundary"), int)
                    and output_generation > m["boundary"])
@@ -715,8 +724,7 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
     if current_working:
         m["codex_saw_working"] = True
     if reset:
-        starts = [match.start() for match in re.finditer(
-            r"\x1b\]7501;state=working(?=[;\x07\x1b\r\n]|$)", raw)]
+        starts = [start for start, state in markers if state == "working"]
         m["full_len"] = starts[-1] if starts else 0
     return get_reply(m)
 

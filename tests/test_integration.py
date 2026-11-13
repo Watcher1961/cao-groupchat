@@ -449,7 +449,8 @@ class IntegrationTests(unittest.TestCase):
         for m in members:
             tid=m["terminal_id"]
             self.assertEqual(self.terminal(tid)["inputs"],[])
-            self.next_turn(tid,"收到，我是"+m["name"],complete_on_input=True)
+            self.next_turn(tid,"收到，我是"+m["name"],complete_on_input=True,
+                           padding_bytes=6600 if m["provider"]=="codex" else 0)
             self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready")
         self.assert_fast_replies_remain_complete(["收到，我是cx","收到，我是cc"])
         for m in members:
@@ -457,6 +458,12 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual([turn["message"] for turn in state["inputs"]],["[群主] "+text])
             self.assertTrue(state["inputs"][0]["complete_on_input"])
             self.assertGreater(state["output_generation"],state["inputs"][0]["dispatch_boundary"])
+            if m["provider"]=="codex":
+                # Independently assert the owner's literal bytes, not fake constants.
+                self.assertIn(b"\x1b]7501;state=working:app=codex\x1b\\",state["full_out"].encode())
+                self.assertIn(b"\x1b]7501;state=done:app=codex\x1b\\",state["full_out"].encode())
+                self.assertLess(len(state["full_out"].encode()),32768)
+                self.assertTrue(self.api("GET")["members"][0]["codex_saw_working"])
 
     def test_fast_codex_done_survives_eviction_before_the_first_poll(self):
         self.http(self.cao_url,"POST","/_test/config",{"startup_hold":True})
@@ -465,7 +472,7 @@ class IntegrationTests(unittest.TestCase):
         self.api("POST","/messages",{"text":"@所有人 只回复：收到，我是cx"})
         tid=self.until("cold codex terminal allocated",lambda:self.api("GET")["members"][0]["terminal_id"])
         self.next_turn(tid,"收到，我是cx",complete_on_input=True,padding_bytes=40000)
-        previous="\x1b]7501;state=working\x07旧回复\x1b]7501;state=done\x07\x1b]7501;state=done\x07"
+        previous="\x1b]7501;state=working:app=codex\x1b\\旧回复\x1b]7501;state=done:app=codex\x1b\\\x1b]7501;state=done:app=codex\x1b\\"
         self.http(self.cao_url,"POST",f"/_test/terminals/{tid}/ready",{"prompt":previous+"\ncodex>\n? for shortcuts"})
         self.assert_fast_replies_remain_complete(["收到，我是cx"])
         member=self.api("GET")["members"][0]
@@ -516,7 +523,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("state=working", self.terminal(tid)["full_out"])
         final = "只有新轮最终回复可以入群"
         self.next_turn(tid, final, idle_stream=True, interim="旧轮收尾文字",
-                       raw_prefix="\x1b]7501;state=done\x07")
+                       raw_prefix="\x1b]7501;state=done:app=codex\x1b\\")
         self.api("POST", "/messages", {"text": "@开发 新任务"})
         self.until("old done polled twice after buffer clear", lambda:
                    len(self.terminal(tid)["inputs"]) == 2 and

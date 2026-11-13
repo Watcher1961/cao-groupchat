@@ -420,7 +420,7 @@ class DeliveryTests(ServerTestCase):
         self.developer.update(terminal_id="dev-terminal",ready_terminal="dev-terminal",
                               reply_handled=False,codex_dispatch_markers=0,codex_dispatch_state=None,
                               codex_saw_working=True,full_len=0)
-        raw="\x1b]7501;state=working\x07旧回复\x1b]7501;state=done\x07"
+        raw="\x1b]7501;state=working:app=codex\x1b\\旧回复\x1b]7501;state=done:app=codex\x1b\\"
         def response(method,path,*args,**kwargs):
             if method=="POST":
                 raise self.server.CaoError(0,"input response timed out")
@@ -620,8 +620,9 @@ class DeliveryTests(ServerTestCase):
 
 
 class CodexCompletionTests(ServerTestCase):
-    WORKING = "\x1b]7501;state=working\x07"
-    DONE = "\x1b]7501;state=done\x07"
+    # Exact Codex 0.164.0 bytes supplied by the owner; do not import fake constants.
+    WORKING = "\x1b]7501;state=working:app=codex\x1b\\"
+    DONE = "\x1b]7501;state=done:app=codex\x1b\\"
 
     def prepare(self, provider="codex", boundary=0):
         self.developer.update(provider=provider, status="idle", pending=True,
@@ -654,6 +655,25 @@ class CodexCompletionTests(ServerTestCase):
         self.prepare()
         self.cao.side_effect = [{"output": previous}, {"dispatch_boundary": 7}]
         self.server.send_to(self.group, self.developer, "新一轮", 0)
+
+    def test_real_codex_0164_bytes_and_legacy_formats_are_parsed(self):
+        raw="\x1b]7501;state=working:app=codex\x1b\\正文\x1b]7501;state=done:app=codex\x1b\\"
+        self.assertEqual(self.server.codex_states(raw),["working","done"])
+        for suffix in (":app=codex",":app=another-app",""):
+            for terminator in ("\x1b\\","\x07"):
+                with self.subTest(suffix=suffix,terminator=repr(terminator)):
+                    # No-app variants are compatibility cases, not default CLI fixtures.
+                    raw=f"\x1b]7501;state=working{suffix}{terminator}正文\x1b]7501;state=done{suffix}{terminator}"
+                    self.assertEqual(self.server.codex_states(raw),["working","done"])
+        self.assertEqual(self.server.codex_states(
+            self.DONE+"\x1b]7501;sta"+"\x1b]7501;state=future_state:app=codex\x1b\\"),
+            ["done",None,"future_state"])
+
+    def test_full_fallback_starts_at_the_native_working_marker(self):
+        self.dispatch_from(self.WORKING+"旧回复"+self.DONE)
+        self.poll("旧重绘前缀不应进群"+self.WORKING+"本轮回复"+self.DONE,last_unsupported=True)
+        self.assertFalse(self.developer["pending"])
+        self.assertEqual([m["text"] for m in self.group["messages"]],["本轮回复"])
 
     def test_cleared_buffer_finishes_short_reply_before_any_working_poll(self):
         for previous, current in (("上一轮很长的内容", "短回复"),
@@ -742,8 +762,8 @@ class CodexCompletionTests(ServerTestCase):
                               (self.WORKING + self.DONE, True),
                               (self.DONE + "\x1b]7501;sta", False),
                               (self.DONE + "\x1b]7501;state=don", False),
-                              (self.DONE + "\x1b]7501;state=done_later\x07", False),
-                              ("\x1b]7501;state=working\x1b\\正文\x1b]7501;state=done\x1b\\", True),
+                              (self.DONE + "\x1b]7501;state=done_later:app=codex\x1b\\", False),
+                              ("\x1b]7501;state=working:app=codex\x07正文\x1b]7501;state=done:app=codex\x07", True),
                               (self.DONE, False)):
             with self.subTest(raw=repr(raw)):
                 self.prepare()
@@ -842,10 +862,11 @@ class CleanOutputTests(ServerTestCase):
         self.assertEqual(self.server.clean_output("\x1b[32m完成\x1b[0m\x1b[2K\x1b[?25h\r\n"), "完成")
 
     def test_removes_osc_sequences_with_bell_or_string_terminator(self):
-        for terminator in ("\x07", "\x1b\\"):
-            with self.subTest(terminator=repr(terminator)):
-                text = f"\x1b]7501;state=working{terminator}正文\x1b]7501;state=done{terminator}"
-                self.assertEqual(self.server.clean_output(text), "正文")
+        for suffix in (":app=codex", ""):
+            for terminator in ("\x07", "\x1b\\"):
+                with self.subTest(suffix=suffix,terminator=repr(terminator)):
+                    text = f"\x1b]7501;state=working{suffix}{terminator}正文\x1b]7501;state=done{suffix}{terminator}"
+                    self.assertEqual(self.server.clean_output(text), "正文")
 
     def test_removes_real_claude_tui_footer(self):
         for verb, duration in (("Sautéed", "1m 8s"), ("Cooked", "2m 3s"),

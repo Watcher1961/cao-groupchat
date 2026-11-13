@@ -72,8 +72,8 @@ class Handler(BaseHTTPRequestHandler):
         terminal["status"] = "completed"
         terminal["out"] = turn["reply"]
         if terminal["provider"] == "codex":
-            self.write_raw(terminal, "\x1b]7501;state=working\x07" + "x" * turn["padding_bytes"] + turn["reply"] +
-                           "\x1b]7501;state=done\x07\n" + self.prompt(terminal["provider"]))
+            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + "x" * turn["padding_bytes"] + turn["reply"] +
+                           "\x1b]7501;state=done:app=codex\x1b\\\n" + self.prompt(terminal["provider"]))
         else:
             self.write_raw(terminal, turn["reply"] + "\n" + self.prompt(terminal["provider"]))
         terminal["pending"] = None
@@ -159,10 +159,10 @@ class Handler(BaseHTTPRequestHandler):
                         turn["phase"] += 1
                         terminal["output_generation"] += 1
                         if turn["phase"] == 1:
-                            self.write_raw(terminal, "\x1b]7501;state=working\x07" + turn["interim"])
+                            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + turn["interim"])
                         else:
                             self.write_raw(terminal, "x" * turn["padding_bytes"] + turn["reply"] +
-                                           "\x1b]7501;state=done\x07\n" + self.prompt(terminal["provider"]))
+                                           "\x1b]7501;state=done:app=codex\x1b\\\n" + self.prompt(terminal["provider"]))
                             terminal["out"] = turn["reply"]
                             terminal["pending"] = None
                 elif terminal["pending"]:

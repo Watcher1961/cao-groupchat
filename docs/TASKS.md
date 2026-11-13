@@ -19,7 +19,7 @@
 | --- | --- | --- | --- |
 | 1 | 成员推理强度 | 新增并保存 `effort`；Codex 选 low/medium/high/xhigh 并写入 `codexConfig.model_reasoning_effort`；Claude Code 选 low/medium/high/xhigh/max 并写入 `claudeConfig.effort`，由 CAO 转为 `--effort`；留空沿用 CLI 默认；其他 provider 不显示；邀请/编辑、成员卡片及演示模式一致；保存、编辑重启及恢复有回归证据 | 审查与群主浏览器抽查通过：`f369734`；编辑强度日志由 claude 确认无问题（`116851a`） |
 | 2 | Codex 完成判定 | 以本轮输出最后一个 OSC 7501 标记为准，只有 done 完成；fake 模拟 status=idle 且仍 working，集成断言不提前读取为最终回复 | 审查通过（群主确认）：`116851a`、`092021c`；附带长输出回归本次补充 |
-| 3 | 启动即发丢失与无限等待 | 写清终端就绪信号及依据，只在就绪后投递；投递后长期无本轮进展须提示“可能未送达”并允许重发；隔离测试覆盖正常就绪、丢失及重发恢复 | `aad5a16` 复审通过（群主确认）；真实冷启动 Codex 漏收快速回复，已重开；本次独立修复待审查 |
+| 3 | 启动即发丢失与无限等待 | 写清终端就绪信号及依据，只在就绪后投递；投递后长期无本轮进展须提示“可能未送达”并允许重发；隔离测试覆盖正常就绪、丢失及重发恢复 | `aad5a16` 复审通过；`5b88949` 真实复测仍阻塞，确认原生标记冒号后缀未解析；本次格式修复待审查 |
 | 4 | 并发重启竞态 | 同一群启动串行化或加入已有会话；无在线终端时并发启动多成员，所有成员最终进入同一会话，不出现 Session already exists | 待前项结案及群主授权 |
 | 5 | 窄窗口面板不可达 | 小于 1100px 可由按钮抽屉打开成员/日志，小于 760px 可打开群列表；手机宽度仍可建群、查看成员和日志，有具体浏览器验收记录 | 待前项结案及群主授权 |
 
@@ -129,7 +129,7 @@ Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 T
 
 差异空白、文档链接/围栏/私人路径及共享日志忽略检查通过；AST 确认原 Codex 完成判定、输出提取、成员启停和 profile 未变，CSS 未变。子进程、临时目录清理沿用隔离夹具；不连接真实 9889，不启动真实 provider，没有新增真实联调记录。独立修复提交为 `aad5a16`，未改写 `52a3e93`；群主确认该项审查通过，随后真实冷启动发现下述阻塞并重开。
 
-#### `aad5a16` 真实冷启动联调重开：首次轮询只剩 done（修复待审查）
+#### `aad5a16` 真实冷启动联调重开：快速完成与窗口边界（历史修复 `5b88949`）
 
 2026-11-14，群主在 `aad5a16` 另起独立端口/临时数据目录实例，建群拉入 codex low、claude_code sonnet low，立即发送 `@所有人 只回复：收到，我是<名字>`。以下为群主提供的真实结果，本次实现者没有重复操作真实 CAO：
 
@@ -138,7 +138,7 @@ Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 T
 | Claude Code | 就绪后投递，7 秒内回复进入群聊，通过该冷启动场景。 |
 | Codex | 消息已送达，2 秒内回复“收到，我是cx”，终端完成 working → done；CAO status=completed，status_generation/output_generation=48 > boundary=20。GUI 未收下，约 2 分钟后提示“可能未送达”，pending 未解除，阻塞。 |
 
-出错时 delivery_state=uncertain、delivery_started=False、codex_saw_working=False、codex_buffer_reset=True、codex_dispatch_markers=3。Claude 后续用真实函数只读复现：TUI 重绘超过 32KB，首次轮询前 working 已被挤出，raw 窗口仅剩 done；直接原因是 get_codex_reply 的“必须有 working”保护返回 None，delivery_started=False 是伴随状态，并不是拦截完成的门槛。原 32KB 用例只覆盖先前轮询见过 working，未覆盖此前完全没观察到的情况。
+出错时 delivery_state=uncertain、delivery_started=False、codex_saw_working=False、codex_buffer_reset=True、codex_dispatch_markers=3。Claude 当时用真实函数和桩复现了一个窗口边界：重绘超过 32KB，首次轮询只剩 done 时，get_codex_reply 因没有 working 而返回 None；原用例只覆盖此前已见 working。该隔离复现证实独立边界存在，但当时没有真实原始字节，不能据此确认为群主失败的根因；下面的 5b88949 复测明确发现 working/done 都在，真正阻塞为解析格式。
 
 本次修复：保留发送时 codex_dispatch_state 原值，不在缓冲区重置时丢弃，也不在忽略旧完成时改写它。若已识别缓冲区清空/重置、发送时不是 working、最后标记是 done 且 output_generation > dispatch_boundary，则不要求看到 working，即可收下本轮回复。发送时旧轮仍 working 的场景仍须本轮 working 证据；只有状态代际前进、输出代际未前进/缺失，或无重置证据，不能用孤立 done 完成。完整 W/D、追加及此前见过 working 的滚动路径保留。统一回复处理（含普通 provider）将 delivery_started 标为 True，解除 pending，不自动重发。
 
@@ -152,7 +152,41 @@ Codex 特征为 shortcuts/context/path 页脚且不是 working；Claude 为新 T
 | 2 | 14.476 秒 | 83 项，OK |
 | 3 | 14.596 秒 | 83 项，OK |
 
-文档相对链接、围栏、私人路径扫描、`git diff --check` 及日志忽略检查通过；AST 确认生产代码仅改变 get_codex_reply 和 handle_reply，未改就绪/超时/启停、前端及第 4/5 项。测试使用随机端口、隔离临时目录并清理子进程，不连接真实 9889 或启动真实 CLI。仅做本次冷启动修复，独立提交（本节所属提交，交接给出哈希），待 Claude 审查及群主在修复版重新真实联调；不进入第 4/5 项、不推送。
+文档相对链接、围栏、私人路径扫描、`git diff --check` 及日志忽略检查通过；AST 确认生产代码仅改变 get_codex_reply 和 handle_reply，未改就绪/超时/启停、前端及第 4/5 项。测试使用随机端口、隔离临时目录并清理子进程，不连接真实 9889 或启动真实 CLI。该窗口修复提交为 `5b88949`，隔离测试通过，但群主真实复测仍失败，后续格式修复见下文；未进入第 4/5 项、不推送。
+
+#### `5b88949` 真实复测：Codex 0.164.0 原生 OSC 字节（修复待审查）
+
+2026-11-14，群主在 `5b88949` 真实复测：Claude Code 就绪后投递，8 秒回复，仍正常；Codex 2 秒回复“收到，我是cx”，GUI 约 2 分钟后仍提示“可能未送达”。本次 raw 缓冲区约 6.6KB，working 和 done 都在，因此前述 32KB 推断不能解释本次真实失败。
+
+群主查明 Codex 0.164.0 原始标记如下（末尾 `\x1b\\` 为 ST；这里以 Python 转义形式记录）：
+
+```text
+'\x1b]7501;state=working:app=codex\x1b\\'
+'\x1b]7501;state=done:app=codex\x1b\\'
+```
+
+旧 codex_states 的状态后边界未接受冒号，对上述真实字节解析为 [None, None]；fake 与主要测试都使用不带 app 后缀的 BEL 样本，所以此前 83 项通过也漏掉该问题。本次实现者未重新操作真实 CAO，上述结果和字节均来自群主。
+
+本次先写失败回归：直接使用群主两条字节、full 降级起点、6.6KB 首次轮询前完成的冷启动，共 3 项在生产代码未改时于 1.052 秒全部失败，无错误；直接观察到 [None, None]。实现后首次全量 85 项通过（14.841 秒），无跳过。
+
+修复与样本核对：
+
+- 共用 CODEX_STATE/codex_markers 解析状态及 raw 起点，接受 `:app=…` 后缀与 ST/BEL；未知值和拆分末标记照旧保留，不能被旧 done 覆盖。
+- 全库搜索发现 full 降级定位 working 的第二条正则也遗漏冒号，现复用同一解析结果；新增用例保证旧重绘前缀不会进入本轮回复。基线计数、就绪 gate 均经 codex_states 同步修复；ANSI/OSC 清洗已有 ST/BEL 支持，扩充含后缀的验证。
+- fake 同步完成、idle_stream/advance 默认全部输出 `state=…:app=codex` + ST；主单测常量、集成旧轮注入也切换为原生格式。无 app 的 ST/BEL 仅保留为明确兼容矩阵，未知/拆分样本仍为负向用例。
+- 冷启动集成在 working 与 done 之间重绘 6600 字节，断言完整窗口小于 32KB、两条原生标记都存在、回复进群且超时期限后也不告警。测试独立写出群主字节常量、不导入 fake 常量，以免两者一起偏离真实格式。
+
+最终验证（2026-11-14，codex）：连续三次执行 `python3 -B -W error::ResourceWarning -m unittest discover -s tests`，均退出 0，85 项通过（67 后端单测、14 HTTP 集成、4 Node 前端回归），无跳过/资源警告。
+
+| 次数 | unittest 耗时 | 结果 |
+| --- | --- | --- |
+| 1 | 14.591 秒 | 85 项，OK |
+| 2 | 14.638 秒 | 85 项，OK |
+| 3 | 14.550 秒 | 85 项，OK |
+
+AST 核对生产只新增 codex_markers 并修改 codex_states/get_codex_reply；fake 与 HTTP 完整字面标记全部使用原生后缀/ST，文档转义样本求值后也与群主字节一致。文档相对链接/围栏/私人路径、`git diff --check`、共享日志忽略检查通过。全量继续使用随机端口和临时目录，不接触真实 9889，结束清理子进程。
+
+本次单独提交（本节所属提交，交接给出哈希），待 Claude 审查；特别请审查者逐字节核对 fake 与直接单测/集成样本和上面原始字节一致。第 3 项保持重开，修复版真实复测待群主执行，不进入第 4/5 项、不推送。
 
 后续真实联调清单（Claude 冷启动在 `aad5a16` 已通过上述单一场景，Codex 修复版及其余场景仍待执行）：
 
