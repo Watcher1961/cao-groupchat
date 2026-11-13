@@ -192,6 +192,27 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.api("GET")["messages"], before["messages"])
         self.assertEqual(self.terminal(review_tid)["output_reads"], review_state["output_reads"])
 
+        # Exercise a new turn through the restored group and its existing terminal.
+        resumed_text = "@开发 重启后再处理一轮"
+        resumed_reply = "重启后的本轮回复已送达"
+        self.next_turn(dev_tid, resumed_reply)
+        resumed_owner = self.api("POST", "/messages", {"text": resumed_text})
+        self.assertEqual((resumed_owner["kind"], resumed_owner["sender"], resumed_owner["to"]),
+                         ("owner", "群主", ["开发"]))
+        resumed_replies = self.wait_replies(3)
+        self.assertEqual(resumed_replies[:2], replies)
+        self.assertEqual((resumed_replies[2]["sender"], resumed_replies[2]["member_id"],
+                          resumed_replies[2]["text"]), ("开发", dev["id"], resumed_reply))
+        self.assertEqual(self.api("GET")["messages"],
+                         before["messages"] + [resumed_owner, resumed_replies[2]])
+        self.assertEqual(resumed_owner["seq"], before["messages"][-1]["seq"] + 1)
+        self.assertEqual(resumed_replies[2]["seq"], resumed_owner["seq"] + 1)
+        resumed_state = self.terminal(dev_tid)
+        self.assertEqual(len(resumed_state["inputs"]), len(dev_state["inputs"]) + 1)
+        self.assertEqual(resumed_state["inputs"][-1]["message"], "[群主] " + resumed_text)
+        self.assertGreater(resumed_state["status_generation"],
+                           resumed_state["inputs"][-1]["dispatch_boundary"])
+
     def test_stale_completed_waits_for_current_turn_output(self):
         self.create_group()
         dev = self.invite("开发", "codex", "developer")
