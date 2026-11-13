@@ -1,0 +1,15 @@
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime logs and Python caches
+*.log
+__pycache__/
+*.py[cod]
+
+# Local tools and operating system files
+.DS_Store
+.claude/
+GROUP_LOG.md
