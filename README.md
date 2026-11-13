@@ -50,18 +50,19 @@ API 金额按内置价格和数据目录下的 `prices.json` 估算；未知价�
 
 ## 验证范围与已知限制
 
-- **已验证（群主确认）**：2026-11-14 在真实 cao-server 2.5.4 上，使用 codex、claude_code 成员跑通建群、加成员、提及接力、日志代写。本轮任务 2 不重跑真实会话。
+- **已验证（群主确认）**：2026-11-14 在真实 cao-server 2.5.4 上，使用 codex、claude_code 成员跑通建群、加成员、提及接力、日志代写。以上为历史联调结果；任务 3 仅运行隔离单元测试。
 - **待验证**：kiro 等其他 provider，以及 waiting_user_answer 权限确认后的回复和恢复交互。代码有相关分支，不代表实测通过。
 - 多成员同时重启时可能争抢新建 session，后到者报 Session already exists；成员推理强度（codexConfig / claudeConfig）尚未支持。本轮不修复这两项。
-- 部分 CLI 的回复可能残留界面字符；消息与日志可能含正文和私人路径，运行数据不提交、不公开。
+- 单测已覆盖两条已知 TUI 尾巴的清除，其他 CLI 格式仍可能残留界面字符；消息与日志可能含正文和私人路径，运行数据不提交、不公开。
 
 ## 开发与测试
 
 共享规则见 [AGENTS.md](AGENTS.md)，Claude Code 通过 [CLAUDE.md](CLAUDE.md) 导入。产品需求、接口和串行任务分别见 [PRD](docs/PRD.md)、[架构](docs/ARCHITECTURE.md)、[任务清单](docs/TASKS.md)。
 
 ```bash
+python3 -m unittest discover -s tests            # 自动单元测试
 python3 -m py_compile server.py tests/fake_cao.py  # 仅语法检查
 python3 tests/fake_cao.py                        # 持续运行的模拟 CAO，非自动测试
 ```
 
-模拟服务固定监听 9889，仅在隔离验证环境替代真实 CAO，不要占用或切换当前真实会话。当前尚无自动断言套件；标准库 unittest 和临时目录、随机端口的集成测试分别在任务 3、4 实施。文档修改使用链接、隐私、范围和 Git 差异检查验证。
+模拟服务固定监听 9889，仅在隔离验证环境替代真实 CAO，不要占用或切换当前真实会话。任务 3 已增加 22 个标准库 unittest：隔离导入、提及、接力上限、静默回复、日志幂等、ANSI 与两条 TUI 尾巴。测试使用临时 HOME/数据目录并阻断真实 CAO 调用；任务 4 的随机端口集成验收尚未实施。文档修改使用链接、隐私、范围和 Git 差异检查验证。

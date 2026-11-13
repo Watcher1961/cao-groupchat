@@ -389,6 +389,7 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> Non
             # 的状态才属于这次发送（见 POST /terminals/{id}/input 的说明，#735/#407）
             m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
             m["pending"] = True
+            m["reply_handled"] = False
             m["sent_at"] = time.time()
             m["saw_busy"] = False
             m["hops"] = hops
@@ -399,13 +400,14 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> Non
 
 
 def find_mentions(g: dict, text: str, exclude: str | None = None) -> list[dict]:
-    out = []
-    for x in g["members"]:
-        if x["id"] == exclude:
-            continue
-        if re.search(rf"@{re.escape(x['name'])}(?![\w一-鿿])", text):
-            out.append(x)
-    return out
+    names = sorted((x["name"] for x in g["members"]), key=len, reverse=True)
+    if not names:
+        return []
+    # Resolve the longest known name before checking its suffix, including dev/dev-team.
+    pattern = r"@(" + "|".join(re.escape(name) for name in names) + r")"
+    mentioned = {match.group(1) for match in re.finditer(pattern, text)
+                 if not re.match(r"[\w一-鿿]", text[match.end():match.end() + 1])}
+    return [x for x in g["members"] if x["id"] != exclude and x["name"] in mentioned]
 
 
 def get_reply(m: dict) -> str:
@@ -426,22 +428,33 @@ def get_reply(m: dict) -> str:
     return ""
 
 
-ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+TUI_FOOTER = re.compile(
+    r"(?:✻ Sautéed for (?:\d+[hms]\s*)+· done \d{1,2}:\d{2} (?:AM|PM)"
+    r"|Worked for (?:\d+[hms]\s*)+• \d{2}:\d{2})"
+)
 
 
 def clean_output(s: str) -> str:
     s = ANSI.sub("", s).replace("\r", "")
-    s = re.sub(r"\n{3,}", "\n\n", s)
+    lines = s.strip().splitlines()
+    # Only remove complete footer lines at the end, preserving prose and code examples.
+    while lines and (not lines[-1].strip() or TUI_FOOTER.fullmatch(lines[-1].strip())):
+        lines.pop()
+    s = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
     return s.strip()
 
 
 def handle_reply(g: dict, m: dict, text: str) -> None:
+    if m.get("reply_handled"):
+        return
+    m["reply_handled"] = True
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
     if not text:
         text = "（无文字输出）"
     add_msg(g, "agent", m["name"], text, mid=m["id"])
-    for line in re.findall(r"^\s*\[日志\]\s*(.+)$", text, flags=re.M):
+    for line in re.findall(r"^[^\S\r\n]*\[日志\][^\S\r\n]*(\S[^\r\n]*)\r?$", text, flags=re.M):
         append_log(g, m["name"], line)
     hops = m.get("hops", 0)
     targets = find_mentions(g, text, exclude=m["id"])

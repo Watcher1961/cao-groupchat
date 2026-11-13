@@ -14,7 +14,8 @@
 | `docs/TASKS.md` | 串行任务、状态、提交和已知问题 |
 | `server.py` | Python 标准库后端及 CAO HTTP 适配 |
 | `index.html` | 单文件前端与浏览器演示模式 |
-| `tests/fake_cao.py` | 模拟 CAO HTTP 服务；目前不是自动断言套件 |
+| `tests/fake_cao.py` | 模拟 CAO HTTP 服务；不是自动断言套件 |
+| `tests/test_server.py` | 标准库 unittest，隔离导入与群聊行为测试 |
 
 ## 构建、运行与验证
 
@@ -36,7 +37,7 @@ python3 tests/fake_cao.py                        # 模拟服务，持续运行�
 
 模拟服务用于隔离的手工验证，不能与同端口真实 CAO 同时运行，也不要让正在工作的 GUI 改连模拟服务。当前模拟脚本会在执行或导入时启动服务，不要把它当作测试模块导入。
 
-任务 3 计划采用以下命令；当前尚无自动单元测试，发现 0 个测试不算通过：
+运行自动单元测试；使用临时 HOME/数据/日志目录并模拟 CAO，不访问真实会话；发现 0 个测试不算通过：
 
 ```bash
 python3 -m unittest discover -s tests -v
