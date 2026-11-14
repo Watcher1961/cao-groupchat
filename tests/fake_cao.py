@@ -142,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                 if query["agent_profile"] in self.server.config["fail_profiles"]:
                     return self.respond(503, {"detail": "simulated terminal start failure"})
                 if path == "/sessions":
-                    self.server.sessions[session] = {"id": session, "name": session, "status": "running"}
+                    self.server.sessions[session] = {"id": session, "name": session, "status": "detached"}
                 tid = uuid.uuid4().hex[:8]
                 terminal = {
                     "id": tid, "session_name": query.get("session_name") or path.split("/")[2],

@@ -1,56 +1,6 @@
-// Optional Node-only behavior checks for the actual inline UI, with no npm packages.
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const vm = require("node:vm");
-const html = fs.readFileSync(process.argv[2], "utf8");
-const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)[1];
-const cutoff = script.indexOf("(async function boot(){");
-assert.ok(cutoff > 0);
-function element() {
-  return {innerHTML: "", value: "", style: {}, dataset: {},
-    classList: {toggle() {}, add() {}, remove() {}}, addEventListener() {},
-    querySelectorAll() { return []; }};
-}
-const nodes = new Map();
-const context = vm.createContext({
-  document: {querySelector(selector) {
-    if (!nodes.has(selector)) nodes.set(selector, element());
-    return nodes.get(selector);
-  }, querySelectorAll() { return []; }},
-  localStorage: {getItem() { return ""; }, setItem() {}},
-  URLSearchParams, setTimeout(fn) { fn(); return 1; },
-});
-vm.runInContext(script.slice(0, cutoff), context);
-function run(code) { return vm.runInContext(code, context); }
-function effortSelect(markup) {
-  const match = markup.match(/<select\b[^>]*name="effort"[^>]*>([\s\S]*?)<\/select>/);
-  if (!match) return null;
-  const options = [...match[1].matchAll(/<option\b([^>]*)>([\s\S]*?)<\/option>/g)].map(option => ({
-    value: option[1].match(/value="([^"]*)"/)[1], selected: /\bselected\b/.test(option[1])}));
-  return {options, value: (options.find(option => option.selected) || options[0]).value};
-}
-function form(member) {
-  const fields = Object.fromEntries(Object.entries({name: "测试成员", provider: member.provider,
-    role: "developer", duty: "测试职责", permission_mode: "", plan: "", model: ""})
-    .map(([key, value]) => [key, {value}]));
-  let markup = run(`memberFormHTML(${JSON.stringify(member)},0,false)`);
-  let select = effortSelect(markup);
-  const box = {get innerHTML() { return markup; }, set innerHTML(value) {
-    markup = value; select = effortSelect(value);
-  }};
-  const modelBox = {innerHTML: "", querySelector(selector) {
-    return selector === "[name=model]" ? fields.model : null;
-  }};
-  return {fields, querySelector(selector) {
-    if (selector === ".effort") return box;
-    if (selector === ".mdl") return modelBox;
-    if (selector === ".cc") return {style: {}};
-    if (selector === "[name=effort]") return select;
-    const name = selector.match(/^\[name=(.+)\]$/);
-    if (name) return fields[name[1]] || null;
-    throw Error(`Unexpected selector ${selector}`);
-  }, querySelectorAll() { return []; }};
-}
+// Optional Node-only checks for the real inline UI.
+const assert=require("node:assert/strict");
+const {html,nodes,context,run,form,effortSelect}=require("./frontend_dom.js")(process.argv[2]);
 const cases = {
   async delivery() {
     run(`S.group={id:"g",members:[{id:"dev",name:"开发",provider:"codex",role:"developer",

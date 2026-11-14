@@ -180,6 +180,7 @@ class IntegrationTests(unittest.TestCase):
         state=self.fake_state()
         self.assertEqual(len(state["sessions"]),1)
         self.assertEqual(len(state["terminals"]),1)
+        self.assertIn(next(iter(state["sessions"].values()))["status"],("active","detached"))
 
     def test_concurrent_new_members_create_one_session_and_all_join(self):
         self.create_group()
@@ -250,7 +251,7 @@ class IntegrationTests(unittest.TestCase):
         recovered=self.startup_settled(self.group_path,3)
         self.assertTrue(all(m["terminal_id"] and m["terminal_id"] not in old
                             for m in recovered["members"][:2]),recovered["messages"])
-        self.assertEqual(self.http(self.cao_url,"GET",f"/sessions/{session}")["session"]["status"],"running")
+        self.assertEqual(self.http(self.cao_url,"GET",f"/sessions/{session}")["session"]["status"],"detached")
         self.api("POST",f"/members/{members[2]['id']}/restart",{})
         self.until("all failed members join new backend",lambda:
                    all(m["terminal_id"] and m["terminal_id"] not in old and m.get("ready_terminal")==m["terminal_id"]

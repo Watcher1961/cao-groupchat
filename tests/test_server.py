@@ -890,7 +890,7 @@ class SessionStartupTests(ServerTestCase):
 
     def test_session_disappearing_during_join_is_recreated(self):
         self.group["session_name"]="shared-session"
-        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"active"}},
             self.server.CaoError(404,"session removed"),{"id":"rebuilt","session_name":"shared-session","status":"idle"}]
         self.server.start_member(self.group,self.member)
         self.assertEqual(self.member["terminal_id"],"rebuilt")
@@ -912,7 +912,7 @@ class SessionStartupTests(ServerTestCase):
                     [("GET","/sessions/shared-session"),("POST","/sessions")])
 
     def test_404_rebuild_attempt_is_bounded_when_join_still_fails(self):
-        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"active"}},
             self.server.CaoError(404,"missing backend"),
             self.server.CaoError(400,"Session 'shared-session' already exists"),
             self.server.CaoError(404,"operator still unavailable")]
@@ -932,7 +932,7 @@ class SessionStartupTests(ServerTestCase):
                 tail=([self.server.CaoError(400,"Session 'shared-session' already exists"),
                        self.server.CaoError(404,"old operator route"),{"id":"recovered","status":"idle"}]
                       if old_operator else [{"id":"recovered","status":"idle"}])
-                self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+                self.cao.side_effect=[{"session":{"id":"shared-session","status":"active"}},
                                      self.server.CaoError(404,"missing backend or route"),*tail]
                 self.server.start_member(self.group,self.member)
                 self.assertEqual(self.member["terminal_id"],"recovered")
@@ -947,7 +947,7 @@ class SessionStartupTests(ServerTestCase):
     def test_legacy_join_keeps_the_live_caller(self):
         self.group["session_name"]="shared-session"
         self.group["members"].append(self.reviewer)
-        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},self.server.CaoError(405,"operator unavailable"),
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"active"}},self.server.CaoError(405,"operator unavailable"),
                               {"id":"legacy-joined","status":"idle"}]
         self.server.start_member(self.group,self.member)
         self.assertEqual(self.member["terminal_id"],"legacy-joined")
