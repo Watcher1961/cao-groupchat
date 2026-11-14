@@ -857,6 +857,58 @@ class CodexCompletionTests(ServerTestCase):
         self.assertIn("发给 开发 失败", self.group["messages"][0]["text"])
 
 
+class SessionStartupTests(ServerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.group.update(session_slug="shared-session",session_name=None)
+        self.member=self.server.clean_member({"name":"启动成员","provider":"codex"},[])
+        self.group["members"]=[self.member]
+        self.profile_patch=patch.object(self.server,"install_profile")
+        self.profile_patch.start();self.addCleanup(self.profile_patch.stop)
+        self.provider_patch=patch.object(self.server,"providers_with_install",return_value=[])
+        self.provider_patch.start();self.addCleanup(self.provider_patch.stop)
+
+    def test_duplicate_session_race_joins_the_existing_session(self):
+        self.cao.side_effect=[self.server.CaoError(404,"session missing"),
+            self.server.CaoError(400,"Session 'shared-session' already exists"),
+            {"id":"joined","session_name":"shared-session","status":"idle"}]
+        self.server.start_member(self.group,self.member)
+        self.assertEqual(self.member["terminal_id"],"joined")
+        self.assertEqual(self.group["session_name"],"shared-session")
+        self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],
+            [("GET","/sessions/shared-session"),("POST","/sessions"),
+             ("POST","/sessions/shared-session/terminals:operator")])
+
+    def test_unrelated_bad_request_is_not_treated_as_an_existing_session(self):
+        self.cao.side_effect=[self.server.CaoError(404,"session missing"),
+                              self.server.CaoError(400,"invalid working directory")]
+        with self.assertRaises(self.server.CaoError) as failed:
+            self.server.start_member(self.group,self.member)
+        self.assertEqual(failed.exception.status,400)
+        self.assertIsNone(self.member["terminal_id"])
+        self.assertEqual(len(self.cao.call_args_list),2)
+
+    def test_session_disappearing_during_join_is_recreated(self):
+        self.group["session_name"]="shared-session"
+        self.cao.side_effect=[{"session_name":"shared-session"},self.server.CaoError(404,"session removed"),
+            self.server.CaoError(404,"session missing"),{"id":"rebuilt","session_name":"shared-session","status":"idle"}]
+        self.server.start_member(self.group,self.member)
+        self.assertEqual(self.member["terminal_id"],"rebuilt")
+        self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],
+            [("GET","/sessions/shared-session"),("POST","/sessions/shared-session/terminals:operator"),
+             ("GET","/sessions/shared-session"),("POST","/sessions")])
+
+    def test_legacy_join_keeps_the_live_caller(self):
+        self.group["session_name"]="shared-session"
+        self.group["members"].append(self.reviewer)
+        self.cao.side_effect=[{"session_name":"shared-session"},self.server.CaoError(405,"operator unavailable"),
+                              {"id":"legacy-joined","status":"idle"}]
+        self.server.start_member(self.group,self.member)
+        self.assertEqual(self.member["terminal_id"],"legacy-joined")
+        self.assertEqual(self.cao.call_args.args[1],"/sessions/shared-session/terminals")
+        self.assertEqual(self.cao.call_args.args[2]["caller_id"],"review-terminal")
+
+
 class CleanOutputTests(ServerTestCase):
     def test_removes_ansi_colors_cursor_and_erase_sequences(self):
         self.assertEqual(self.server.clean_output("\x1b[32m完成\x1b[0m\x1b[2K\x1b[?25h\r\n"), "完成")

@@ -16,10 +16,12 @@ class FakeCAO(ThreadingHTTPServer):
         self.lock = threading.RLock()
         self.profiles = {}
         self.terminals = {}
-        self.config = {"startup_hold": False, "hold_create": False}
-        self.creation_gate = threading.Event()
-        self.creation_gate.set()
+        self.sessions = {}
+        self.create_requests = []
+        self.config = {"startup_hold": False, "hold_create": False, "hold_sessions": [], "fail_profiles": []}
+        self.creation_gates = {}
         self.create_waiting = 0
+        self.create_waiting_sessions = {}
         self.buffer_limit = 32768
 
 
@@ -28,6 +30,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def respond(self, code, obj):
+        if getattr(self, "creation_event", None) is not None:
+            with self.server.lock:
+                self.creation_event["status"] = code
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -84,21 +89,34 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         creating = method == "POST" and (path == "/sessions" or
                    re.fullmatch(r"/sessions/[^/]+/terminals:operator", path))
-        if creating and self.server.config["hold_create"]:
+        self.creation_event = None
+        if creating:
+            session = query.get("session_name") if path == "/sessions" else path.split("/")[2]
             with self.server.lock:
-                self.server.create_waiting += 1
-            released = self.server.creation_gate.wait(timeout=10)
-            with self.server.lock:
-                self.server.create_waiting -= 1
-            if not released:
-                return self.respond(503, {"detail": "create gate timed out"})
+                self.creation_event = {"path": path, "session": session,
+                                       "profile": query.get("agent_profile"), "status": None}
+                self.server.create_requests.append(self.creation_event)
+                blocked = self.server.config["hold_create"] or session in self.server.config["hold_sessions"]
+                if blocked:
+                    gate = self.server.creation_gates.setdefault(session, threading.Event())
+                    gate.clear()
+                    self.server.create_waiting += 1
+                    self.server.create_waiting_sessions[session] = self.server.create_waiting_sessions.get(session, 0) + 1
+            if blocked:
+                released = gate.wait(timeout=10)
+                with self.server.lock:
+                    self.server.create_waiting -= 1
+                    self.server.create_waiting_sessions[session] -= 1
+                if not released:
+                    return self.respond(503, {"detail": "create gate timed out"})
         with self.server.lock:
             if path == "/_test/config" and method == "POST":
                 self.server.config.update(self.body())
-                if self.server.config["hold_create"]:
-                    self.server.creation_gate.clear()
-                else:
-                    self.server.creation_gate.set()
+                for session, gate in self.server.creation_gates.items():
+                    if self.server.config["hold_create"] or session in self.server.config["hold_sessions"]:
+                        gate.clear()
+                    else:
+                        gate.set()
                 return self.respond(200, {"ok": True})
             if path == "/health" and method == "GET":
                 return self.respond(200, {"status": "ok"})
@@ -115,6 +133,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.body()
                 if query.get("agent_profile") not in self.server.profiles:
                     return self.respond(400, {"detail": "profile missing"})
+                if path == "/sessions" and session in self.server.sessions:
+                    return self.respond(400, {"detail": f"Session '{session}' already exists"})
+                if path != "/sessions" and session not in self.server.sessions:
+                    return self.respond(404, {"detail": f"Session '{session}' not found"})
+                if query["agent_profile"] in self.server.config["fail_profiles"]:
+                    return self.respond(503, {"detail": "simulated terminal start failure"})
+                if path == "/sessions":
+                    self.server.sessions[session] = {"session_name": session}
                 tid = uuid.uuid4().hex[:8]
                 terminal = {
                     "id": tid, "session_name": query.get("session_name") or path.split("/")[2],
@@ -134,8 +160,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_test/state" and method == "GET":
                 return self.respond(200, {"terminals": self.server.terminals,
                                           "profiles": self.server.profiles,
+                                          "sessions": self.server.sessions,
+                                          "create_requests": self.server.create_requests,
                                           "create_waiting": self.server.create_waiting,
+                                          "create_waiting_sessions": self.server.create_waiting_sessions,
                                           "buffer_limit": self.server.buffer_limit})
+            if re.fullmatch(r"/sessions/[^/]+", path) and method == "GET":
+                session = self.server.sessions.get(path.split("/")[2])
+                return self.respond(200, session) if session else self.respond(404, {"detail": "session missing"})
             control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
@@ -248,6 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(200, {"output": output, "mode": mode})
             if path.startswith("/sessions/") and method == "DELETE":
                 session = path.split("/")[2]
+                self.server.sessions.pop(session, None)
                 self.server.terminals = {tid: t for tid, t in self.server.terminals.items()
                                          if t["session_name"] != session}
                 return self.respond(200, {"success": True})

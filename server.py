@@ -149,6 +149,7 @@ DONE = {"completed", "idle"}
 lock = threading.RLock()
 groups: dict[str, dict] = {}
 delivery_locks: dict[tuple[str, str], threading.RLock] = {}
+session_start_locks: dict[str, threading.RLock] = {}
 
 
 # ───────────────────────── 工具函数 ─────────────────────────
@@ -377,6 +378,53 @@ def install_profile(g: dict, m: dict) -> None:
 
 
 # ───────────────────────── 成员生命周期 ─────────────────────────
+def session_start_lock(g: dict):
+    # Never hold the global state lock across CAO I/O; different groups run apart.
+    with lock:
+        return session_start_locks.setdefault(g["id"], threading.RLock())
+
+
+def start_group_terminal(g: dict, m: dict, query: dict) -> dict:
+    """Called under the group's startup lock, through terminal-id publication."""
+    session = g.get("session_name") or g["session_slug"]
+    for attempt in range(2):
+        try:
+            cao("GET", f"/sessions/{session}")
+            exists = True
+        except CaoError as e:
+            if e.status != 404:
+                raise
+            exists = False
+        if not exists:
+            try:
+                terminal = cao("POST", "/sessions", {**query, "session_name": session},
+                               body={"description": f"{g['name']} / {m['name']}"}, timeout=180)
+            except CaoError as e:
+                # Another process may have created it after our existence probe.
+                if e.status != 400 or f"Session '{session}' already exists" not in str(e):
+                    raise
+            else:
+                g["session_name"] = terminal.get("session_name") or session
+                return terminal
+        g["session_name"] = session
+        path = f"/sessions/{session}/terminals"
+        live = [x for x in g["members"] if x is not m and x.get("terminal_id")]
+        try:
+            try:
+                return cao("POST", path + ":operator", query, body={"description": m["name"]}, timeout=180)
+            except CaoError as e:
+                if e.status not in (404, 405) or not live:
+                    raise
+                # Older CAO versions require a live caller instead of :operator.
+                return cao("POST", path, {**query, "caller_id": live[0]["terminal_id"]},
+                           body={"description": m["name"]}, timeout=180)
+        except CaoError as e:
+            if e.status != 404 or attempt:
+                raise
+            # The last old terminal may have been removed between probe and join.
+            # Recheck once; never loop on an unrelated or persistent API failure.
+
+
 def start_member(g: dict, m: dict) -> None:
     p = next((x for x in providers_with_install() if x["id"] == m["provider"]), None)
     if p and p.get("installed") is False:
@@ -390,30 +438,17 @@ def start_member(g: dict, m: dict) -> None:
         "allowed_tools": ",".join(member_tools(m)),
         "model": m.get("model") or None,
     }
-    live = [x for x in g["members"] if x.get("terminal_id") and x is not m]
-    if not g.get("session_name") or not live:
-        t = cao("POST", "/sessions", {**q, "session_name": g["session_slug"]},
-                body={"description": f"{g['name']} / {m['name']}"}, timeout=180)
-        g["session_name"] = t.get("session_name") or g["session_slug"]
-    else:
-        path = f"/sessions/{g['session_name']}/terminals"
-        try:
-            t = cao("POST", path + ":operator", q, body={"description": m["name"]}, timeout=180)
-        except CaoError as e:
-            if e.status not in (404, 405):
-                raise
-            # 老版本没有 :operator 路由，以群里第一个成员的身份创建
-            t = cao("POST", path, {**q, "caller_id": live[0]["terminal_id"]},
-                    body={"description": m["name"]}, timeout=180)
-    with delivery_lock(g, m):
-        m["terminal_id"] = t.get("id") or t.get("terminal_id")
-        m["status"] = t.get("status", "starting")
-        m["ready_terminal"] = None
-        m.pop("ready_candidate", None)
-        m["pending"] = False
-        if m.get("active_delivery"):
-            m["delivery_state"] = "failed"
-        save_state()
+    with session_start_lock(g):
+        t = start_group_terminal(g, m, q)
+        with delivery_lock(g, m):
+            m["terminal_id"] = t.get("id") or t.get("terminal_id")
+            m["status"] = t.get("status", "starting")
+            m["ready_terminal"] = None
+            m.pop("ready_candidate", None)
+            m["pending"] = False
+            if m.get("active_delivery"):
+                m["delivery_state"] = "failed"
+            save_state()
 
 
 def stop_member(m: dict) -> None:

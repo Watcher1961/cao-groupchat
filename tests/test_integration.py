@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from urllib import error, request
+from urllib import error, parse, request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,9 +83,9 @@ class IntegrationTests(unittest.TestCase):
         req = request.Request(base + path, data=data, method=method,
                               headers={"Content-Type": "application/json"})
         with self.opener.open(req, timeout=1) as response:
-            self.assertEqual(response.status, 201 if method == "POST" and
-                             path in ("/api/groups", getattr(self, "group_path", "") + "/members",
-                                      getattr(self, "group_path", "") + "/messages") else 200)
+            creates = path == "/api/groups" or (path.startswith("/api/groups/") and
+                      path.rsplit("/",1)[-1] in ("members","messages"))
+            self.assertEqual(response.status, 201 if method == "POST" and creates else 200)
             return json.load(response)
 
     def start_server(self):
@@ -137,6 +137,144 @@ class IntegrationTests(unittest.TestCase):
             replies = self.replies()
             return replies if len(replies) >= count else None
         return self.until(f"{count} agent replies", received)
+
+    def fake_state(self):
+        return self.http(self.cao_url,"GET","/_test/state")
+
+    def concurrent_posts(self, requests):
+        gate=threading.Barrier(len(requests))
+        def post(item):
+            gate.wait(timeout=3)
+            return self.http(self.server_url,"POST",item[0],item[1])
+        with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+            return list(pool.map(post,requests))
+
+    def startup_settled(self, path, count, timeout=15):
+        def settled():
+            group=self.http(self.server_url,"GET",path)
+            members=group["members"]
+            return group if len(members)==count and all(m.get("status")=="failed" or
+                (m.get("terminal_id") and m.get("ready_terminal")==m["terminal_id"]) for m in members) else None
+        return self.until("all startup workers settle",settled,timeout=timeout)
+
+    def offline_group(self, path):
+        group=self.http(self.server_url,"GET",path)
+        old={m["terminal_id"] for m in group["members"]}
+        for tid in old:
+            self.http(self.cao_url,"DELETE",f"/terminals/{tid}")
+        self.until("all members observed offline",lambda:all(not m["terminal_id"] for m in
+            self.http(self.server_url,"GET",path)["members"]))
+        return old
+
+    def test_fake_rejects_duplicate_session_creation_with_the_real_400(self):
+        self.create_group()
+        member=self.invite("开发","codex","developer")
+        terminal=self.terminal(member["terminal_id"])
+        query=parse.urlencode({
+            "session_name":terminal["session_name"],"agent_profile":terminal["profile"],"provider":"codex"})
+        with self.assertRaises(error.HTTPError) as duplicate:
+            self.http(self.cao_url,"POST","/sessions?"+query,{})
+        with duplicate.exception as response:
+            self.assertEqual(response.code,400)
+            self.assertEqual(json.load(response)["detail"],f"Session '{terminal['session_name']}' already exists")
+        state=self.fake_state()
+        self.assertEqual(len(state["sessions"]),1)
+        self.assertEqual(len(state["terminals"]),1)
+
+    def test_concurrent_new_members_create_one_session_and_all_join(self):
+        self.create_group()
+        self.http(self.cao_url,"POST","/_test/config",{"hold_create":True})
+        try:
+            self.concurrent_posts([(self.group_path+"/members",{"name":name,"provider":provider})
+                for name,provider in (("开发","codex"),("评审","claude_code"),("统筹","codex"))])
+            self.until("concurrent profiles installed",lambda:len(self.fake_state()["profiles"])==3)
+            self.until("session creation held",lambda:self.fake_state()["create_waiting"])
+        finally:
+            self.http(self.cao_url,"POST","/_test/config",{"hold_create":False})
+        group=self.startup_settled(self.group_path,3)
+        self.assertTrue(all(m["terminal_id"] for m in group["members"]),group["messages"])
+        state=self.fake_state()
+        self.assertEqual([r["status"] for r in state["create_requests"] if r["path"]=="/sessions"],[201])
+        self.assertEqual(len(state["sessions"]),1)
+        self.assertEqual({t["session_name"] for t in state["terminals"].values()},{group["session_name"]})
+
+    def test_concurrent_offline_restarts_reuse_or_rebuild_one_session(self):
+        self.create_group()
+        for name,provider in (("开发","codex"),("评审","claude_code"),("统筹","codex")):
+            self.invite(name,provider,"developer")
+        group=self.startup_settled(self.group_path,3)
+        for missing in (False,True):
+            old=self.offline_group(self.group_path)
+            if missing:
+                self.http(self.cao_url,"DELETE",f"/sessions/{group['session_name']}")
+            before=len([r for r in self.fake_state()["create_requests"] if r["path"]=="/sessions"])
+            self.http(self.cao_url,"POST","/_test/config",{"hold_create":True})
+            try:
+                self.concurrent_posts([(self.group_path+f"/members/{m['id']}/restart",{}) for m in group["members"]])
+                self.until("restart creation held",lambda:self.fake_state()["create_waiting"])
+            finally:
+                self.http(self.cao_url,"POST","/_test/config",{"hold_create":False})
+            group=self.startup_settled(self.group_path,3)
+            self.assertTrue(all(m["terminal_id"] and m["terminal_id"] not in old for m in group["members"]),group["messages"])
+            state=self.fake_state()
+            creates=[r for r in state["create_requests"] if r["path"]=="/sessions"]
+            self.assertEqual(len(creates)-before,int(missing))
+            self.assertTrue(all(r["status"]==201 for r in creates))
+            self.assertEqual(len(state["sessions"]),1)
+            self.assertEqual({t["session_name"] for t in state["terminals"].values()},{group["session_name"]})
+
+    def test_a_blocked_group_does_not_block_another_groups_startup(self):
+        first=self.create_group();first_path=self.group_path
+        second=self.create_group();second_path=self.group_path
+        self.http(self.cao_url,"POST","/_test/config",{"hold_sessions":[first["session_slug"]]})
+        release_client=threading.Event()
+        def start_first():
+            result=self.http(self.server_url,"POST",first_path+"/members",{"name":"甲","provider":"codex"})
+            release_client.wait(timeout=5)
+            return result
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_call=pool.submit(start_first)
+            try:
+                self.until("first group held before starting second",lambda:
+                    self.fake_state()["create_waiting_sessions"].get(first["session_slug"]))
+                second_call=pool.submit(self.http,self.server_url,"POST",second_path+"/members",
+                                       {"name":"乙","provider":"claude_code"})
+                second_call.result(timeout=3)
+                ready=self.startup_settled(second_path,1,timeout=3)
+                self.assertTrue(ready["members"][0]["terminal_id"])
+                self.assertGreater(self.fake_state()["create_waiting_sessions"][first["session_slug"]],0)
+                self.assertIsNone(self.http(self.server_url,"GET",first_path)["members"][0]["terminal_id"])
+            finally:
+                release_client.set()
+                self.http(self.cao_url,"POST","/_test/config",{"hold_sessions":[]})
+            first_call.result(timeout=3)
+        self.assertTrue(self.startup_settled(first_path,1)["members"][0]["terminal_id"])
+        self.assertEqual(set(self.fake_state()["sessions"]),{first["session_slug"],second["session_slug"]})
+
+    def test_a_failed_creator_releases_its_group_for_other_members_and_retry(self):
+        group=self.create_group()
+        self.http(self.cao_url,"POST","/_test/config",{"hold_sessions":[group["session_slug"]]})
+        bad=self.api("POST","/members",{"name":"失败成员","provider":"codex"})
+        held=self.until("first creator held",lambda:self.fake_state()["create_requests"])
+        failed_profile=held[0]["profile"]
+        try:
+            self.http(self.cao_url,"POST","/_test/config",{"fail_profiles":[failed_profile]})
+            self.concurrent_posts([(self.group_path+"/members",{"name":name,"provider":"claude_code"})
+                                   for name in ("成员甲","成员乙")])
+            self.until("all profiles installed before failure",lambda:len(self.fake_state()["profiles"])==3)
+        finally:
+            self.http(self.cao_url,"POST","/_test/config",{"hold_sessions":[]})
+        settled=self.startup_settled(self.group_path,3)
+        self.assertEqual(next(m for m in settled["members"] if m["id"]==bad["id"])["status"],"failed")
+        self.assertTrue(all(m["terminal_id"] for m in settled["members"] if m["id"]!=bad["id"]))
+        self.assertEqual(len(self.fake_state()["sessions"]),1)
+        self.http(self.cao_url,"POST","/_test/config",{"fail_profiles":[]})
+        self.api("POST",f"/members/{bad['id']}/restart",{})
+        self.until("failed creator can retry",lambda:all(m["terminal_id"] and m.get("ready_terminal")==m["terminal_id"]
+                   for m in self.api("GET")["members"]))
+        creates=[r for r in self.fake_state()["create_requests"] if r["path"]=="/sessions"]
+        self.assertEqual(sum(r["status"]==201 for r in creates),1)
+        self.assertEqual({t["session_name"] for t in self.fake_state()["terminals"].values()},{group["session_slug"]})
 
     def test_group_message_relay_and_restart_restore(self):
         group = self.create_group()
