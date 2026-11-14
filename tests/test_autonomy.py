@@ -188,6 +188,26 @@ class AutonomyTests(ServerTestCase):
                 self.finish(text=self.server.get_reply(self.developer))
                 self.assertEqual(self.developer["work_state"], expected)
 
+    def test_codex_real_bullet_and_two_space_continuation_states(self):
+        for state in ("进行中", "等对方", "等群主", "阻塞", "已交付"):
+            with self.subTest(state=state):
+                raw = "• 已完成两条回复指令，等待群主安排下一步。\n\n  状态：" + state
+                self.developer.update(provider="codex", reply_handled=False)
+                self.cao.side_effect = lambda *args, **kwargs: {"output": raw}
+                self.finish(text=self.server.get_reply(self.developer))
+                self.assertEqual(self.developer["work_state"], state)
+                self.assertEqual(self.server.reply_work_state("正文\n\n  状态：" + state), state)
+
+    def test_codex_rendered_fences_quotes_and_relative_code_indent_stay_excluded(self):
+        for raw in ("• 引用示例\n\n  > 状态：等群主", "• > 状态：阻塞",
+                    "• ```text\n  状态：等群主\n  ```", "• ```text\n  状态：阻塞",
+                    "\n• ```text\n  状态：等群主", "\n\n• ~~~\n  状态：已交付",
+                    "• ~~~\n  状态：已交付", "• 代码示例\n\n      状态：等群主"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.server.reply_work_state(raw), "进行中")
+        self.assertEqual(self.server.reply_work_state(
+            "• 示例\n    ```\n    状态：进行中\n    ```\n\n  状态：已交付"), "已交付")
+
     def test_owner_mention_without_state_blocks_reminders_until_new_owner_message(self):
         self.configure(idle_minutes=1)
         self.finish(text="@群主 需要你决定范围")

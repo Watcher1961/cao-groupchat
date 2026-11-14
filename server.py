@@ -1181,6 +1181,11 @@ def budget_notice(g: dict) -> None:
 
 def reply_work_state(text: str) -> str:
     lines = text.rstrip().splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), len(lines))
+    if first < len(lines) and lines[first].startswith("• "):
+        # Codex renders the response with a bullet and two-space continuations.
+        # Remove only that display margin; retain any relative Markdown indent.
+        lines = lines[:first] + [lines[first][2:]] + [line[2:] if line.startswith("  ") else line for line in lines[first + 1:]]
     fence = None
     for line in lines[:-1]:
         marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
@@ -1190,7 +1195,7 @@ def reply_work_state(text: str) -> str:
                 fence = run
             elif run[0] == fence[0] and len(run) >= len(fence) and not tail.strip():
                 fence = None
-    match = re.fullmatch(r"状态：(进行中|等对方|等群主|阻塞|已交付)", lines[-1]) if lines and not fence else None
+    match = re.fullmatch(r" {0,3}状态：(进行中|等对方|等群主|阻塞|已交付)", lines[-1]) if lines and not fence else None
     return match.group(1) if match else "进行中"
 
 

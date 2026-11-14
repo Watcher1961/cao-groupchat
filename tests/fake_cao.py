@@ -71,13 +71,20 @@ class Handler(BaseHTTPRequestHandler):
         raw = (terminal["full_out"] + content).encode()
         terminal["full_out"] = raw[-self.server.buffer_limit:].decode(errors="ignore")
 
+    @staticmethod
+    def rendered_reply(terminal, text):
+        if terminal["provider"] != "codex":
+            return text
+        lines = text.split("\n")
+        return "• " + lines[0] + "".join("\n" + ("  " + line if line else "") for line in lines[1:])
+
     def complete(self, terminal, turn):
         terminal["output_generation"] += 1
         terminal["status_generation"] = terminal["output_generation"]
         terminal["status"] = "completed"
-        terminal["out"] = turn["reply"]
+        terminal["out"] = self.rendered_reply(terminal, turn["reply"])
         if terminal["provider"] == "codex":
-            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + "x" * turn["padding_bytes"] + turn["reply"] +
+            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + "x" * turn["padding_bytes"] + terminal["out"] +
                            "\x1b]7501;state=done:app=codex\x1b\\\n" + self.prompt(terminal["provider"]))
         else:
             self.write_raw(terminal, turn["reply"] + "\n" + self.prompt(terminal["provider"]))
@@ -211,11 +218,11 @@ class Handler(BaseHTTPRequestHandler):
                         turn["phase"] += 1
                         terminal["output_generation"] += 1
                         if turn["phase"] == 1:
-                            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + turn["interim"])
+                            self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + self.rendered_reply(terminal, turn["interim"]))
                         else:
-                            self.write_raw(terminal, "x" * turn["padding_bytes"] + turn["reply"] +
+                            terminal["out"] = self.rendered_reply(terminal, turn["reply"])
+                            self.write_raw(terminal, "x" * turn["padding_bytes"] + terminal["out"] +
                                            "\x1b]7501;state=done:app=codex\x1b\\\n" + self.prompt(terminal["provider"]))
-                            terminal["out"] = turn["reply"]
                             terminal["pending"] = None
                 elif terminal["pending"]:
                     terminal["pending"]["held"] = False
@@ -285,8 +292,8 @@ class Handler(BaseHTTPRequestHandler):
                         terminal["status"] = "idle"
                         terminal["output_generation"] += 1
                         terminal["status_generation"] = terminal["output_generation"]
-                        terminal["out"] = turn["interim"]
-                        self.write_raw(terminal, options.get("raw_prefix", "") + turn["interim"])
+                        terminal["out"] = self.rendered_reply(terminal, turn["interim"])
+                        self.write_raw(terminal, options.get("raw_prefix", "") + terminal["out"])
                     elif not stale:
                         terminal["status"] = "processing"
                         # No raw bytes have arrived yet; a status value is not output.
