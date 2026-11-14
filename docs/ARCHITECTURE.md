@@ -11,9 +11,9 @@
 | 持久化与共享日志 | 群和消息写入数据目录的 `groups.json`；先写临时文件再替换；工作目录内追加 `GROUP_LOG.md` |
 | 用量解析 | 读取本机 Claude Code/Codex CLI JSONL，按成员标记认领，缓存解析并估算费用 |
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
-| `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 17 项自主运行隔离回归，含真实线程及注入时钟 |
+| `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 20 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501；不包含验收断言 |
-| `tests/test_integration.py` | 25 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 27 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 10 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -32,11 +32,13 @@
 
 `GET/PUT /api/groups/{id}/automation` 读取设置及运行摘要，PUT 为部分更新。缺省 `relay_limit=6`、`delivery_budget=null`、`idle_minutes=0`、`reminder_cooldown_minutes=5`、`reminder_limit=3`、`coordinator_id=null`；GET 不激活旧群配置。数值拒绝 bool、负数及非有限值，协调 ID 必须属于当前群；空对象无操作，相同配置 PUT 保持空闲观察期。未提供界面和浏览器 Mock API。
 
-明确配置后，`automation` 保存设置，`automation_state` 保存 deliveries_used、budget_notified、reminders_sent、last_reminder_at、idle_since。预算是累计上限，不是剩余额度；成员广播、静默通知、自动提醒、人工重发都经同一 input 路径。各成员 FIFO 仍可并发，跨成员不保证全局顺序。超额在原 outbox 中保留，delivery_state=budget_paused，不设置 pending；增额/null 后下一轮自动继续，启动等待时钟从预算暂停恢复处续开，不把暂停时间算成启动超时。
+明确配置后，`automation` 保存设置，`automation_state` 保存 deliveries_used、budget_notified、reminders_sent、last_reminder_at、idle_since、awaiting_owner。预算是累计上限，不是剩余额度；成员广播、静默通知、自动提醒、人工重发都经同一 input 路径。各成员 FIFO 仍可并发，跨成员不保证全局顺序。超额在原 outbox 中保留，delivery_state=budget_paused，不设置 pending；增额/null 后下一轮自动继续，启动等待时钟从预算暂停恢复处续开，不把暂停时间算成启动超时。
 
 发送持成员投递锁；原始输出基线等网络读取在全局锁外。input 前持全局锁检查剩余、预留一个名额，与 dispatching 一起持久化，再释放全局锁调用 CAO。多个成员不能同时抢最后一个名额。发送前失败及明确拒绝返还；可能已送达的异常保留计数，人工重试按新尝试计数；崩溃留下的预留保守保留，沿用 uncertain 恢复。预算到达上限或首次阻塞时仅一条系统提示，加额恢复可开启下一次耗尽提示。没有 CAO/本地文件联合事务，不承诺恰好一次。
 
-工作状态与 CLI 状态分开：每次非静默完成回复解析最后非空行的 `状态：进行中|等对方|等群主|阻塞|已交付`，每行只能取其中一个值且从行首开始；无合法标记回到进行中。先去 ANSI/真实结束行但保留缩进，再解析，避免单行缩进代码被显示层 strip 误认；围栏代码、引用、列表及正文提及不认，显示正文保持原清洗结果。静默入群确认不覆盖工作状态。
+工作状态与 CLI 状态分开：每次非静默完成回复解析最后非空行的 `状态：进行中|等对方|等群主|阻塞|已交付`，每行只能取其中一个值且从行首开始；无合法标记回到进行中。先去 ANSI/真实结束行并保留 CAO 返回文本中仍存在的缩进，再解析；围栏代码、引用符、列表及正文提及不认，显示正文保持原清洗结果。这个缩进保护不能还原上游丢失的信息：真实 CAO Claude 的 extract_last_message_from_script 对每行 strip，last 模式中原缩进代码的状态行仍可能被认成标记；full/其他模式只有保留了缩进时才可排除，围栏代码不受此限制。静默入群确认不覆盖工作状态。
+
+群级等待与成员 work_state 分开：配置过自主运行的群中，非静默回复提及 @群主（沿用提及的后缀边界）或因 relay_limit 截断成员转发，在保存该回复时同步置 awaiting_owner=true、idle_since=null；静默通知不触发，@群主助手不匹配。该标志阻止提醒把接力从 0 跳重新启动，其他成员回复/设置变更不清除，重启也保留。只有非空、有效的群主 post_message 清除，并与群主消息同次保存；随后仍须满足原成员工作状态和连续空闲条件。
 
 轮询所有成员后按群检查提醒：必须无 active_delivery/pending/outbox，CLI 不忙、不等待用户输入、状态已知且观察正常；任一成员等群主/阻塞/已交付则重置连续空闲观察。目标优先配置的在线就绪成员，否则首个可用成员，无可用者不提醒。先在全局锁选目标，释放后获取该成员锁，再在全局锁重验，原子登记提醒计数、系统消息及队列；释放全局锁后才尝试 input。固定标识 `[自动提醒 idle:<群ID>:<累计序号>]`，不冒充群主；间隔、正数冷却、总次数及预算同时约束，无额度不生成提醒。
 

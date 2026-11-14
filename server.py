@@ -876,16 +876,18 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
     reported_state = m.pop("_reply_work_state", None)
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
-    with lock:
-        m["work_state"] = reported_state if reported_state is not None else reply_work_state(text)
     if not text:
         text = "（无文字输出）"
-    add_msg(g, "agent", m["name"], text, mid=m["id"])
-    for line in re.findall(r"^[^\S\r\n]*\[日志\][^\S\r\n]*(\S[^\r\n]*)\r?$", text, flags=re.M):
-        append_log(g, m["name"], line)
     hops = m.get("hops", 0)
     targets = find_mentions(g, text, exclude=m["id"])
     relay_limit = automation_settings(g)["relay_limit"]
+    with lock:
+        m["work_state"] = reported_state if reported_state is not None else reply_work_state(text)
+        if "automation" in g and (re.search(r"@群主(?![\w一-鿿])", text) or (targets and hops >= relay_limit)):
+            automation_state(g).update(awaiting_owner=True, idle_since=None)
+    add_msg(g, "agent", m["name"], text, mid=m["id"])
+    for line in re.findall(r"^[^\S\r\n]*\[日志\][^\S\r\n]*(\S[^\r\n]*)\r?$", text, flags=re.M):
+        append_log(g, m["name"], line)
     if targets and hops < relay_limit:
         for t in targets:
             send_to(g, t, f"[来自 {m['name']}] {text}", hops + 1)
@@ -1081,7 +1083,10 @@ def post_message(g: dict, text: str) -> dict:
     targets = find_mentions(g, text)
     if re.search(r"@(所有人|all)\b", text, flags=re.I) or not targets:
         targets = list(g["members"])
-    msg = add_msg(g, "owner", "群主", text, to=[t["name"] for t in targets])
+    with lock:
+        if "automation_state" in g:
+            g["automation_state"].update(awaiting_owner=False, idle_since=None)
+        msg = add_msg(g, "owner", "群主", text, to=[t["name"] for t in targets])
     for t in targets:
         run_bg(send_to, g, t, f"[群主] {text}", 0)
     return msg
@@ -1115,7 +1120,8 @@ def automation_settings(g: dict) -> dict:
 
 def automation_state(g: dict) -> dict:
     return g.setdefault("automation_state", {"deliveries_used": 0, "budget_notified": False,
-                                           "reminders_sent": 0, "last_reminder_at": None, "idle_since": None})
+                                           "reminders_sent": 0, "last_reminder_at": None, "idle_since": None,
+                                           "awaiting_owner": False})
 
 
 def budget_available(g: dict) -> bool:
@@ -1126,7 +1132,7 @@ def budget_available(g: dict) -> bool:
 def automation_view(g: dict) -> dict:
     with lock:
         state = {"deliveries_used": 0, "reminders_sent": 0, "last_reminder_at": None,
-                 "idle_since": None, **g.get("automation_state", {})}
+                 "idle_since": None, "awaiting_owner": False, **g.get("automation_state", {})}
         state.pop("budget_notified", None)
         state["budget_exhausted"] = not budget_available(g)
         return {"settings": automation_settings(g), "runtime": state}
@@ -1189,6 +1195,8 @@ def reply_work_state(text: str) -> str:
 
 
 def idle_coordinator(g: dict, settings: dict) -> dict | None:
+    if g.get("automation_state", {}).get("awaiting_owner"):
+        return None
     members = g["members"]
     for m in members:
         if (m.get("pending") or m.get("active_delivery") or m.get("outbox")

@@ -711,6 +711,47 @@ class IntegrationTests(unittest.TestCase):
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
         self.assertEqual([m["text"] for m in self.wait_replies(1)], [final])
 
+    def check_automation_waits_for_owner(self, relay_limit):
+        self.create_group()
+        member = self.invite("执行", "claude_code", "developer")
+        peer = self.invite("复核", "claude_code", "reviewer")
+        self.until("silent notices completed before owner-wait case", lambda:
+                   all(not m.get("pending") and not m.get("queued_count") for m in self.api("GET")["members"]))
+        peer_inputs = len(self.terminal(peer["terminal_id"])["inputs"])
+        reply = "@复核 请审查" if relay_limit == 0 else "@群主 需要你决定范围"
+        self.next_turn(member["terminal_id"], reply)
+        self.api("PUT", "/automation", {"idle_minutes": 1, "reminder_cooldown_minutes": 0.002,
+                                        "reminder_limit": 1, "relay_limit": relay_limit})
+        self.api("POST", "/messages", {"text": "@执行 本轮任务"})
+        self.wait_replies(1)
+        self.assertTrue(self.api("GET", "/automation")["runtime"].get("awaiting_owner", False))
+        self.api("PUT", "/automation", {"idle_minutes": 0.002})
+        self.assertEqual(len(self.terminal(peer["terminal_id"])["inputs"]), peer_inputs)
+        self.stopped_server = self.server
+        self.stop_process(self.stopped_server)
+        self.start_server()
+        reads = self.terminal(member["terminal_id"])["status_reads"]
+        self.until("owner-wait survives restart and many idle observations", lambda:
+                   self.terminal(member["terminal_id"])["status_reads"] >= reads + 20)
+        runtime = self.api("GET", "/automation")["runtime"]
+        self.assertTrue(runtime["awaiting_owner"])
+        self.assertEqual((runtime["reminders_sent"], runtime["deliveries_used"]), (0, 1))
+        self.api("PUT", "/automation", {"relay_limit": 10, "idle_minutes": 1})
+        self.assertTrue(self.api("GET", "/automation")["runtime"]["awaiting_owner"])
+        self.next_turn(member["terminal_id"], "继续推进\n状态：进行中")
+        self.api("POST", "/messages", {"text": "@执行 群主决定继续"})
+        self.wait_replies(2)
+        self.assertFalse(self.api("GET", "/automation")["runtime"]["awaiting_owner"])
+        self.api("PUT", "/automation", {"idle_minutes": 0.002})
+        self.wait_replies(3)
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["reminders_sent"], 1)
+
+    def test_automation_owner_mention_pauses_reminders_until_owner_resumes(self):
+        self.check_automation_waits_for_owner(relay_limit=6)
+
+    def test_automation_relay_limit_pauses_reminders_until_owner_resumes(self):
+        self.check_automation_waits_for_owner(relay_limit=0)
+
     def test_automation_budget_queue_restore_and_increase_preserve_fifo(self):
         self.create_group()
         member = self.invite("预算成员", "claude_code", "developer")

@@ -177,15 +177,61 @@ class AutonomyTests(ServerTestCase):
         self.finish(text="下一轮没有标记")
         self.assertEqual(self.developer["work_state"], "进行中")
 
-    def test_raw_reply_indentation_is_not_lost_before_state_parsing(self):
+    def test_received_indentation_and_already_stripped_last_mode_limit(self):
         for raw, expected in (("    状态：等群主", "进行中"), ("> 状态：阻塞", "进行中"),
                               ("```\n状态：已交付", "进行中"),
+                              ("状态：等群主", "等群主"),  # CAO last may already have stripped indentation.
                               ("正文\n状态：阻塞\n✻ Worked for 1s · done 01:01 AM", "阻塞")):
             with self.subTest(raw=raw):
                 self.developer["reply_handled"] = False
                 self.cao.side_effect = lambda *args, **kwargs: {"output": raw}
                 self.finish(text=self.server.get_reply(self.developer))
                 self.assertEqual(self.developer["work_state"], expected)
+
+    def test_owner_mention_without_state_blocks_reminders_until_new_owner_message(self):
+        self.configure(idle_minutes=1)
+        self.finish(text="@群主 需要你决定范围")
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=1000))
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=1060))
+        self.assertEqual(self.inputs, [])
+        self.assertTrue(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
+        self.finish(self.reviewer, text="仍在等决定\n状态：进行中")
+        self.configure(delivery_budget=10)
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=2000))
+        with self.assertRaises(ValueError):
+            self.server.post_message(self.group, "   ")
+        self.assertTrue(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
+        with patch.object(self.server, "run_bg"):
+            self.server.post_message(self.group, "继续当前范围")
+        self.assertFalse(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=2001))
+        self.assertTrue(self.server.check_idle_reminder(self.group, now=2061))
+
+    def test_relay_limit_wait_survives_restart_and_increase_until_owner_resumes(self):
+        self.configure(relay_limit=0, idle_minutes=1)
+        self.finish(text="@评审 请审查")
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=1000))
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=1060))
+        self.assertEqual(self.inputs, [])
+        self.server.save_state()
+        self.server.groups.clear()
+        self.server.load_state()
+        self.group = self.server.groups[self.group["id"]]
+        self.assertTrue(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
+        self.configure(relay_limit=10)
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=2000))
+        with patch.object(self.server, "run_bg"):
+            self.server.post_message(self.group, "开始新一轮审查")
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=2001))
+        self.assertTrue(self.server.check_idle_reminder(self.group, now=2061))
+
+    def test_silent_owner_mention_and_longer_name_do_not_block_idle_reminders(self):
+        self.configure(idle_minutes=1)
+        self.developer["silent"] = True
+        self.finish(text="@群主 静默通知确认")
+        self.finish(self.reviewer, text="@群主助手 不是群主")
+        self.assertFalse(self.server.check_idle_reminder(self.group, now=1000))
+        self.assertTrue(self.server.check_idle_reminder(self.group, now=1060))
 
     def test_reminder_interval_cooldown_limit_and_coordinator(self):
         self.configure(idle_minutes=1, reminder_cooldown_minutes=3, reminder_limit=2, coordinator_id="review")
