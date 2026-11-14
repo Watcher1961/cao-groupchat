@@ -557,7 +557,8 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 /* 抽屉与弹窗：CSS/JS 使用相同的严格断点。DOM 替身不验证实际排版。 */
 let modalOrigin=null;
-function drawerAvailable(kind){ return window.matchMedia(`(width < ${kind==="groups"?760:1100}px)`).matches; }
+const drawerMedia={groups:window.matchMedia("(width < 760px)"),members:window.matchMedia("(width < 1100px)")};
+function drawerAvailable(kind){ return drawerMedia[kind].matches; }
 function drawerPanel(kind){ return $(kind==="groups"?"#groupsPanel":"#membersPanel"); }
 function activeSurface(){
   const picker=document.querySelector(".fsmask.on");
@@ -589,7 +590,9 @@ function setDrawer(kind){
   if(!drawerAvailable(kind))return;
   S.drawer=kind;syncDrawers();$(kind==="groups"?"#groupsClose":"#membersClose").focus();
 }
-window.addEventListener("resize",()=>{if(S.drawer&&!drawerAvailable(S.drawer))closeDrawer();else syncDrawers();});
+function syncDrawerLayout(){if(S.drawer&&!drawerAvailable(S.drawer))closeDrawer();else syncDrawers();}
+for(const media of Object.values(drawerMedia))media.addEventListener("change",syncDrawerLayout);
+window.addEventListener("resize",syncDrawerLayout);
 document.addEventListener("keydown",e=>{
   if(e.defaultPrevented)return;
   const surface=activeSurface();if(!surface)return;

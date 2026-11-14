@@ -49,7 +49,15 @@ module.exports = function loadUI(path) {
     querySelectorAll(selector){return selector===".seg button"?[get("#membersTab"),get("#logTab")]:[];},createElement:element});
   document.activeElement=document.body;
   const window=events({innerWidth:1440,viewportWidth:1440,confirm(){return true;}});
-  window.matchMedia=query=>({matches:window.viewportWidth<Number(query.match(/width\s*<\s*(\d+)/)[1])});
+  const mediaQueries=new Map();
+  window.matchMedia=query=>{
+    if(!mediaQueries.has(query)){
+      const media=events({media:query});
+      Object.defineProperty(media,"matches",{get:()=>window.viewportWidth<Number(query.match(/width\s*<\s*(\d+)/)[1])});
+      mediaQueries.set(query,media);
+    }
+    return mediaQueries.get(query);
+  };
   const context=vm.createContext({document,window,confirm:window.confirm,alert(text){alerts.push(text);},
     localStorage:{getItem:key=>storage.get(key)||"",setItem:(key,value)=>storage.set(key,value)},
     URLSearchParams,setTimeout(fn){fn();return 1;}});

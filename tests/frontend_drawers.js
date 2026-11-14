@@ -34,6 +34,38 @@ const cases={
       assert.equal(get("#mainContent").inert,false);
     }
   },
+  drawer_media_change(){
+    width(375);
+    let resizes=0;context.window.addEventListener("resize",()=>resizes++);
+    function mediaWidth(value,query){
+      context.window.innerWidth=value;context.window.viewportWidth=value;
+      const media=context.window.matchMedia(query);
+      media.dispatchEvent({type:"change",media:query,matches:media.matches});
+    }
+    get("#membersToggle").click();
+    mediaWidth(800,"(width < 760px)");
+    assert.equal(run("S.drawer"),"members");
+    assert.equal(get("#groupsToggle").hidden,true);
+    assert.equal(get("#groupsPanel").inert,true);
+    mediaWidth(1100,"(width < 1100px)");
+    assert.equal(run("S.drawer"),null);
+    for(const id of ["#mainContent","#groupsPanel","#membersPanel"])assert.equal(get(id).inert,false);
+    assert.equal(get("#drawerBackdrop").hidden,true);
+    assert.equal(get("#membersToggle").getAttribute("aria-expanded"),"false");
+    assert.equal(get("#membersPanel").getAttribute("role"),null);
+    assert.equal(context.document.activeElement,get("#membersPanel"));
+    mediaWidth(375,"(width < 1100px)");mediaWidth(375,"(width < 760px)");
+    get("#groupsToggle").click();
+    mediaWidth(760,"(width < 760px)");
+    assert.equal(run("S.drawer"),null);
+    assert.equal(get("#drawerBackdrop").hidden,true);
+    assert.equal(get("#mainContent").inert,false);assert.equal(get("#groupsPanel").inert,false);
+    assert.equal(get("#membersPanel").inert,true); // Only the collapsed drawer stays inert.
+    assert.equal(get("#groupsToggle").getAttribute("aria-expanded"),"false");
+    assert.equal(get("#groupsPanel").getAttribute("role"),null);
+    assert.equal(context.document.activeElement,get("#groupsPanel"));
+    assert.equal(resizes,0);
+  },
   async drawer_keyboard(){
     width(375);get("#membersToggle").click();assert.equal(run("S.drawer"),"members");
     const panel=get("#membersPanel"),first=element("button"),last=element("button"),hidden=element("button"),disabled=element("button");

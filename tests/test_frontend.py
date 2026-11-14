@@ -38,6 +38,9 @@ class FrontendEffortTests(unittest.TestCase):
     def test_drawer_keyboard_modal_priority_and_resizing(self):
         self.check_ui("drawer_keyboard","frontend_drawers.js")
 
+    def test_media_query_changes_sync_drawers_without_window_resize(self):
+        self.check_ui("drawer_media_change","frontend_drawers.js")
+
     def test_group_selection_closes_only_the_current_left_drawer(self):
         self.check_ui("drawer_group_select","frontend_drawers.js")
 
