@@ -387,14 +387,20 @@ def session_start_lock(g: dict):
 def start_group_terminal(g: dict, m: dict, query: dict) -> dict:
     """Called under the group's startup lock, through terminal-id publication."""
     session = g.get("session_name") or g["session_slug"]
+    force_create = False
     for attempt in range(2):
-        try:
-            cao("GET", f"/sessions/{session}")
-            exists = True
-        except CaoError as e:
-            if e.status != 404:
-                raise
-            exists = False
+        exists = False
+        if not force_create:
+            try:
+                response = cao("GET", f"/sessions/{session}")
+                # CAO preserves deferred-init failure records after tmux exits.
+                # Its real response wraps metadata in "session"; accept flat
+                # metadata too for older adapters.
+                info = response.get("session") or response
+                exists = str(info.get("status", "")).lower() != "terminated"
+            except CaoError as e:
+                if e.status != 404:
+                    raise
         if not exists:
             try:
                 terminal = cao("POST", "/sessions", {**query, "session_name": session},
@@ -413,6 +419,8 @@ def start_group_terminal(g: dict, m: dict, query: dict) -> dict:
             try:
                 return cao("POST", path + ":operator", query, body={"description": m["name"]}, timeout=180)
             except CaoError as e:
+                if e.status == 404 and not attempt:
+                    raise  # Rebuild first, even if local terminal IDs are stale.
                 if e.status not in (404, 405) or not live:
                     raise
                 # Older CAO versions require a live caller instead of :operator.
@@ -421,8 +429,9 @@ def start_group_terminal(g: dict, m: dict, query: dict) -> dict:
         except CaoError as e:
             if e.status != 404 or attempt:
                 raise
-            # The last old terminal may have been removed between probe and join.
-            # Recheck once; never loop on an unrelated or persistent API failure.
+            # A successful GET may keep returning a terminated registry shell.
+            # After join 404, try creation directly once instead of querying again.
+            force_create = True
 
 
 def start_member(g: dict, m: dict) -> None:

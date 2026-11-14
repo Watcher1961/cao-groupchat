@@ -133,14 +133,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.body()
                 if query.get("agent_profile") not in self.server.profiles:
                     return self.respond(400, {"detail": "profile missing"})
-                if path == "/sessions" and session in self.server.sessions:
+                if (path == "/sessions" and session in self.server.sessions
+                        and self.server.sessions[session]["status"] != "terminated"):
                     return self.respond(400, {"detail": f"Session '{session}' already exists"})
-                if path != "/sessions" and session not in self.server.sessions:
+                if (path != "/sessions" and (session not in self.server.sessions
+                        or self.server.sessions[session]["status"] == "terminated")):
                     return self.respond(404, {"detail": f"Session '{session}' not found"})
                 if query["agent_profile"] in self.server.config["fail_profiles"]:
                     return self.respond(503, {"detail": "simulated terminal start failure"})
                 if path == "/sessions":
-                    self.server.sessions[session] = {"session_name": session}
+                    self.server.sessions[session] = {"id": session, "name": session, "status": "running"}
                 tid = uuid.uuid4().hex[:8]
                 terminal = {
                     "id": tid, "session_name": query.get("session_name") or path.split("/")[2],
@@ -165,9 +167,27 @@ class Handler(BaseHTTPRequestHandler):
                                           "create_waiting": self.server.create_waiting,
                                           "create_waiting_sessions": self.server.create_waiting_sessions,
                                           "buffer_limit": self.server.buffer_limit})
+            session_control = re.fullmatch(r"/_test/sessions/([^/]+)/terminate", path)
+            if session_control and method == "POST":
+                session = self.server.sessions.get(session_control[1])
+                if session is None:
+                    return self.respond(404, {"detail": "session missing"})
+                session["status"] = "terminated"
+                for terminal in self.server.terminals.values():
+                    if terminal["session_name"] == session_control[1]:
+                        terminal["status"] = "error"
+                        terminal["deferred_init_failure"] = {"error_type": "simulated_provider_start_failure"}
+                return self.respond(200, {"ok": True})
             if re.fullmatch(r"/sessions/[^/]+", path) and method == "GET":
-                session = self.server.sessions.get(path.split("/")[2])
-                return self.respond(200, session) if session else self.respond(404, {"detail": "session missing"})
+                name = path.split("/")[2]
+                session = self.server.sessions.get(name)
+                terminals = [{**self.public(t), **({"deferred_init_failure": t["deferred_init_failure"]}
+                              if t.get("deferred_init_failure") else {})}
+                             for t in self.server.terminals.values() if t["session_name"] == name]
+                if not session or (session["status"] == "terminated" and
+                                   not any(t.get("deferred_init_failure") for t in terminals)):
+                    return self.respond(404, {"detail": "session missing"})
+                return self.respond(200, {"session": session, "terminals": terminals})
             control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])

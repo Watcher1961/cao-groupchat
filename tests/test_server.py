@@ -890,18 +890,64 @@ class SessionStartupTests(ServerTestCase):
 
     def test_session_disappearing_during_join_is_recreated(self):
         self.group["session_name"]="shared-session"
-        self.cao.side_effect=[{"session_name":"shared-session"},self.server.CaoError(404,"session removed"),
-            self.server.CaoError(404,"session missing"),{"id":"rebuilt","session_name":"shared-session","status":"idle"}]
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+            self.server.CaoError(404,"session removed"),{"id":"rebuilt","session_name":"shared-session","status":"idle"}]
         self.server.start_member(self.group,self.member)
         self.assertEqual(self.member["terminal_id"],"rebuilt")
         self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],
             [("GET","/sessions/shared-session"),("POST","/sessions/shared-session/terminals:operator"),
-             ("GET","/sessions/shared-session"),("POST","/sessions")])
+             ("POST","/sessions")])
+
+    def test_terminated_session_record_is_recreated_instead_of_joined(self):
+        failure={"id":"failed-terminal","status":"error","deferred_init_failure":{"error_type":"provider_start_failure"}}
+        for payload in ({"session":{"id":"shared-session","status":"terminated"},"terminals":[failure]},
+                        {"status":"terminated","terminals":[failure]}):
+            with self.subTest(payload=payload):
+                self.member["terminal_id"]=None
+                self.cao.reset_mock()
+                self.cao.side_effect=[payload,{"id":"rebuilt","session_name":"shared-session","status":"idle"}]
+                self.server.start_member(self.group,self.member)
+                self.assertEqual(self.member["terminal_id"],"rebuilt")
+                self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],
+                    [("GET","/sessions/shared-session"),("POST","/sessions")])
+
+    def test_404_rebuild_attempt_is_bounded_when_join_still_fails(self):
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+            self.server.CaoError(404,"missing backend"),
+            self.server.CaoError(400,"Session 'shared-session' already exists"),
+            self.server.CaoError(404,"operator still unavailable")]
+        with self.assertRaises(self.server.CaoError) as failure:
+            self.server.start_member(self.group,self.member)
+        self.assertEqual(failure.exception.status,404)
+        self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],
+            [("GET","/sessions/shared-session"),("POST","/sessions/shared-session/terminals:operator"),
+             ("POST","/sessions"),("POST","/sessions/shared-session/terminals:operator")])
+
+    def test_operator_404_prioritizes_rebuild_even_with_a_stale_live_caller(self):
+        self.group["members"].append(self.reviewer)
+        for old_operator in (False,True):
+            with self.subTest(old_operator=old_operator):
+                self.member["terminal_id"]=None
+                self.cao.reset_mock()
+                tail=([self.server.CaoError(400,"Session 'shared-session' already exists"),
+                       self.server.CaoError(404,"old operator route"),{"id":"recovered","status":"idle"}]
+                      if old_operator else [{"id":"recovered","status":"idle"}])
+                self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},
+                                     self.server.CaoError(404,"missing backend or route"),*tail]
+                self.server.start_member(self.group,self.member)
+                self.assertEqual(self.member["terminal_id"],"recovered")
+                expected=[("GET","/sessions/shared-session"),("POST","/sessions/shared-session/terminals:operator"),
+                          ("POST","/sessions")]
+                if old_operator:
+                    expected += [("POST","/sessions/shared-session/terminals:operator"),
+                                 ("POST","/sessions/shared-session/terminals")]
+                    self.assertEqual(self.cao.call_args.args[2]["caller_id"],"review-terminal")
+                self.assertEqual([(c.args[0],c.args[1]) for c in self.cao.call_args_list],expected)
 
     def test_legacy_join_keeps_the_live_caller(self):
         self.group["session_name"]="shared-session"
         self.group["members"].append(self.reviewer)
-        self.cao.side_effect=[{"session_name":"shared-session"},self.server.CaoError(405,"operator unavailable"),
+        self.cao.side_effect=[{"session":{"id":"shared-session","status":"running"}},self.server.CaoError(405,"operator unavailable"),
                               {"id":"legacy-joined","status":"idle"}]
         self.server.start_member(self.group,self.member)
         self.assertEqual(self.member["terminal_id"],"legacy-joined")

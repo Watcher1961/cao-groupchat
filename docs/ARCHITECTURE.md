@@ -29,7 +29,7 @@
 
 1. 浏览器经 `/api/groups` 创建群，提交工作目录与成员配置；后端保存群并异步启动成员。
 2. 每位成员生成独立 agent profile；非空 effort 对 Codex 写入 `codexConfig.model_reasoning_effort`，对 Claude Code 写入 `claudeConfig.effort`，由 CAO 转为对应 CLI 配置；缺字段或空值不写配置。一个群对应一个 CAO session，一位成员对应一个 terminal。权限与职责写入 profile，实际执行由 provider 决定。
-3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时覆盖所有成员。每位成员有持久化 outbox 和 active_delivery，以及进程内的投递锁；未取得 terminal 或未证明初次就绪前不 POST input，按成员队列顺序处理。自动就绪须 idle/completed、provider 正向提示特征及两次至少间隔 READY_SECONDS 的稳定观察（Claude 输入框可为空或带 Try 占位文字，先清除 ANSI）；terminal 更换或手动重试重新检查。另有按群的启动锁，覆盖会话查询/创建/加入直到发布 terminal_id；profile 安装在锁外，不同群不互相等待。会话存在就加入，即使全体离线；确认为 404 才创建。精确同名重复 400 转加入，加入时会话丢失最多重查一次，异常释放群锁。
+3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时覆盖所有成员。每位成员有持久化 outbox 和 active_delivery，以及进程内的投递锁；未取得 terminal 或未证明初次就绪前不 POST input，按成员队列顺序处理。自动就绪须 idle/completed、provider 正向提示特征及两次至少间隔 READY_SECONDS 的稳定观察（Claude 输入框可为空或带 Try 占位文字，先清除 ANSI）；terminal 更换或手动重试重新检查。另有按群的启动锁，覆盖会话查询/创建/加入直到发布 terminal_id；profile 安装在锁外，不同群不互相等待。读取原生 session.status：会话存活就加入，即使全体离线；404 或 terminated 才创建。GET 200 可仅为失败记录，并不证明后端存活。精确同名重复 400 转加入，加入 404 后最多直接创建一次，异常释放群锁。
 4. 其他 provider 将 input 响应的 `dispatch_boundary` 记为边界，轮询按 `status_generation` 判断；字段缺失时仍降级为 busy 或发送后等待时间。Codex 原生 OSC 标记为 state=working/done:app=codex，以 ST 结束；解析兼容 BEL 和无 app 旧格式，未知/拆分末状态保留。状态与 full 起点共用同一解析规则。Codex 发送前读取 raw full 标记基线，排除旧轮 done；只有本轮最后一个 OSC 7501 为 done 才读取最终回复，无标记、working 或探测失败继续等待，不回退相信 idle。发送前只存长度/哈希和标记元数据；前缀改变或缩短时将有效边界归零，同一轮首次读取的 working+done 可完成。相同字节的短回复结合新 output_generation 确认新输出；若 raw 已重置、发送时非 working 且 output_generation > dispatch_boundary，首次轮询只剩 done 也能完成（working 可能已被 32KB 重绘挤出）；发送时旧轮 working 的保护仍要求本轮 working 证据，并保持发送时原状态不变。显式追加兼容仍以原前缀及标记数区分旧轮，full 降级使用当前轮起点；原等待确认/错误路径保留。
 5. 读取并清洗回复：去除 ANSI/OSC 控制序列，末尾整行匹配 Claude `✻ <单个字母词> for <时长> · done <时:分> AM/PM` 或 Codex `Worked for <时长> • <时:分>` 格式时去除；Claude 动词支持带重音字母，不写死具体词；引用、代码和非尾部示例保留。同轮回复只处理一次，成功发送下一轮时重置标记；静默通知回复直接丢弃。收下回复时即标 delivery_started=True，即使首次轮询前已完成、未见中间 busy/working 状态。普通回复写入群消息，行首非空 `[日志]` 仅在同一行代写；成员提及按最长已知名字解析，最多接力 6 跳。
 6. 启动等待超时保留队列并暂停投递；从 not_ready 人工重试时，在用户确认 CLI 可输入后允许仅凭稳定 idle/completed 状态投递，仍需两次观察、最小时长，busy 等状态重置候选。其他自动投递及未开启此兜底的 uncertain/failed 重试仍走原特征检查。已投递后记录本轮工作证据（Codex working；其他 provider 的 fresh busy/等待确认），只有实际新输出刷新无进展时钟，重复状态不续期；超时标 uncertain、系统提示“可能未送达”，仍轮询迟到完成，不自动重发。input 网络响应丢失也属 uncertain：Codex 保留发送前基线，其他 provider 未获 dispatch 确认须先有工作证据，不复用旧完成。重试校验投递 ID/次数，同一成员锁内只接受一次，保留原文、静默属性和接力跳数，不重写群主消息。
@@ -60,7 +60,7 @@
 | --- | --- |
 | 连通性与 provider | `GET /health`、`GET /agents/providers` |
 | 安装 profile | `POST /agents/profiles`，body 为 `{name, content}`；409 时 `PUT /agents/profiles/{name}`，body 仅 `{content}`；失败退回 `cao install <file> --provider <provider>` |
-| 会话探测 | `GET /sessions/{name}`；存在则直接加入，404 才创建；精确重复 400 表示外部创建竞态，转为加入 |
+| 会话探测 | `GET /sessions/{name}`；读取嵌套 session.status；存活则加入，404/terminated 才创建；精确重复 400 表示外部创建竞态，转为加入 |
 | 创建会话及首位成员 | `POST /sessions`；query 含 profile、provider、工作目录、工具、模型和 session_name；body 含 description |
 | 后续成员 | `POST /sessions/{s}/terminals:operator`；404/405 时退回 `/sessions/{s}/terminals` 并带首个存活成员的 caller_id |
 | 发消息 | `POST /terminals/{id}/input?message=...`，读取 dispatch_boundary |

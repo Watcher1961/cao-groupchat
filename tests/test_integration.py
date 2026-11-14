@@ -223,6 +223,43 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(len(state["sessions"]),1)
             self.assertEqual({t["session_name"] for t in state["terminals"].values()},{group["session_name"]})
 
+    def test_terminated_session_with_failure_records_is_recreated_on_restart(self):
+        group=self.create_group()
+        members=[self.invite(name,provider,"developer") for name,provider in
+                 (("开发","codex"),("评审","claude_code"),("统筹","codex"))]
+        self.until("silent notices consumed before provider failure",lambda:
+                   all(not m.get("pending") and not m.get("queued_count") for m in self.api("GET")["members"]))
+        session=group["session_slug"]
+        old={m["terminal_id"] for m in members}
+        self.http(self.cao_url,"POST",f"/_test/sessions/{session}/terminate",{})
+        record=self.http(self.cao_url,"GET",f"/sessions/{session}")
+        self.assertEqual(record["session"]["status"],"terminated")
+        self.assertEqual(len(record["terminals"]),3)
+        self.assertTrue(all(t["status"]=="error" and t["deferred_init_failure"] for t in record["terminals"]))
+        query=parse.urlencode({"agent_profile":self.terminal(members[0]["terminal_id"])["profile"],"provider":"codex"})
+        with self.assertRaises(error.HTTPError) as cannot_join:
+            self.http(self.cao_url,"POST",f"/sessions/{session}/terminals:operator?"+query,{})
+        self.assertEqual(cannot_join.exception.code,404)
+        cannot_join.exception.close()
+        self.until("GUI observes failed provider records",lambda:
+                   all(m["status"]=="error" for m in self.api("GET")["members"]))
+        before=sum(r["path"]=="/sessions" and r["status"]==201 for r in self.fake_state()["create_requests"])
+        # Keep one failure record so GET must remain 200/terminated while the
+        # other two members concurrently stop their old records and restart.
+        self.concurrent_posts([(self.group_path+f"/members/{m['id']}/restart",{}) for m in members[:2]])
+        recovered=self.startup_settled(self.group_path,3)
+        self.assertTrue(all(m["terminal_id"] and m["terminal_id"] not in old
+                            for m in recovered["members"][:2]),recovered["messages"])
+        self.assertEqual(self.http(self.cao_url,"GET",f"/sessions/{session}")["session"]["status"],"running")
+        self.api("POST",f"/members/{members[2]['id']}/restart",{})
+        self.until("all failed members join new backend",lambda:
+                   all(m["terminal_id"] and m["terminal_id"] not in old and m.get("ready_terminal")==m["terminal_id"]
+                       for m in self.api("GET")["members"]))
+        state=self.fake_state()
+        self.assertEqual(sum(r["path"]=="/sessions" and r["status"]==201 for r in state["create_requests"])-before,1)
+        self.assertEqual(len(state["sessions"]),1)
+        self.assertEqual({t["session_name"] for t in state["terminals"].values()},{session})
+
     def test_a_blocked_group_does_not_block_another_groups_startup(self):
         first=self.create_group();first_path=self.group_path
         second=self.create_group();second_path=self.group_path
