@@ -183,6 +183,9 @@ def load_state() -> None:
                         # The process may have died after CAO accepted the input.
                         # Keep polling and permit manual recovery; never auto-resend.
                         member.update(delivery_state="uncertain", pending=True, delivery_warned=False)
+                if "automation_state" in group:
+                    # Downtime is not an observation of continuous group idleness.
+                    group["automation_state"]["idle_since"] = None
         except Exception:
             groups = {}
 
@@ -558,20 +561,28 @@ def runtime_notice(g: dict, m: dict, text: str, exc: Exception) -> None:
 
 def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> None:
     with delivery_lock(g, m):
-        job = {"id": uuid.uuid4().hex, "attempt": 0, "queued_at": time.time(),
-               "text": text, "hops": hops, "silent": silent}
-        # An explicit owner answer must still reach a live permission prompt.
-        if m.get("pending") and m.get("status") == "waiting_user_answer" and hops == 0 and not silent:
-            m["active_delivery"] = None
-            m["pending"] = False
-            m["delivery_state"] = "waiting_ready"
-            m.setdefault("outbox", []).insert(0, job)
-        else:
-            m.setdefault("outbox", []).append(job)
-        if not m.get("active_delivery") and m.get("delivery_state") != "not_ready":
-            m["delivery_state"] = "waiting_ready"
-        save_state()
+        with lock:
+            queue_delivery(g, m, new_delivery(text, hops, silent))
+            save_state()
         flush_outbox(g, m)
+
+
+def new_delivery(text: str, hops: int, silent: bool = False) -> dict:
+    return {"id": uuid.uuid4().hex, "attempt": 0, "queued_at": time.time(),
+            "text": text, "hops": hops, "silent": silent}
+
+
+def queue_delivery(g: dict, m: dict, job: dict) -> None:
+    # Caller holds this member's delivery lock, then the global state lock.
+    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"]:
+        m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+        m.setdefault("outbox", []).insert(0, job)
+    else:
+        m.setdefault("outbox", []).append(job)
+    if not m.get("active_delivery") and m.get("delivery_state") not in ("not_ready", "budget_paused"):
+        m["delivery_state"] = "waiting_ready"
+    if "automation_state" in g:
+        g["automation_state"]["idle_since"] = None
 
 
 def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
@@ -579,6 +590,16 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
         queue = m.get("outbox", [])
         if not queue or m.get("active_delivery") or m.get("delivery_state") == "not_ready":
             return False
+        with lock:
+            if not budget_available(g):
+                m["delivery_state"] = "budget_paused"
+                budget_notice(g)
+                save_state()
+                return False
+            if m.get("delivery_state") == "budget_paused":
+                # A budget pause must not consume the CLI startup timeout.
+                queue[0]["queued_at"] = time.time()
+                m["delivery_state"] = "waiting_ready"
         if time.time() - queue[0]["queued_at"] >= STARTUP_TIMEOUT and not m.get("terminal_id"):
             ready = False
         else:
@@ -598,42 +619,65 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
                 add_msg(g, "system", "系统", f"{m['name']} 启动尚未就绪，消息尚未投递；处理终端后可重试投递。", log=False)
             save_state()
             return False
-        job = queue.pop(0)
-        dispatch_delivery(g, m, job)
-        return True
+        with lock:
+            job = queue.pop(0)
+            m["active_delivery"] = job
+        return dispatch_delivery(g, m, job)
 
 
-def dispatch_delivery(g: dict, m: dict, job: dict) -> None:
-    job["attempt"] += 1
-    m.update(active_delivery=job, pending=True, delivery_state="dispatching", delivery_warned=False)
+def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
+    with lock:
+        job["attempt"] += 1
+        m.update(active_delivery=job, pending=True, delivery_state="dispatching", delivery_warned=False)
     attempted = False
+    charged = False
     try:
         raw = get_full_output(m) if m.get("provider") == "codex" else None
-        m.update(boundary=None, reply_handled=False, sent_at=time.time(), saw_busy=False,
-                 hops=job["hops"], silent=job["silent"], dispatch_confirmed=False,
-                 delivery_started=False, last_progress_at=time.time(), progress_generation=None)
-        m.pop("progress_hash", None)
-        if raw is not None:
-            states = codex_states(raw)
-            m.update(codex_dispatch_markers=len(states), codex_dispatch_state=states[-1] if states else None,
-                     codex_saw_working=False, codex_snapshot_len=len(raw),
-                     codex_snapshot_hash=hashlib.sha256(raw.encode()).hexdigest(),
-                     codex_buffer_reset=False, full_len=len(raw))
-        save_state()  # Persist the in-flight job before CAO can accept it.
+        with lock:
+            m.update(boundary=None, reply_handled=False, sent_at=time.time(), saw_busy=False,
+                     hops=job["hops"], silent=job["silent"], dispatch_confirmed=False,
+                     delivery_started=False, last_progress_at=time.time(), progress_generation=None)
+            m.pop("progress_hash", None)
+            if raw is not None:
+                states = codex_states(raw)
+                m.update(codex_dispatch_markers=len(states), codex_dispatch_state=states[-1] if states else None,
+                         codex_saw_working=False, codex_snapshot_len=len(raw),
+                         codex_snapshot_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                         codex_buffer_reset=False, full_len=len(raw))
+            # Reserve globally across member locks, immediately before input.
+            if not budget_available(g):
+                job["attempt"] -= 1
+                m.setdefault("outbox", []).insert(0, job)
+                m.update(active_delivery=None, pending=False, delivery_state="budget_paused")
+                budget_notice(g)
+                save_state()
+                return False
+            if "automation" in g:
+                automation_state(g)["deliveries_used"] += 1
+                charged = True
+            save_state()  # Persist the reservation and in-flight job before input.
         attempted = True
         r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})
         # Fresh statuses belong to this dispatch only above CAO's boundary.
-        m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
-        m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
-        save_state()
+        with lock:
+            m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
+            m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
+            save_state()
     except Exception as e:
         ambiguous = attempted and (not isinstance(e, CaoError) or e.status == 0 or e.status >= 500)
+        if charged and not ambiguous:
+            with lock:
+                automation_state(g)["deliveries_used"] -= 1
+                charged = False
         m.update(pending=ambiguous, delivery_state="uncertain" if ambiguous else "failed",
                  delivery_warned=True, sent_at=time.time(), last_progress_at=time.time(),
                  delivery_started=False)
         note = "可能未送达，可重发（也可能已送达，请先核对终端）" if ambiguous else "投递失败，可重试"
         detail = str(e) if isinstance(e, CaoError) else type(e).__name__
         runtime_notice(g, m, f"发给 {m['name']} 失败：{detail}；{note}。", e)
+    if charged:
+        budget_notice(g)
+    return True
 
 
 def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
@@ -801,6 +845,8 @@ def get_reply(m: dict) -> str:
             prev = m.get("full_len", 0)
             m["full_len"] = len(text)
             text = text[prev:]
+        with lock:
+            m["_reply_work_state"] = reply_work_state(clean_output(text, preserve_indent=True))
         return clean_output(text)
     return ""
 
@@ -812,14 +858,14 @@ TUI_FOOTER = re.compile(
 )
 
 
-def clean_output(s: str) -> str:
+def clean_output(s: str, *, preserve_indent: bool = False) -> str:
     s = ANSI.sub("", s).replace("\r", "")
-    lines = s.strip().splitlines()
+    lines = (s.rstrip() if preserve_indent else s.strip()).splitlines()
     # Only remove complete footer lines at the end, preserving prose and code examples.
     while lines and (not lines[-1].strip() or TUI_FOOTER.fullmatch(lines[-1].strip())):
         lines.pop()
     s = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
-    return s.strip()
+    return s.rstrip() if preserve_indent else s.strip()
 
 
 def handle_reply(g: dict, m: dict, text: str) -> None:
@@ -827,8 +873,11 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
         return
     m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed",
              delivery_started=True, last_progress_at=time.time())
+    reported_state = m.pop("_reply_work_state", None)
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
+    with lock:
+        m["work_state"] = reported_state if reported_state is not None else reply_work_state(text)
     if not text:
         text = "（无文字输出）"
     add_msg(g, "agent", m["name"], text, mid=m["id"])
@@ -836,12 +885,13 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
         append_log(g, m["name"], line)
     hops = m.get("hops", 0)
     targets = find_mentions(g, text, exclude=m["id"])
-    if targets and hops < MAX_RELAY_HOPS:
+    relay_limit = automation_settings(g)["relay_limit"]
+    if targets and hops < relay_limit:
         for t in targets:
             send_to(g, t, f"[来自 {m['name']}] {text}", hops + 1)
     elif targets:
         add_msg(g, "system", "系统",
-                f"已达到自动转发上限（{MAX_RELAY_HOPS} 次），请群主决定下一步。", log=False)
+                f"已达到自动转发上限（{relay_limit} 次），请群主决定下一步。", log=False)
 
 
 def poll_member(g: dict, m: dict) -> None:
@@ -851,6 +901,8 @@ def poll_member(g: dict, m: dict) -> None:
     try:
         t = cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
     except CaoError as e:
+        if automation_settings(g)["idle_minutes"]:
+            m["autonomy_poll_ok"] = False
         if e.status == 404:
             m.update(status="gone", terminal_id=None, ready_terminal=None, pending=False)
             if m.get("active_delivery"):
@@ -859,6 +911,8 @@ def poll_member(g: dict, m: dict) -> None:
         else:
             watch_delivery(g, m, {})
         return
+    if automation_settings(g)["idle_minutes"]:
+        m["autonomy_poll_ok"] = True
     st = str(t.get("status", "")).lower()
     prev = m.get("status")
     gen, boundary = t.get("status_generation"), m.get("boundary")
@@ -917,6 +971,7 @@ def poll_loop() -> None:
     while True:
         time.sleep(POLL_SECONDS)
         with lock:
+            group_snapshot = list(groups.values())
             snapshot = [(g, m) for g in groups.values() for m in g["members"]
                         if m.get("terminal_id") or m.get("outbox") or m.get("active_delivery")]
         for g, m in snapshot:
@@ -933,6 +988,11 @@ def poll_loop() -> None:
                         m["poll_error_type"] = type(e).__name__
                         runtime_notice(g, m, f"{m['name']} 的状态更新失败（{type(e).__name__}）；"
                                        "投递可能未送达，请核对终端后重试。", e)
+        for g in group_snapshot:
+            try:
+                check_idle_reminder(g)
+            except Exception as e:
+                print(f"group={g['id']} reminder_error={type(e).__name__}", flush=True)
         if snapshot:
             try:
                 save_state()
@@ -1033,13 +1093,154 @@ def public_group(g: dict, since: int = 0) -> dict:
     out["log_file"] = str(log_path(g))
     out["members"] = []
     for m in g["members"]:
-        member = {k: v for k, v in m.items() if k not in ("outbox", "active_delivery")}
+        member = {k: v for k, v in m.items() if k not in ("outbox", "active_delivery", "_reply_work_state")}
         job = m.get("active_delivery") or next(iter(m.get("outbox", [])), None)
         member.update(effective_tools=member_tools(m), queued_count=len(m.get("outbox", [])),
                       delivery_id=job["id"] if job else None, delivery_attempt=job["attempt"] if job else None,
                       can_retry=bool(job and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
         out["members"].append(member)
     return out
+
+
+# ───────────────────────── 按群自主运行（缺省保持原行为） ─────────────────────────
+AUTOMATION_DEFAULTS = {
+    "relay_limit": MAX_RELAY_HOPS, "delivery_budget": None, "idle_minutes": 0,
+    "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None,
+}
+
+
+def automation_settings(g: dict) -> dict:
+    return {**AUTOMATION_DEFAULTS, **g.get("automation", {})}
+
+
+def automation_state(g: dict) -> dict:
+    return g.setdefault("automation_state", {"deliveries_used": 0, "budget_notified": False,
+                                           "reminders_sent": 0, "last_reminder_at": None, "idle_since": None})
+
+
+def budget_available(g: dict) -> bool:
+    limit = automation_settings(g)["delivery_budget"]
+    return limit is None or g.get("automation_state", {}).get("deliveries_used", 0) < limit
+
+
+def automation_view(g: dict) -> dict:
+    with lock:
+        state = {"deliveries_used": 0, "reminders_sent": 0, "last_reminder_at": None,
+                 "idle_since": None, **g.get("automation_state", {})}
+        state.pop("budget_notified", None)
+        state["budget_exhausted"] = not budget_available(g)
+        return {"settings": automation_settings(g), "runtime": state}
+
+
+def update_automation(g: dict, body: dict) -> dict:
+    with lock:
+        if not isinstance(body, dict) or any(key not in AUTOMATION_DEFAULTS for key in body):
+            raise ValueError("自主运行设置必须是对象，且只能包含支持的配置字段")
+        settings = {**automation_settings(g), **body}
+        for key in ("relay_limit", "delivery_budget", "reminder_limit"):
+            value = settings[key]
+            if key == "delivery_budget" and value is None:
+                continue
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{key} 必须是非负整数")
+        for key in ("idle_minutes", "reminder_cooldown_minutes"):
+            value = settings[key]
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or value < 0 or (key == "reminder_cooldown_minutes" and value == 0)):
+                raise ValueError(f"{key} 必须是有限的{'正数' if key == 'reminder_cooldown_minutes' else '非负数'}分钟数")
+        coordinator = settings["coordinator_id"]
+        if ("coordinator_id" in body and coordinator is not None
+                and not any(m["id"] == coordinator for m in g["members"])):
+            raise ValueError("协调成员不存在，请使用本群成员 ID 或 null")
+        if body and ("automation" not in g or settings != automation_settings(g)):
+            g["automation"] = settings
+            state = automation_state(g)
+            state["idle_since"] = None
+            if budget_available(g):
+                state["budget_notified"] = False
+            save_state()
+            budget_notice(g)
+        return automation_view(g)
+
+
+def budget_notice(g: dict) -> None:
+    with lock:
+        if budget_available(g) or automation_state(g)["budget_notified"]:
+            return
+        state = automation_state(g)
+        state["budget_notified"] = True
+        add_msg(g, "system", "系统", f"本群投递预算已用完（{state['deliveries_used']}/"
+                f"{automation_settings(g)['delivery_budget']}）；新消息保留在队列，调高预算后按成员队列顺序继续投递。", log=False)
+
+
+def reply_work_state(text: str) -> str:
+    lines = text.rstrip().splitlines()
+    fence = None
+    for line in lines[:-1]:
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if marker:
+            run, tail = marker.groups()
+            if fence is None:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence) and not tail.strip():
+                fence = None
+    match = re.fullmatch(r"状态：(进行中|等对方|等群主|阻塞|已交付)", lines[-1]) if lines and not fence else None
+    return match.group(1) if match else "进行中"
+
+
+def idle_coordinator(g: dict, settings: dict) -> dict | None:
+    members = g["members"]
+    for m in members:
+        if (m.get("pending") or m.get("active_delivery") or m.get("outbox")
+                or m.get("work_state", "进行中") in ("等群主", "阻塞", "已交付")
+                or m.get("status") not in DONE | {"gone", "failed", "stopped", "error"}
+                or m.get("poll_error_type") or (m.get("terminal_id") and m.get("autonomy_poll_ok") is False)):
+            return None
+    available = [m for m in members if m.get("terminal_id") and m.get("ready_terminal") == m["terminal_id"]
+                 and m.get("status") in DONE]
+    return next((m for m in available if m["id"] == settings["coordinator_id"]), next(iter(available), None))
+
+
+def check_idle_reminder(g: dict, now: float | None = None) -> bool:
+    with lock:
+        settings = automation_settings(g)
+        if not settings["idle_minutes"] or not settings["reminder_limit"]:
+            return False
+        target = idle_coordinator(g, settings)
+        if target is None:
+            automation_state(g)["idle_since"] = None
+            return False
+    # Never acquire a member lock while holding the global state lock.
+    with delivery_lock(g, target):
+        with lock:
+            if groups.get(g["id"]) is not g:
+                return False
+            settings = automation_settings(g)
+            state = automation_state(g)
+            if (not settings["idle_minutes"] or not settings["reminder_limit"]
+                    or idle_coordinator(g, settings) is not target):
+                state["idle_since"] = None
+                return False
+            now = time.time() if now is None else now
+            since, last = state["idle_since"], state["last_reminder_at"]
+            if since is None or now < since:
+                state["idle_since"] = now
+                return False
+            if (now - since < settings["idle_minutes"] * 60
+                    or (last is not None and now - last < settings["reminder_cooldown_minutes"] * 60)
+                    or state["reminders_sent"] >= settings["reminder_limit"]):
+                return False
+            if not budget_available(g):
+                budget_notice(g)
+                return False
+            number = state["reminders_sent"] + 1
+            text = (f"[自动提醒 idle:{g['id']}:{number}] 群内已持续空闲，请协调下一步或说明等待原因。"
+                    "必要时定向提及其他成员；回复最后请独立一行标明状态，取值为进行中、等对方、等群主、阻塞或已交付，格式为‘状态：取值’。")
+            state.update(reminders_sent=number, last_reminder_at=now)
+            queue_delivery(g, target, new_delivery(text, 0))
+            add_msg(g, "system", "系统", text, to=[target["name"]], log=False)
+        flush_outbox(g, target)
+    return True
 
 
 # ───────────────────────── 用量与开销 ─────────────────────────
@@ -1464,6 +1665,11 @@ class H(BaseHTTPRequestHandler):
                     since = int((qs.get("since") or ["0"])[0])
                     with lock:
                         return self._json(200, public_group(g, since))
+                if rest == ["automation"]:
+                    if method == "GET":
+                        return self._json(200, automation_view(g))
+                    if method == "PUT":
+                        return self._json(200, update_automation(g, self._body()))
                 if not rest and method == "DELETE":
                     for m in g["members"]:
                         stop_member(m)

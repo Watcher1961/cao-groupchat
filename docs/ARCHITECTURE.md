@@ -10,9 +10,10 @@
 | CAO 适配与轮询 | 标准库 HTTP 请求、可选 Bearer token、每 2 秒轮询 terminal 状态和完成输出 |
 | 持久化与共享日志 | 群和消息写入数据目录的 `groups.json`；先写临时文件再替换；工作目录内追加 `GROUP_LOG.md` |
 | 用量解析 | 读取本机 Claude Code/Codex CLI JSONL，按成员标记认领，缓存解析并估算费用 |
-| `tests/test_server.py` | 41 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
+| `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
+| `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 17 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501；不包含验收断言 |
-| `tests/test_integration.py` | 六个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 25 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 10 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -26,6 +27,20 @@
 - 选目录通过 `osascript` 打开 macOS 原生对话框；非 macOS 或缺少该命令、原生选择失败时，前端退回页面内目录浏览。用户取消时不打开降级浏览器。
 
 窄窗口保留 1100px/760px 边界：小于 1100px 右侧抽屉、小于 760px 左侧也为抽屉，375px 顶栏入口常驻。S.drawer 只允许一侧展开，控制遮罩、ARIA、背景 inert 和焦点；Esc 优先关闭目录/设置窗口，随后关闭抽屉。两个断点的 matchMedia change 与 resize 兜底共用同步路径，恢复常驻布局时清理遮罩和禁用状态，选群成功关闭左侧；头部动态内容与入口分开，轮询不销毁入口。单文件前端使用现有颜色令牌；布局/无横向滚动由群主浏览器验收，Node 只验证行为。过期日志响应校验当前群/页签后才写入视图。
+
+## 按群自主运行控制
+
+`GET/PUT /api/groups/{id}/automation` 读取设置及运行摘要，PUT 为部分更新。缺省 `relay_limit=6`、`delivery_budget=null`、`idle_minutes=0`、`reminder_cooldown_minutes=5`、`reminder_limit=3`、`coordinator_id=null`；GET 不激活旧群配置。数值拒绝 bool、负数及非有限值，协调 ID 必须属于当前群；空对象无操作，相同配置 PUT 保持空闲观察期。未提供界面和浏览器 Mock API。
+
+明确配置后，`automation` 保存设置，`automation_state` 保存 deliveries_used、budget_notified、reminders_sent、last_reminder_at、idle_since。预算是累计上限，不是剩余额度；成员广播、静默通知、自动提醒、人工重发都经同一 input 路径。各成员 FIFO 仍可并发，跨成员不保证全局顺序。超额在原 outbox 中保留，delivery_state=budget_paused，不设置 pending；增额/null 后下一轮自动继续，启动等待时钟从预算暂停恢复处续开，不把暂停时间算成启动超时。
+
+发送持成员投递锁；原始输出基线等网络读取在全局锁外。input 前持全局锁检查剩余、预留一个名额，与 dispatching 一起持久化，再释放全局锁调用 CAO。多个成员不能同时抢最后一个名额。发送前失败及明确拒绝返还；可能已送达的异常保留计数，人工重试按新尝试计数；崩溃留下的预留保守保留，沿用 uncertain 恢复。预算到达上限或首次阻塞时仅一条系统提示，加额恢复可开启下一次耗尽提示。没有 CAO/本地文件联合事务，不承诺恰好一次。
+
+工作状态与 CLI 状态分开：每次非静默完成回复解析最后非空行的 `状态：进行中|等对方|等群主|阻塞|已交付`，每行只能取其中一个值且从行首开始；无合法标记回到进行中。先去 ANSI/真实结束行但保留缩进，再解析，避免单行缩进代码被显示层 strip 误认；围栏代码、引用、列表及正文提及不认，显示正文保持原清洗结果。静默入群确认不覆盖工作状态。
+
+轮询所有成员后按群检查提醒：必须无 active_delivery/pending/outbox，CLI 不忙、不等待用户输入、状态已知且观察正常；任一成员等群主/阻塞/已交付则重置连续空闲观察。目标优先配置的在线就绪成员，否则首个可用成员，无可用者不提醒。先在全局锁选目标，释放后获取该成员锁，再在全局锁重验，原子登记提醒计数、系统消息及队列；释放全局锁后才尝试 input。固定标识 `[自动提醒 idle:<群ID>:<累计序号>]`，不冒充群主；间隔、正数冷却、总次数及预算同时约束，无额度不生成提醒。
+
+设置改动和重启后重新观察持续空闲，累计预算/提醒次数/冷却及待发队列保留；相同 PUT 不改变观察期。任一待投递/在途任务，包括预算暂停和 uncertain，都禁止空闲提醒。单成员轮询和单群提醒错误分别兜底，不中止其他群。配置仅影响本实例经 GUI 发起的 input，不限制 CLI 自己的内部工具或外部直接 CAO 输入；不能替代只读角色的实际授权和隔离。
 
 ## 数据流
 
@@ -50,6 +65,7 @@
 | `PUT/DELETE /api/groups/{id}/members/{mid}` | 编辑并重启或移出成员 |
 | `POST /api/groups/{id}/members/{mid}/restart` | 重启成员 |
 | `POST /api/groups/{id}/members/{mid}/retry` | 人工重试原任务；body 为 delivery_id/ delivery_attempt，过期或重复请求 400 |
+| `GET/PUT /api/groups/{id}/automation` | 读设置及累计摘要，部分更新本群自主运行设置 |
 | `GET /api/groups/{id}/log`、`GET /api/groups/{id}/usage` | 共享日志、用量汇总 |
 | `POST /api/pick-folder` | macOS 原生选目录；前端在失败时降级为页面浏览 |
 | `GET /api/fs`、`POST /api/fs/mkdir` | 本机目录浏览和创建 |

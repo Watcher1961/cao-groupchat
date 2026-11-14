@@ -711,6 +711,74 @@ class IntegrationTests(unittest.TestCase):
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
         self.assertEqual([m["text"] for m in self.wait_replies(1)], [final])
 
+    def test_automation_budget_queue_restore_and_increase_preserve_fifo(self):
+        self.create_group()
+        member = self.invite("预算成员", "claude_code", "developer")
+        self.assertEqual(self.api("GET", "/automation")["settings"]["relay_limit"], 6)
+        self.api("PUT", "/automation", {"delivery_budget": 1, "relay_limit": 10})
+        for text in ("第一条", "第二条", "第三条"):
+            self.api("POST", "/messages", {"text": text})
+        self.until("one input and two budget-paused messages", lambda:
+                   len(self.terminal(member["terminal_id"])["inputs"]) == 1 and
+                   self.api("GET")["members"][0]["queued_count"] == 2 and len(self.replies()) == 1)
+        self.assertEqual(sum("投递预算" in msg["text"] for msg in self.api("GET")["messages"]), 1)
+        self.stopped_server = self.server
+        self.stop_process(self.stopped_server)
+        self.start_server()
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 1)
+        self.assertEqual(self.api("GET")["members"][0]["queued_count"], 2)
+        self.api("PUT", "/automation", {"delivery_budget": 3})
+        self.wait_replies(3)
+        inputs = self.terminal(member["terminal_id"])["inputs"]
+        self.assertEqual([turn["message"] for turn in inputs], ["[群主] 第一条", "[群主] 第二条", "[群主] 第三条"])
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 3)
+
+    def test_automation_broadcast_counts_recipients_and_rejects_invalid_configuration(self):
+        self.create_group()
+        members = [self.invite(name, "claude_code", "developer") for name in ("成员甲", "成员乙", "成员丙")]
+        self.until("silent notices completed", lambda: all(not m.get("pending") and not m.get("queued_count")
+                                                          for m in self.api("GET")["members"]))
+        before = {m["terminal_id"]: len(self.terminal(m["terminal_id"])["inputs"]) for m in members}
+        defaults = self.api("GET", "/automation")
+        for invalid in ({"relay_limit": True}, {"delivery_budget": -1}, {"coordinator_id": "missing"}):
+            with self.assertRaises(error.HTTPError) as caught:
+                self.api("PUT", "/automation", invalid)
+            with caught.exception as response:
+                self.assertEqual(response.code, 400)
+                self.assertTrue(json.load(response)["error"])
+            self.assertEqual(self.api("GET", "/automation"), defaults)
+        self.api("PUT", "/automation", {"delivery_budget": 1})
+        self.api("POST", "/messages", {"text": "@所有人 预算广播"})
+        self.until("broadcast paused at exactly one recipient", lambda:
+                   sum(self.api("GET")["members"][i]["queued_count"] for i in range(3)) == 2)
+        self.assertEqual(sum(len(self.terminal(tid)["inputs"]) - count for tid, count in before.items()), 1)
+        self.api("PUT", "/automation", {"delivery_budget": 3})
+        self.wait_replies(3)
+        self.assertEqual(sum(len(self.terminal(tid)["inputs"]) - count for tid, count in before.items()), 3)
+        other = self.http(self.server_url, "POST", "/api/groups", {
+            "name": "默认群", "workdir": str(self.root / "other"), "members": []})
+        self.assertIsNone(self.http(self.server_url, "GET", f"/api/groups/{other['id']}/automation")["settings"]["delivery_budget"])
+
+    def test_automation_idle_reminder_is_identified_targeted_and_budgeted(self):
+        self.create_group()
+        member = self.invite("协调", "claude_code", "supervisor")
+        self.next_turn(member["terminal_id"], "请群主决定\n状态：等群主")
+        self.api("PUT", "/automation", {"idle_minutes": 0.004, "reminder_cooldown_minutes": 0.004,
+                                        "reminder_limit": 2, "delivery_budget": 5, "coordinator_id": member["id"]})
+        self.wait_replies(1)
+        self.assertEqual(self.api("GET")["members"][0]["work_state"], "等群主")
+        reminders = [msg for msg in self.api("GET")["messages"] if "[自动提醒 idle:" in msg["text"]]
+        self.assertEqual(len(reminders), 1)
+        self.assertEqual(reminders[0]["kind"], "system")
+        self.assertEqual(reminders[0]["to"], ["协调"])
+        self.assertIn("[自动提醒 idle:", self.terminal(member["terminal_id"])["inputs"][0]["message"])
+        # Observe many actual poll cycles across the interval, without fixed sleeps.
+        reads = self.terminal(member["terminal_id"])["status_reads"]
+        self.until("waiting-owner excludes reminders across many polls", lambda:
+                   self.terminal(member["terminal_id"])["status_reads"] >= reads + 20)
+        runtime = self.api("GET", "/automation")["runtime"]
+        self.assertEqual((runtime["reminders_sent"], runtime["deliveries_used"]), (1, 1))
+
     def test_invalid_permission_modes_do_not_disrupt_running_member(self):
         self.create_group()
         member = self.invite("权限测试", "claude_code", "developer",

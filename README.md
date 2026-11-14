@@ -40,7 +40,7 @@ python3 server.py
 ## 工作方式
 
 - 一个群对应一个 CAO session，一位成员对应一个 terminal。角色、工具和职责写入生成的 profile，优先经 HTTP 安装，失败时退回 `cao install`。
-- 群主提及已匹配成员时定向发送；无匹配提及或广播时投递给所有成员，尚未取得 terminal 或就绪证据的消息先排队保存。成员回复中的提及继续接力，上限 6 跳。
+- 群主提及已匹配成员时定向发送；无匹配提及或广播时投递给所有成员，尚未取得 terminal 或就绪证据的消息先排队保存。成员回复中的提及继续接力，默认上限 6 跳，可按群配置。
 - 后台每 2 秒轮询 terminal；其他 provider 用 dispatch_boundary/status_generation 区分本轮状态。Codex 解析原始 `OSC 7501;state=…:app=codex`（ST 结束，兼容 BEL 和无 app 旧格式），使用本轮最后状态，仅 done 完成；没有新标记、仍 working 或输出读取失败继续等待，不相信中途 idle。发送前记录快照指纹和标记边界，识别 CAO input 清空；首次轮询中同时出现本轮 working/done 可完成；若 raw 已重置、发送时非 working 且输出代际前进，只剩 done 也可完成。发送时旧轮仍 working 则继续要求新 working，完成后才取最终回复。
 - 邀请和编辑可选推理强度：Codex 为 low/medium/high/xhigh；Claude Code 另有 max；留空用 CLI 默认，其他 provider 不显示。配置随成员保存，卡片和演示模式同步；编辑后重启生成对应 provider 的 profile，群主表单/卡片抽查通过，真实 CLI 参数生效尚待联调；编辑日志记录强度值或 CLI 默认。
 - 初次投递须观察 idle/completed 及稳定的 CLI 提示特征：Codex 页脚、Claude Code 空/带 `Try "…"` 占位提示的输入框或旧空提示符。当前 HTTP 只能取得 raw full，不能完全替代 CAO 的渲染屏幕检查；群主在 afaa1ab 真实冷启动复测通过：Codex 7 秒、Claude Code 8 秒回复进群且无 TUI 残留，第 3 项已结案，具体依据见任务清单。
@@ -48,6 +48,47 @@ python3 server.py
 - 编辑成员配置会停止旧 terminal 并启动新 terminal，不保证保留旧 CLI 上下文。
 - 共享日志位于群工作目录的 `GROUP_LOG.md`。有写权限的成员直接追加，无写权限者在行首使用 `[日志]` 由后端代写；该文件含本机运行信息，保持 Git 忽略。
 - 工具权限最终由 CAO 和 provider 执行。界面会标注部分 provider 的软约束或不执行限制；这些标注不等于安全隔离已验证。
+
+### 按群配置自主运行（仅后端 API）
+
+默认群保持接力 6 跳、不限投递、不发空闲提醒；只读取 API 不会开启新功能。仅给另建的实验群配置，不要误用开发群 ID。直接打开 HTML 的演示模式不支持此 API。
+
+`GET /api/groups/{id}/automation` 返回 `{settings, runtime}`，`PUT` 部分更新 settings；未知字段/非法类型返回中文 400，runtime 累计计数不可通过 PUT 清零。
+
+| 配置键 | 默认 | 含义 |
+| --- | --- | --- |
+| relay_limit | 6 | 非负整数，0 禁止成员自动接力 |
+| delivery_budget | null | 从首次配置起的累计投递上限；非负整数，0 暂停，null 不限 |
+| idle_minutes | 0 | 持续空闲几分钟后提醒；0 关闭，支持有限小数 |
+| reminder_cooldown_minutes | 5 | 两条自动提醒至少间隔的正数分钟数 |
+| reminder_limit | 3 | 累计提醒次数上限，0 禁止；重启不清零 |
+| coordinator_id | null | 本群协调成员 ID；未指定/成员离线时用首个在线就绪成员 |
+
+以下仅为配置示例，先替换实验群 ID 和实际成员 ID；Python 标准库即可调用：
+
+```python
+import json
+from urllib.request import Request, urlopen
+
+url = "http://127.0.0.1:8765/api/groups/替换为实验群ID/automation"
+with urlopen(url) as response:
+    print(json.load(response))
+settings = {"relay_limit": 30, "delivery_budget": 100, "idle_minutes": 3,
+            "reminder_cooldown_minutes": 5, "reminder_limit": 3,
+            "coordinator_id": None}  # 可改为 GET 群详情中的成员 id
+req = Request(url, data=json.dumps(settings).encode(), method="PUT",
+              headers={"Content-Type": "application/json"})
+with urlopen(req) as response:
+    print(json.load(response))
+```
+
+runtime 提供 deliveries_used、budget_exhausted、reminders_sent、last_reminder_at、idle_since。广播 N 人扣 N 次，静默通知、自动提醒与人工重发也扣；只有明确配置后的尝试计数，不追溯历史。额度在 input 前原子预留落盘；发送前失败/明确拒绝返还，响应丢失等可能送达的尝试保守扣减。进程崩溃后的未决预留也保留，避免重启绕过预算。
+
+预算耗尽时系统提示一次，后续消息保留各成员 FIFO 队列；将 delivery_budget 提高到大于 deliveries_used（或设 null），下次轮询恢复。预算暂停不消耗启动超时；不同成员仍可并发，不保证跨成员全局顺序。实际更改设置会重开空闲观察窗口，但不清累计计数；同值重复 PUT 不重置观察期。
+
+成员任务回复须在最后独立一行写一个标记，例如 `状态：等群主`；可选进行中、等对方、等群主、阻塞、已交付。无标记视为进行中；引用、正文提及和代码块不认，静默通知不改变工作状态。群详情的成员 work_state 可查询。工作状态不等于 CAO 的 CLI status。
+
+只有全群无在途或排队任务且持续空闲才提醒；等群主/阻塞/已交付、待用户应答（含额度弹窗）、忙碌/启动/未知状态和观察失败均排除。提醒带 `[自动提醒 idle:<群ID>:<序号>]`，作为系统消息只发协调成员；无预算或无可用成员不生成，冷却和累计次数也限制发送。重启后重新观察空闲，原累计计数/冷却/队列不变。提醒不授予额外权限，不替代额度交接、独立审查或真实 CLI 安全边界。
 
 ### 用量与费用
 
@@ -74,7 +115,7 @@ python3 -B tests/fake_cao.py --port 0             # 独立模拟 CAO，输出随
 
 模拟服务支持 `--port 0`（系统分配端口），省略参数仍默认 9889；不要占用或切换当前真实会话。导入不会启动服务。模拟状态按状态查询推进，不依赖固定延迟；`/_test/state` 提供观察，`POST /_test/terminals/{id}/next-turn` 可指定下一轮 `reply`、`hold`、`stale_polls`，`POST /_test/terminals/{id}/release` 释放本轮输出。另可用 `idle_stream` 和 `POST /_test/terminals/{id}/advance` 控制无标记/working/done 阶段；raw full 输出与 last 回复分离。模拟器的 input 默认清空 raw full 缓冲；`append_output=true` 选择只追加兼容路径，`complete_on_input=true` 模拟首次轮询前完成。另用 `/_test/config` 的 `hold_create/startup_hold` 控制创建与启动，`ready` 放出输入提示；`drop=true` 丢弃下一次投递，`padding_bytes` 模拟滚动 FIFO（上限 32768 字节）。会话单独保存，重复同名创建严格返回真实 400；`hold_sessions` 与 `fail_profiles` 配置可按群阻塞创建或按成员注入失败，供并发隔离验证。这些仅用于本机测试。
 
-自动套件含 74 个隔离后端单测、20 个 HTTP 集成和 10 个可选前端行为测试。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗、effort 默认/校验/profile 及 Codex 本轮标记判定。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，effort 编辑、成员重启和清空配置，以及 Codex 全程 idle 时无新标记/working 不提前发言、done 后最终回复可接力，还覆盖清空后快速完成、连续相同短回复和迟到旧 done 的保护。还覆盖两种 CLI 误报 idle 的启动等待、未取得 terminal 的队列、超时/手动重试/并发防重、迟到完成、启动任务的重启恢复，以及 32KB 滚出 working 后的完成。主样本采用群主提供的 Codex 0.164.0 原生 app 后缀/ST 字节，并覆盖 BEL/旧格式兼容、未知状态及 full 起点。还覆盖两种 provider 首次轮询前完成、此前未见 working 的 32KB done 完成及无误告警、dim 占位输入框、未知特征人工兜底及发送/轮询/写盘异常恢复。另覆盖同群线程并发只创建一次、全离线复用/丢失重建、跨群不阻塞和启动失败恢复，以及 GET 200 terminated 失败记录下的并发重建。集成测试以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
+自动套件含 97 个隔离后端单测、25 个 HTTP 集成和 10 个可选前端行为测试。单测另覆盖按群自主运行的默认隔离、配置校验、6 线程预算原子性、暂停/恢复、引用状态误判及提醒冷却/上限/排除；HTTP 增加广播预算、队列重启恢复与定向自动提醒。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗、effort 默认/校验/profile 及 Codex 本轮标记判定。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，effort 编辑、成员重启和清空配置，以及 Codex 全程 idle 时无新标记/working 不提前发言、done 后最终回复可接力，还覆盖清空后快速完成、连续相同短回复和迟到旧 done 的保护。还覆盖两种 CLI 误报 idle 的启动等待、未取得 terminal 的队列、超时/手动重试/并发防重、迟到完成、启动任务的重启恢复，以及 32KB 滚出 working 后的完成。主样本采用群主提供的 Codex 0.164.0 原生 app 后缀/ST 字节，并覆盖 BEL/旧格式兼容、未知状态及 full 起点。还覆盖两种 provider 首次轮询前完成、此前未见 working 的 32KB done 完成及无误告警、dim 占位输入框、未知特征人工兜底及发送/轮询/写盘异常恢复。另覆盖同群线程并发只创建一次、全离线复用/丢失重建、跨群不阻塞和启动失败恢复，以及 GET 200 terminated 失败记录下的并发重建。集成测试以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
 
 前端测试通过可选的本机 Node 执行真实内联脚本，使用最小 DOM 夹具验证强度选项、provider 切换提交、演示邀请编辑和卡片，以及投递不确定时的状态/重发、抽屉/焦点/缩放/选群与手机演示工作流；不安装 npm 包，不增加应用依赖。未安装 Node 时这 10 项会明确跳过，不能记为前端已验证。浏览器排版及真实 provider 联调需单独验收。
 
