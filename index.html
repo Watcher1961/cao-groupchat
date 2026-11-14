@@ -736,14 +736,17 @@ function tokLine(u){ const t=u.tokens; return `输入 ${fmtTok(t.in)} · 缓存�
 function usageHTML(m){
   const x=S.usage&&S.usage.members&&S.usage.members[m.id]; if(!x) return "";
   const u=x.usage, rows=[];
-  // 订阅额度（目前只有 Codex 的日志里有）
-  if(x.limits&&x.limits.windows.length&&x.mode!=="api"){
-    x.limits.windows.forEach(w=>{
-      const p=w.stale?0:Math.min(100,Math.max(0,w.used_percent||0)), cls=p>=85?"hi":p>=60?"mid":"";
-      rows.push(`<div class="qrow"><span>${winLabel(w.window_minutes)}额度</span><div class="qbar"><i class="${cls}" style="width:${p}%"></i></div><b>${w.stale?"已重置":p+"%"}</b></div>`+
-        (w.stale||w.resets_in==null?"":`<div class="qsub">${fmtDur(w.resets_in)}后重置</div>`));
+  const claude=x.provider==="claude_code", limits=x.limits;
+  const windows=claude?[300,10080].map(n=>(limits?.windows||[]).find(w=>w.window_minutes===n)||{window_minutes:n}):(limits?.windows||[]);
+  if(claude||(windows.length&&x.mode!=="api")){
+    windows.forEach(w=>{
+      const known=Number.isFinite(w.used_percent), p=w.stale||!known?0:Math.min(100,Math.max(0,w.used_percent)), cls=p>=85?"hi":p>=60?"mid":"";
+      const label=claude&&w.window_minutes===10080?"7 天":winLabel(w.window_minutes);
+      rows.push(`<div class="qrow"><span>${label}额度</span><div class="qbar"><i class="${cls}" style="width:${p}%"></i></div><b>${w.stale?"已重置":known?p+"%":"暂无数据"}</b></div>`+
+        (w.stale||!known||w.resets_in==null?"":`<div class="qsub">${fmtDur(w.resets_in)}后重置</div>`));
     });
-    if(x.limits.credits&&x.limits.credits.has) rows.push(`<div class="unote">额外 credits 余额：${esc(x.limits.credits.balance)}</div>`);
+    if(claude) rows.push(`<div class="unote">${Number.isFinite(limits?.updated_at)?`更新于 ${Math.max(0,Math.floor((Date.now()/1000-limits.updated_at)/60))} 分钟前`:"更新时间：暂无数据"}</div>`);
+    if(limits?.credits?.has) rows.push(`<div class="unote">额外 credits 余额：${esc(limits.credits.balance)}</div>`);
   }else if(x.mode==="subscription"&&!x.limits_available){
     rows.push(`<div class="unote">订阅剩余额度：该 CLI 不在日志里记录，可在它的终端里用 <code>/usage</code> 查看</div>`);
   }
@@ -773,7 +776,7 @@ function spendHTML(){
 async function loadUsage(){
   if(!S.group) return;
   try{ const id=S.group.id, u=await api("GET",`/groups/${id}/usage`); if(!S.group||S.group.id!==id) return;
-    const sig=JSON.stringify(u); if(sig===S.usageSig) return; S.usage=u; S.usageSig=sig;
+    const sig=JSON.stringify(u)+"|"+Math.floor(Date.now()/60000); if(sig===S.usageSig) return; S.usage=u; S.usageSig=sig;
     renderHead(); if(S.tab==="members") renderPane(); }catch{}
 }
 function toolChips(m){ return eff(m).map(t=>`<span class="tool ${WRITE_TOOLS.has(t)?"w":""}">${esc(t)}</span>`).join(""); }

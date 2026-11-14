@@ -26,6 +26,18 @@ class FrontendEffortTests(unittest.TestCase):
     def test_provider_specific_choices_and_edit_selection(self):
         self.check_ui("choices")
 
+    def test_claude_quota_independent_windows_and_update_age(self):
+        self.check_ui("partial", "frontend_limits.js")
+
+    def test_claude_quota_missing_data_keeps_both_bars_and_api_cost(self):
+        self.check_ui("missing", "frontend_limits.js")
+
+    def test_claude_quota_reset_never_shows_old_percentage(self):
+        self.check_ui("reset", "frontend_limits.js")
+
+    def test_usage_age_refreshes_without_new_snapshot(self):
+        self.check_ui("age_refresh", "frontend_limits.js")
+
     def test_provider_switching_and_form_payload(self):
         self.check_ui("switching")
 

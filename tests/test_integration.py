@@ -1,6 +1,7 @@
 """Real HTTP/subprocess acceptance tests using only disposable local resources."""
 
 import json
+import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -710,6 +711,47 @@ class IntegrationTests(unittest.TestCase):
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
         self.assertEqual([m["text"] for m in self.wait_replies(1)], ["• " + final])
+
+    def test_claude_limits_opt_in_conflict_capture_usage_and_member_restart(self):
+        group = self.create_group()
+        member = self.invite("额度成员", "claude_code", "developer", effort="low", plan="pro")
+        settings_file = Path(group["workdir"]) / ".claude" / "settings.local.json"
+        self.assertFalse(settings_file.exists())
+        settings_file.parent.mkdir()
+        original = '{"statusLine":{"type":"command","command":"user-bar"},"permissions":{"allow":["Read"]}}'
+        settings_file.write_text(original)
+        with self.assertRaises(error.HTTPError) as caught:
+            self.api("PUT", "/automation", {"claude_limits": True})
+        with caught.exception as response:
+            self.assertEqual(response.code, 400)
+            self.assertIn("statusLine", json.load(response)["error"])
+        self.assertEqual(settings_file.read_text(), original)
+        self.assertEqual(self.api("GET")["members"][0]["terminal_id"], member["terminal_id"])
+        self.assertFalse(self.api("GET", "/automation")["settings"]["claude_limits"])
+        settings_file.write_text('{"permissions":{"allow":["Read"]}}')
+        self.api("PUT", "/automation", {"claude_limits": True})
+        settings = json.loads(settings_file.read_text())
+        argv = shlex.split(settings["statusLine"]["command"])
+        future = time.time() + 7200
+        capture = subprocess.run(argv, input=json.dumps({"rate_limits": {
+            "seven_day": {"used_percentage": 24, "resets_at": future}}, "cwd": "must-not-save",
+            "transcript_path": "must-not-save", "messages": ["must-not-save"]}),
+            capture_output=True, text=True, cwd=self.root, env=self.env, timeout=5)
+        self.assertEqual((capture.returncode, capture.stdout, capture.stderr), (0, "", ""))
+        self.assertNotIn("must-not-save", Path(argv[-1]).read_text())
+        usage = self.api("GET", "/usage")["members"][member["id"]]
+        self.assertIsNone(usage["usage"])
+        self.assertEqual([(w["window_minutes"], w["used_percent"]) for w in usage["limits"]["windows"]], [(10080, 24)])
+        self.assertIsNotNone(usage["limits"]["updated_at"])
+        self.api("POST", f"/members/{member['id']}/restart", {})
+        current = self.until("Claude restarted with project-local quota collector", lambda:
+                   next((m for m in self.api("GET")["members"] if m["terminal_id"] and
+                         m["terminal_id"] != member["terminal_id"] and m.get("ready_terminal") == m["terminal_id"]), None))
+        self.assertEqual(current["effort"], "low")
+        self.assertEqual(json.loads(settings_file.read_text()), settings)
+        self.api("PUT", "/automation", {"claude_limits": False})
+        self.assertEqual(json.loads(settings_file.read_text()), {"permissions": {"allow": ["Read"]}})
+        self.assertEqual(self.api("GET", "/usage")["members"][member["id"]]["limits"]["windows"], [])
 
     def check_rendered_work_states_stop_idle_reminders(self, provider):
         self.create_group()

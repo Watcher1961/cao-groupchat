@@ -28,8 +28,10 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -456,6 +458,10 @@ def start_member(g: dict, m: dict) -> None:
     if p and p.get("installed") is False:
         raise RuntimeError(f"本机没有找到 `{p['binary']}` 命令（{p['label']} 未安装或不在 PATH 里）。"
                            f"请先安装并登录，然后在成员面板里重启该成员。")
+    if m["provider"] == "claude_code":
+        with lock:
+            if automation_settings(g)["claude_limits"]:
+                configure_claude_statusline(g, True)
     install_profile(g, m)
     q = {
         "agent_profile": profile_name(g, m),
@@ -1069,6 +1075,9 @@ def create_group(body: dict) -> dict:
     for raw in body.get("members") or []:
         g["members"].append(clean_member(raw, g["members"]))
     with lock:
+        if any(automation_settings(other)["claude_limits"] and Path(other["workdir"]).expanduser().resolve() == wd.resolve()
+               for other in groups.values()):
+            raise ValueError("该工作目录已有群开启 Claude 额度采集，请为新群使用独立目录")
         groups[gid] = g
     append_log(g, "群主", f"创建项目群「{name}」，工作目录 {wd}")
     save_state()
@@ -1110,7 +1119,7 @@ def public_group(g: dict, since: int = 0) -> dict:
 # ───────────────────────── 按群自主运行（缺省保持原行为） ─────────────────────────
 AUTOMATION_DEFAULTS = {
     "relay_limit": MAX_RELAY_HOPS, "delivery_budget": None, "idle_minutes": 0,
-    "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None,
+    "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None, "claude_limits": False,
 }
 
 
@@ -1143,6 +1152,8 @@ def update_automation(g: dict, body: dict) -> dict:
         if not isinstance(body, dict) or any(key not in AUTOMATION_DEFAULTS for key in body):
             raise ValueError("自主运行设置必须是对象，且只能包含支持的配置字段")
         settings = {**automation_settings(g), **body}
+        if type(settings["claude_limits"]) is not bool:
+            raise ValueError("claude_limits 必须是布尔值")
         for key in ("relay_limit", "delivery_budget", "reminder_limit"):
             value = settings[key]
             if key == "delivery_budget" and value is None:
@@ -1158,14 +1169,29 @@ def update_automation(g: dict, body: dict) -> dict:
         if ("coordinator_id" in body and coordinator is not None
                 and not any(m["id"] == coordinator for m in g["members"])):
             raise ValueError("协调成员不存在，请使用本群成员 ID 或 null")
-        if body and ("automation" not in g or settings != automation_settings(g)):
-            g["automation"] = settings
-            state = automation_state(g)
-            state["idle_since"] = None
-            if budget_available(g):
-                state["budget_notified"] = False
-            save_state()
-            budget_notice(g)
+        restore_project = configure_claude_statusline(g, settings["claude_limits"]) if "claude_limits" in body else lambda: None
+        previous_settings, previous_state = g.get("automation"), g.get("automation_state")
+        previous_state = dict(previous_state) if previous_state is not None else None
+        try:
+            if body and ("automation" not in g or settings != automation_settings(g)):
+                g["automation"] = settings
+                state = automation_state(g)
+                state["idle_since"] = None
+                if budget_available(g):
+                    state["budget_notified"] = False
+                save_state()
+                budget_notice(g)
+        except Exception:
+            if previous_settings is None:
+                g.pop("automation", None)
+            else:
+                g["automation"] = previous_settings
+            if previous_state is None:
+                g.pop("automation_state", None)
+            else:
+                g["automation_state"] = previous_state
+            restore_project()
+            raise
         return automation_view(g)
 
 
@@ -1256,8 +1282,111 @@ def check_idle_reminder(g: dict, now: float | None = None) -> bool:
     return True
 
 
+def claude_limits_path(g: dict) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", g["id"]):
+        raise ValueError("群标识不合法")
+    return DATA_DIR.resolve() / "claude_limits" / f"{g['id']}.json"
+
+
+def claude_statusline_entry(g: dict) -> dict:
+    return {"type": "command", "command": shlex.join([
+        sys.executable, "-I", "-B", str(HERE / "claude_statusline.py"), str(claude_limits_path(g))])}
+
+
+def atomic_project_settings(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".groupchat-settings-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            if path.exists():
+                os.chmod(temporary, path.stat().st_mode & 0o777)
+            output.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def configure_claude_statusline(g: dict, enabled: bool):
+    """Return an undo callback; never write shared/global or unowned settings."""
+    if not enabled and not automation_settings(g)["claude_limits"]:
+        return lambda: None
+    workdir = Path(g["workdir"]).expanduser().resolve()
+    path = workdir / ".claude" / "settings.local.json"
+    global_dir = (Path.home() / ".claude").resolve()
+    if (workdir == Path.home().resolve() or path.resolve().is_relative_to(global_dir)
+            or claude_limits_path(g).resolve().is_relative_to(global_dir)
+            or path.parent.is_symlink() or path.is_symlink()):
+        raise ValueError("只能配置独立项目目录，不能使用全局或符号链接的 Claude 设置")
+    if enabled and any(other.get("id") != g["id"] and
+                       Path(other["workdir"]).expanduser().resolve() == workdir for other in groups.values()):
+        raise ValueError("该工作目录被其他群使用，请使用独立目录开启 Claude 额度采集")
+    try:
+        original = path.read_bytes() if path.exists() else None
+        def invalid_constant(_):
+            raise ValueError("invalid JSON constant")
+        content = json.loads(original, parse_constant=invalid_constant) if original is not None else {}
+        if not isinstance(content, dict):
+            raise ValueError("settings must be an object")
+    except (OSError, ValueError):
+        raise ValueError("Claude 项目本地设置不是可读取的合法 JSON 对象，原文件未修改") from None
+    expected = claude_statusline_entry(g)
+    owned = content.get("statusLine") == expected
+    if enabled:
+        if "statusLine" in content and not owned:
+            raise ValueError("已有非本程序的 statusLine 状态栏，拒绝覆盖")
+        if owned:
+            return lambda: None
+        content["statusLine"] = expected
+    elif owned:
+        del content["statusLine"]
+    else:
+        return lambda: None
+    replacement = (json.dumps(content, ensure_ascii=False, indent=2) + "\n").encode() if content else None
+    try:
+        atomic_project_settings(path, replacement)
+    except OSError:
+        raise ValueError("无法原子写入 Claude 项目本地设置，请检查目录权限") from None
+    return lambda: atomic_project_settings(path, original)
+
+
+def claude_limits(g: dict) -> dict:
+    result = {"windows": [], "updated_at": None, "spend_limit": None}
+    if not automation_settings(g)["claude_limits"]:
+        return result
+    try:
+        data = json.loads(claude_limits_path(g).read_text(encoding="utf-8"))
+        updated = data.get("updated_at")
+        if type(updated) not in (int, float) or not math.isfinite(updated) or updated <= 0:
+            return result
+        limits = data.get("rate_limits")
+        if not isinstance(limits, dict):
+            return result
+        now = time.time()
+        result["updated_at"] = updated
+        for name, minutes in (("five_hour", 300), ("seven_day", 10080), ("spend_limit", None)):
+            value = limits.get(name)
+            if not isinstance(value, dict):
+                continue
+            used, resets = value.get("used_percentage"), value.get("resets_at")
+            if (type(used) not in (int, float) or type(resets) not in (int, float)
+                    or not math.isfinite(used) or not math.isfinite(resets)
+                    or not 0 <= used <= 100 or resets <= now):
+                continue
+            if name == "spend_limit":
+                result["spend_limit"] = {"used_percentage": used, "resets_at": resets}
+            else:
+                result["windows"].append({"window_minutes": minutes, "used_percent": used, "resets_at": resets,
+                                          "resets_in": max(int(resets - now), 0), "stale": False})
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return {"windows": [], "updated_at": None, "spend_limit": None}
+    return result
+
+
 # ───────────────────────── 用量与开销 ─────────────────────────
-# 数据全部来自各 CLI 写在本机的日志，不联网、不需要密钥：
+# token/费用来自各 CLI 本机日志；Claude 额度另取上述可选状态栏快照，不联网、不需要密钥：
 #   Claude Code：~/.claude/projects/<工作目录编码>/*.jsonl，每条回复带 token 用量（没有订阅剩余额度）
 #   Codex：~/.codex/sessions/**/rollout-*.jsonl，带 token 用量和账号的额度窗口（rate_limits）
 # 用系统提示词里的「项目群「群名」里的成员 **名字**」认领日志文件，所以同一目录下多个成员也分得开。
@@ -1534,6 +1663,7 @@ def group_usage(g: dict) -> dict:
     prices = all_prices()
     members, total, priced = {}, 0.0, True
     limits = None
+    claude_quota = claude_limits(g)
     for m in g["members"]:
         prov, plan = m.get("provider"), m.get("plan") or ""
         if prov == "claude_code":
@@ -1547,8 +1677,8 @@ def group_usage(g: dict) -> dict:
         # 订阅（包月）不按次计费：显示额度；API 显示花费；没选计划时两者都给，前端标“参考”
         mode = "subscription" if plan in SUBSCRIPTION_PLANS else "api" if plan == "api" else "unknown"
         members[m["id"]] = {"provider": prov, "plan": plan, "mode": mode, "usage": u,
-                            "limits": limits if prov == "codex" else None,
-                            "limits_available": prov == "codex"}
+                            "limits": limits if prov == "codex" else claude_quota if prov == "claude_code" else None,
+                            "limits_available": prov in ("codex", "claude_code")}
         if u and mode == "api":
             if u["cost"] is None:
                 priced = False
@@ -1684,6 +1814,9 @@ class H(BaseHTTPRequestHandler):
                     if method == "PUT":
                         return self._json(200, update_automation(g, self._body()))
                 if not rest and method == "DELETE":
+                    with lock:
+                        if automation_settings(g)["claude_limits"]:
+                            configure_claude_statusline(g, False)
                     for m in g["members"]:
                         stop_member(m)
                     if g.get("session_name"):

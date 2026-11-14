@@ -63,6 +63,7 @@ python3 server.py
 | reminder_cooldown_minutes | 5 | 两条自动提醒至少间隔的正数分钟数 |
 | reminder_limit | 3 | 累计提醒次数上限，0 禁止；重启不清零 |
 | coordinator_id | null | 本群协调成员 ID；未指定/成员离线时用首个在线就绪成员 |
+| claude_limits | false | 本群 Claude 状态栏额度采集；需独立工作目录，开关后重启 Claude 成员 |
 
 以下仅为配置示例，先替换实验群 ID 和实际成员 ID；Python 标准库即可调用：
 
@@ -94,9 +95,21 @@ runtime 提供 deliveries_used、budget_exhausted、reminders_sent、last_remind
 
 ### 用量与费用
 
-`GET /api/groups/{id}/usage` 解析本机 CLI 日志，支持 Claude Code 与 Codex；不是调用 CAO 用量接口。Claude Code 日志可提供 token，不能提供订阅剩余额度；Codex 可提供账号共享的额度窗口，不能当作成员独享额度。
+`GET /api/groups/{id}/usage` 从本机 CLI 日志统计 Claude Code 与 Codex 的 token；不是调用 CAO 用量接口。Codex 日志还提供账号共享的额度窗口。Claude Code 日志不含订阅额度，可按下面的开关额外采集；两者额度均不能当作成员独享额度。
 
 API 金额按内置价格和数据目录下的 `prices.json` 估算；未知价格不会得到确定总价。日志缺失或格式变化可能造成无数据，内置价格与模型推荐没有在本轮核验为最新值。
+
+#### Claude 额度采集（按群选择开启）
+
+沿用上面的 API 示例，将 `settings` 改为 `{"claude_limits": True}` 即可开启；关闭用 `{"claude_limits": False}`。默认关闭，不给开发群开启。**开启或关闭后都需要重启已有 Claude Code 成员**，不强制重启正在工作的成员；不影响 Codex 或其他 provider 的配置、推理强度和用量来源。
+
+开启会原子合并该群工作目录的 `.claude/settings.local.json`，仅添加 `statusLine`，其他键和值及原文件权限保留。已有用户状态栏、非法 JSON、符号链接、全局 Claude 目录或多个群共用工作目录时返回中文 400，原文件和开关不变。关闭或解散群只删除本程序仍持有的那一项，其他键保留；文件为空才删除，用户自行替换的状态栏不会被删。不改 CAO、`~/.claude`、项目其他设置或 `.gitignore`。
+
+项目设置也会影响在同一目录另行启动的 Claude CLI，请使用专用实验工作目录；程序拒绝其他群复用已开启的目录。当前 CAO 不提供此任务所需的成员独立 `--settings` 透传，因此这里使用群主批准的项目本地设置方案。生成命令指向仓库的 `claude_statusline.py`，仓库和 Python 的位置需保持有效。
+
+状态栏从 stdin 读取 Claude 提供的 `rate_limits`，静默写入 `GROUPCHAT_DATA/claude_limits/<群ID>.json`（原子替换）。只留 five_hour、seven_day、spend_limit 的 used_percentage/resets_at 和 updated_at；不保存工作目录、transcript 路径、正文或密钥，不输入 `/usage`，不读取 OAuth 或钥匙串。第一次模型调用前可能没有额度，各窗口可以独立缺失；过期窗口不沿用旧值。异常不输出内容、不打断 CLI。
+
+成员用量区固定显示 5 小时、7 天两条额度条及“更新于 X 分钟前”；未采集/缺失/已过重置时间显示“暂无数据”。没有 token 日志也能显示额度；API 计划的费用仍按原方式显示。usage API 的 Claude 成员 limits 含 windows、updated_at 和独立 spend_limit；后者不新增第三条 UI。一个群的 Claude 成员共用最后写入的账号额度快照，更新时间只表示采集时间。新钩子的真实 Claude 联调待群主在审查后执行，步骤见任务清单。
 
 ## 验证范围与已知限制
 
@@ -117,8 +130,8 @@ python3 -B tests/fake_cao.py --port 0             # 独立模拟 CAO，输出随
 
 模拟服务支持 `--port 0`（系统分配端口），省略参数仍默认 9889；不要占用或切换当前真实会话。导入不会启动服务。模拟状态按状态查询推进，不依赖固定延迟；`/_test/state` 提供观察，`POST /_test/terminals/{id}/next-turn` 可指定下一轮 `reply`、`hold`、`stale_polls`，`POST /_test/terminals/{id}/release` 释放本轮输出。另可用 `idle_stream` 和 `POST /_test/terminals/{id}/advance` 控制无标记/working/done 阶段；raw full 输出与 last 回复分离。Codex 的 last/full 及流式回复默认采用真实 TUI 排版：首行 `• `、非空续行前两空格、空行保留；自定义 reply 仍传逻辑正文，模拟器负责显示格式。模拟器的 input 默认清空 raw full 缓冲；`append_output=true` 选择只追加兼容路径，`complete_on_input=true` 模拟首次轮询前完成。另用 `/_test/config` 的 `hold_create/startup_hold` 控制创建与启动，`ready` 放出输入提示；`drop=true` 丢弃下一次投递，`padding_bytes` 模拟滚动 FIFO（上限 32768 字节）。会话单独保存，重复同名创建严格返回真实 400；`hold_sessions` 与 `fail_profiles` 配置可按群阻塞创建或按成员注入失败，供并发隔离验证。这些仅用于本机测试。
 
-自动套件含 102 个隔离后端单测、29 个 HTTP 集成和 10 个可选前端行为测试。单测另覆盖按群自主运行的默认隔离、配置校验、6 线程预算原子性、暂停/恢复、引用状态误判及提醒冷却/上限/排除；HTTP 增加广播预算、队列重启恢复与定向自动提醒。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗、effort 默认/校验/profile 及 Codex 本轮标记判定。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，effort 编辑、成员重启和清空配置，以及 Codex 全程 idle 时无新标记/working 不提前发言、done 后最终回复可接力，还覆盖清空后快速完成、连续相同短回复和迟到旧 done 的保护。还覆盖两种 CLI 误报 idle 的启动等待、未取得 terminal 的队列、超时/手动重试/并发防重、迟到完成、启动任务的重启恢复，以及 32KB 滚出 working 后的完成。主样本采用群主提供的 Codex 0.164.0 原生 app 后缀/ST 字节，并覆盖 BEL/旧格式兼容、未知状态及 full 起点。还覆盖两种 provider 首次轮询前完成、此前未见 working 的 32KB done 完成及无误告警、dim 占位输入框、未知特征人工兜底及发送/轮询/写盘异常恢复。另覆盖同群线程并发只创建一次、全离线复用/丢失重建、跨群不阻塞和启动失败恢复，以及 GET 200 terminated 失败记录下的并发重建。集成测试以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
+自动套件含 117 个隔离后端单测、30 个 HTTP 集成和 14 个可选前端行为测试。新增 Claude 额度覆盖静默脚本过滤/异常/原子替换、项目状态栏归属和回滚、HTTP 开关与成员重启以及前端缺失窗口/更新时间。单测另覆盖按群自主运行的默认隔离、配置校验、6 线程预算原子性、暂停/恢复、引用状态误判及提醒冷却/上限/排除；HTTP 增加广播预算、队列重启恢复与定向自动提醒。单测覆盖隔离导入、提及、接力上限、静默回复、日志幂等、输出清洗、effort 默认/校验/profile 及 Codex 本轮标记判定。集成测试通过 HTTP 验证建群、邀请入群、群主消息、自动转发、残留 completed 防误判和后端重启后的数据恢复，effort 编辑、成员重启和清空配置，以及 Codex 全程 idle 时无新标记/working 不提前发言、done 后最终回复可接力，还覆盖清空后快速完成、连续相同短回复和迟到旧 done 的保护。还覆盖两种 CLI 误报 idle 的启动等待、未取得 terminal 的队列、超时/手动重试/并发防重、迟到完成、启动任务的重启恢复，以及 32KB 滚出 working 后的完成。主样本采用群主提供的 Codex 0.164.0 原生 app 后缀/ST 字节，并覆盖 BEL/旧格式兼容、未知状态及 full 起点。还覆盖两种 provider 首次轮询前完成、此前未见 working 的 32KB done 完成及无误告警、dim 占位输入框、未知特征人工兜底及发送/轮询/写盘异常恢复。另覆盖同群线程并发只创建一次、全离线复用/丢失重建、跨群不阻塞和启动失败恢复，以及 GET 200 terminated 失败记录下的并发重建。集成测试以独立子进程运行原始 `server.py`，使用随机端口、临时 HOME/数据/工作目录和不继承凭据的环境；不连接 9889，不访问真实 `~/.cao-groupchat`，不启动 provider CLI。等待使用有超时的轮询，失败也回收子进程和目录。
 
-前端测试通过可选的本机 Node 执行真实内联脚本，使用最小 DOM 夹具验证强度选项、provider 切换提交、演示邀请编辑和卡片，以及投递不确定时的状态/重发、抽屉/焦点/缩放/选群与手机演示工作流；不安装 npm 包，不增加应用依赖。未安装 Node 时这 10 项会明确跳过，不能记为前端已验证。浏览器排版及真实 provider 联调需单独验收。
+前端测试通过可选的本机 Node 执行真实内联脚本，使用最小 DOM 夹具验证强度选项、provider 切换提交、演示邀请编辑和卡片，以及投递不确定时的状态/重发、抽屉/焦点/缩放/选群与手机演示工作流；不安装 npm 包，不增加应用依赖。未安装 Node 时这 14 项会明确跳过，不能记为前端已验证。浏览器排版及真实 provider 联调需单独验收。
 
 中文界面和演示模式的逐步人工结果见[任务清单](docs/TASKS.md)：2026-11-14 群主第 1–6、8 步通过；第 7 步主题正常，但宽度小于 1100px 时右侧成员/日志面板不可达，700px 时左侧群列表也不可达，第二轮第 5 项 `0c3d33b` 已审查通过，群主在 375×812、375×667、800/1100px、深浅色下完成抽屉/建群/编辑/日志等验收并结案；媒体查询变化收尾修复待复审，实际 Tab 循环及故意 CLI 启动失败恢复待验证；Node 最小 DOM 不能验证布局或横向溢出。模拟集成通过不代表真实 provider 联调通过。文档修改使用链接、隐私、范围和 Git 差异检查验证。
