@@ -11,12 +11,12 @@
 | 持久化与共享日志 | 群和消息写入数据目录的 `groups.json`；先写临时文件再替换；工作目录内追加 `GROUP_LOG.md` |
 | 用量解析 | 读取本机 Claude Code/Codex CLI JSONL，按成员标记认领并估算费用；可选读取 Claude 状态栏过滤快照 |
 | `claude_statusline.py` | 标准库静默 stdin 采集器，只原子保存额度窗口及更新时间；项目本地 statusLine 调用 |
-| `tests/test_claude_limits.py` | 15 项脚本、项目设置所有权/回滚、额度缓存及真实输入框字节回归 |
+| `tests/test_claude_limits.py` | 19 项脚本、项目设置所有权/回滚、生命周期容错、额度缓存及真实输入框字节回归 |
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 30 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
-| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 14 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
+| `tests/test_integration.py` | 31 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 16 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
 
@@ -99,13 +99,13 @@
 
 ## Claude 状态栏额度采集
 
-群主批准方案 B：不改 CAO；仅显式 `PUT /api/groups/{id}/automation` 中 `claude_limits=true` 的群配置项目本地状态栏，默认 false。已安装 CAO 的 claudeConfig 只转接 effort/fallback_model，未提供成员独立 `--settings` 透传；不使用全局设置或 CLAUDE_CONFIG_DIR。开关只改变后续启动的 CLI，已有成员须由群主重启；成员启动前再次检查/补齐本程序设置，失败走原启动错误路径，不绕过冲突。
+群主批准方案 B：不改 CAO；仅显式 `PUT /api/groups/{id}/automation` 中 `claude_limits=true` 的群配置项目本地状态栏，默认 false。已安装 CAO 的 claudeConfig 只转接 effort/fallback_model，未提供成员独立 `--settings` 透传；不使用全局设置或 CLAUDE_CONFIG_DIR。开关只改变后续启动的 CLI，已有成员须由群主重启；成员启动前再次检查/补齐本程序设置；可选配置失败时保留原文件，只发一条固定中文系统提示并继续创建终端，不绕过冲突覆盖。显式开启 API 仍严格返回 400；不能代替 Claude CLI 对用户设置自身的校验。
 
-- 配置阶段持全局状态锁，严格检查 bool 和全部设置后读取 `<workdir>/.claude/settings.local.json`，要求合法 JSON 对象。只合并 statusLine；完整 `{type, command}` 与本群预期一致才属于本程序（命令用 shlex 引用当前 Python、仓库脚本和本群缓存路径）。用户状态栏存在时返回中文 400，不改文件、不停止终端。禁用只删仍归本程序所有的键，空对象删文件，外部替换的状态栏保留；解散已开启的群也清理自有项。默认关闭的群重复关闭不读取项目设置。
+- 配置阶段持全局状态锁，严格检查 bool 和全部设置后读取 `<workdir>/.claude/settings.local.json`，要求合法 JSON 对象。只合并 statusLine；完整 `{type, command}` 与本群预期一致才属于本程序（命令用 shlex 引用当前 Python、仓库脚本和本群缓存路径）。用户状态栏存在时返回中文 400，不改文件、不停止终端。禁用只删仍归本程序所有的键，空对象删文件，外部替换的状态栏保留；解散已开启的群也尝试清理自有项。关闭/解散时遇到非自有、损坏、迁移后命令不符或写入异常，捕获后保留原文件、记录中文系统提示并返回 warnings，仍关闭开关或解散群；前端解散后展示此警告。警告不附设置内容、命令路径或任意异常文本。默认关闭的群重复关闭不读取项目设置。
 - 写入采用同目录临时文件 + os.replace，已有文件权限保留；设置持久化失败会恢复 automation/runtime 和原文件字节。此回滚是进程内补偿，不保证跨进程编辑或崩溃的多文件事务。不开启采集时不创建 `.claude/`。拒绝 HOME/全局 Claude 目录、设置符号链接以及缓存落在全局 Claude 目录。已注册多个群共用目录时拒绝开启；已开启目录也不允许新群复用，防止未开启的群被间接配置。不能隔离人在同一项目另开的 Claude CLI，需专用实验目录。
 - 命令以 `-I -B` 调用标准库采集器，限制输入 JSON 长度。只白名单 rate_limits 的 five_hour/seven_day/spend_limit，各窗口只留有限数值 used_percentage（0–100）和未来 resets_at；另存 updated_at。缺失窗口不继承上一快照；不保存 cwd、transcript 路径、正文或任何鉴权字段。异常全部吞掉且 stdout/stderr 为空；临时文件原子替换到 `<GROUPCHAT_DATA>/claude_limits/<群ID>.json`。不发送 `/usage`，不读取 OAuth/钥匙串，不更改用户或项目的忽略规则。
-- 后端再次逐窗校验，已过 resets_at 的窗口不返回；坏文件/不存在/关闭时 windows=[]、updated_at=null、spend_limit=null。有效快照更新时间不因窗口过期抹除。usage 的每个 Claude 成员共享本群最新 windows（300/10080 分钟，used_percent、resets_at、resets_in、stale=false）和 updated_at；spend_limit 独立返回，不画第三条额度条。额度反映登录账号，不能按成员拆分。关闭后不读取旧缓存，在途旧 CLI 仍可能写入过滤快照，须重启后才彻底停止采集。
-- 前端复用现有 qrow/qbar 及颜色令牌，固定 5 小时/7 天，缺失或过期显示“暂无数据”；显示“更新于 X 分钟前”，刷新签名包含当前分钟，空快照显示更新时间暂无数据。即使 usage=null 也显示窗口；原 API 费用/token 行保留。
+- 后端再次逐窗校验，已过 resets_at 的窗口不返回；开启但坏文件/不存在时 windows=[]、updated_at=null、spend_limit=null；未开启时成员 limits=null、limits_available=false，完全跳过缓存读取。有效快照更新时间不因窗口过期抹除。usage 的每个 Claude 成员共享本群最新 windows（300/10080 分钟，used_percent、resets_at、resets_in、stale=false）和 updated_at；spend_limit 独立返回，不画第三条额度条。额度反映登录账号，不能按成员拆分。关闭后不读取旧缓存，在途旧 CLI 仍可能写入过滤快照，须重启后才彻底停止采集。
+- 前端仅对 limits_available=true 的 Claude 显示额度，未开启时保留原订阅 /usage 提示和 API 行，且不画额度条/更新时间（即使响应残留旧 windows）。开启后复用现有 qrow/qbar 及颜色令牌，固定 5 小时/7 天，缺失或过期显示“暂无数据”；显示“更新于 X 分钟前”，刷新签名包含当前分钟，空快照显示更新时间暂无数据。即使 usage=null 也显示窗口；原 API 费用/token 行保留。
 
 兼容依据（2026-11-14，codex）：只读真实 Claude 屏幕得到 220 个 U+2500 横线包围的 `❯\xa0` 输入行（UTF-8 `e29dafc2a0`），已作为独立就绪单测。提取本机 CAO 纯正则及 extract_last_message_from_script，以该真实框加合成回复验证提取结果只剩回复正文；脚本进程测试确认不输出任何字节。未创建/重启真实成员，未给开发群开启；这不是新状态栏钩子的端到端联调结论，启用后就绪和回复仍待群主真实验证。
 

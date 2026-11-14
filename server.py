@@ -461,7 +461,7 @@ def start_member(g: dict, m: dict) -> None:
     if m["provider"] == "claude_code":
         with lock:
             if automation_settings(g)["claude_limits"]:
-                configure_claude_statusline(g, True)
+                optional_claude_statusline(g, True)
     install_profile(g, m)
     q = {
         "agent_profile": profile_name(g, m),
@@ -1169,7 +1169,12 @@ def update_automation(g: dict, body: dict) -> dict:
         if ("coordinator_id" in body and coordinator is not None
                 and not any(m["id"] == coordinator for m in g["members"])):
             raise ValueError("协调成员不存在，请使用本群成员 ID 或 null")
-        restore_project = configure_claude_statusline(g, settings["claude_limits"]) if "claude_limits" in body else lambda: None
+        restore_project, warning = lambda: None, None
+        if "claude_limits" in body:
+            if settings["claude_limits"]:
+                restore_project = configure_claude_statusline(g, True)
+            else:
+                restore_project, warning = optional_claude_statusline(g, False)
         previous_settings, previous_state = g.get("automation"), g.get("automation_state")
         previous_state = dict(previous_state) if previous_state is not None else None
         try:
@@ -1192,7 +1197,10 @@ def update_automation(g: dict, body: dict) -> dict:
                 g["automation_state"] = previous_state
             restore_project()
             raise
-        return automation_view(g)
+        result = automation_view(g)
+        if warning:
+            result["warnings"] = [warning]
+        return result
 
 
 def budget_notice(g: dict) -> None:
@@ -1342,6 +1350,8 @@ def configure_claude_statusline(g: dict, enabled: bool):
         content["statusLine"] = expected
     elif owned:
         del content["statusLine"]
+    elif "statusLine" in content:
+        raise ValueError("statusLine 已不属于本程序，保留原设置")
     else:
         return lambda: None
     replacement = (json.dumps(content, ensure_ascii=False, indent=2) + "\n").encode() if content else None
@@ -1350,6 +1360,18 @@ def configure_claude_statusline(g: dict, enabled: bool):
     except OSError:
         raise ValueError("无法原子写入 Claude 项目本地设置，请检查目录权限") from None
     return lambda: atomic_project_settings(path, original)
+
+
+def optional_claude_statusline(g: dict, enabled: bool):
+    """Optional setup/cleanup cannot prevent member or group lifecycle actions."""
+    try:
+        return configure_claude_statusline(g, enabled), None
+    except Exception:
+        # Never include settings contents, command paths or arbitrary errors.
+        warning = ("Claude 额度采集设置不可用，已跳过本次配置；成员继续启动。请检查项目本地设置。" if enabled else
+                   "Claude 额度采集设置未清理（文件不可用或不再归本程序所有），已保留原文件；关闭或解散继续。")
+        add_msg(g, "system", "系统", warning, log=False)
+        return lambda: None, warning
 
 
 def claude_limits(g: dict) -> dict:
@@ -1663,7 +1685,8 @@ def group_usage(g: dict) -> dict:
     prices = all_prices()
     members, total, priced = {}, 0.0, True
     limits = None
-    claude_quota = claude_limits(g)
+    claude_enabled = automation_settings(g)["claude_limits"]
+    claude_quota = claude_limits(g) if claude_enabled else None
     for m in g["members"]:
         prov, plan = m.get("provider"), m.get("plan") or ""
         if prov == "claude_code":
@@ -1678,7 +1701,7 @@ def group_usage(g: dict) -> dict:
         mode = "subscription" if plan in SUBSCRIPTION_PLANS else "api" if plan == "api" else "unknown"
         members[m["id"]] = {"provider": prov, "plan": plan, "mode": mode, "usage": u,
                             "limits": limits if prov == "codex" else claude_quota if prov == "claude_code" else None,
-                            "limits_available": prov in ("codex", "claude_code")}
+                            "limits_available": prov == "codex" or (prov == "claude_code" and claude_enabled)}
         if u and mode == "api":
             if u["cost"] is None:
                 priced = False
@@ -1814,9 +1837,10 @@ class H(BaseHTTPRequestHandler):
                     if method == "PUT":
                         return self._json(200, update_automation(g, self._body()))
                 if not rest and method == "DELETE":
+                    warning = None
                     with lock:
                         if automation_settings(g)["claude_limits"]:
-                            configure_claude_statusline(g, False)
+                            _, warning = optional_claude_statusline(g, False)
                     for m in g["members"]:
                         stop_member(m)
                     if g.get("session_name"):
@@ -1828,7 +1852,7 @@ class H(BaseHTTPRequestHandler):
                     with lock:
                         groups.pop(g["id"], None)
                     save_state()
-                    return self._json(200, {"ok": True})
+                    return self._json(200, {"ok": True, **({"warnings": [warning]} if warning else {})})
                 if rest == ["messages"] and method == "POST":
                     return self._json(201, post_message(g, self._body().get("text", "")))
                 if rest == ["usage"] and method == "GET":

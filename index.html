@@ -657,7 +657,8 @@ function renderHead(){
     ${spendHTML()}<div class="stack">${g.members.slice(0,6).map(m=>avHTML(m,"sm",true)).join("")}</div>
     <button class="ghostbtn danger" id="delGroup" title="解散群" aria-label="解散群">${ico("trash")}<span class="head-delete-label">解散</span></button>`;
   $("#delGroup").onclick=async()=>{ if(!ask(`解散「${g.name}」并关闭所有成员的终端？共享日志文件会保留。`)) return;
-    await api("DELETE",`/groups/${g.id}`); S.cur=null; S.group=null; S.msgs=[]; await loadGroups(); renderAll(); };
+    const result=await api("DELETE",`/groups/${g.id}`); S.cur=null; S.group=null; S.msgs=[]; await loadGroups(); renderAll();
+    if(result.warnings?.length) alert(result.warnings.join("\n")); };
 }
 function statusOf(m){
   const delivery={uncertain:"delivery_uncertain",not_ready:"not_ready",failed:"delivery_failed",waiting_ready:"waiting_ready",waiting_user:"waiting_user_answer"};
@@ -738,7 +739,7 @@ function usageHTML(m){
   const u=x.usage, rows=[];
   const claude=x.provider==="claude_code", limits=x.limits;
   const windows=claude?[300,10080].map(n=>(limits?.windows||[]).find(w=>w.window_minutes===n)||{window_minutes:n}):(limits?.windows||[]);
-  if(claude||(windows.length&&x.mode!=="api")){
+  if((claude&&x.limits_available)||(!claude&&windows.length&&x.mode!=="api")){
     windows.forEach(w=>{
       const known=Number.isFinite(w.used_percent), p=w.stale||!known?0:Math.min(100,Math.max(0,w.used_percent)), cls=p>=85?"hi":p>=60?"mid":"";
       const label=claude&&w.window_minutes===10080?"7 天":winLabel(w.window_minutes);

@@ -1,8 +1,23 @@
 const assert=require("node:assert/strict");
-const {run}=require("./frontend_dom.js")(process.argv[2]);
+const {run,alerts}=require("./frontend_dom.js")(process.argv[2]);
 run('Date.now=()=>1000000;S.usage={members:{cc:{provider:"claude_code",mode:"subscription",usage:null,limits_available:true,limits:null}}}');
 const html=()=>run('usageHTML({id:"cc",provider:"claude_code",terminal_id:"t"})');
 const cases={
+  async dissolve_warning(){
+    run('S.usage=null;S.group={id:"g",name:"测试群",workdir:"synthetic-project",members:[]};loadGroups=async()=>{};renderAll=()=>{};api=async()=>({ok:true,warnings:["额度采集设置未清理"]});renderHead()');
+    await run('document.querySelector("#delGroup").onclick()');
+    assert.deepEqual(alerts,["额度采集设置未清理"]);assert.equal(run('S.group'),null);
+    run('S.group={id:"g2",name:"普通群",members:[]};api=async()=>({ok:true});renderHead()');
+    await run('document.querySelector("#delGroup").onclick()');
+    assert.equal(alerts.length,1);assert.equal(run('S.group'),null);
+  },
+  disabled(){
+    run('S.usage.members.cc.limits_available=false;S.usage.members.cc.limits={windows:[{window_minutes:300,used_percent:42}],updated_at:880}');
+    let value=html();assert.match(value,/<code>\/usage<\/code>/);
+    assert.doesNotMatch(value,/class="qrow"|5 小时额度|7 天额度|更新于|暂无数据/);
+    run('S.usage.members.cc.mode="api";S.usage.members.cc.usage={cost:2,tokens:{in:1,out:1,cache_read:0,cache_write:0}}');
+    value=html();assert.match(value,/本群开销/);assert.doesNotMatch(value,/class="qrow"|更新时间|\/usage/);
+  },
   partial(){
     run('S.usage.members.cc.limits={windows:[{window_minutes:300,used_percent:42,resets_in:900,stale:false}],updated_at:880}');
     const value=html();assert.match(value,/5 小时额度/);assert.match(value,/7 天额度/);

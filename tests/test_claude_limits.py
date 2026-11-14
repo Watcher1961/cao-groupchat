@@ -1,6 +1,7 @@
 """Project-local opt-in and privacy-preserving Claude statusLine capture."""
 
 import copy
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -132,6 +133,90 @@ class ClaudeLimitsTests(ServerTestCase):
             self.assertEqual(handler._route("DELETE"), (200, {"ok": True}))
         self.assertEqual(json.loads(self.settings_file.read_text()), {"other": 42})
         self.assertNotIn(self.group["id"], self.server.groups)
+
+    def quota_failure_cases(self):
+        return (("foreign", '{"statusLine":{"type":"command","command":"user-status"}}'),
+                ("broken", '{broken'),
+                ("moved", '{"statusLine":{"type":"command","command":"python moved/claude_statusline.py moved/cache.json"}}'),
+                ("write_failure", '{}'))
+
+    def test_optional_quota_failure_does_not_block_claude_start(self):
+        for reason, raw in self.quota_failure_cases():
+            with self.subTest(reason=reason):
+                self.put_settings('{}')
+                self.server.update_automation(self.group, {"claude_limits": True})
+                self.put_settings(raw)
+                self.group["messages"].clear()
+                member = self.server.clean_member({"name": "额度成员", "provider": "claude_code", "effort": "low"}, [])
+                self.group["members"] = [member]
+                failure = patch.object(self.server, "atomic_project_settings", side_effect=OSError("synthetic disk failure"))
+                with patch.object(self.server, "providers_with_install", return_value=[]), \
+                     patch.object(self.server, "install_profile") as install, \
+                     patch.object(self.server, "start_group_terminal", return_value={"id": "new-terminal", "status": "idle"}), \
+                     failure if reason == "write_failure" else nullcontext():
+                    self.server.start_member(self.group, member)
+                install.assert_called_once_with(self.group, member)
+                self.assertEqual(member["terminal_id"], "new-terminal")
+                self.assertEqual(member["effort"], "low")
+                self.assertEqual(self.settings_file.read_text(), raw)
+                self.assertEqual(len(self.group["messages"]), 1)
+                self.assertEqual(self.group["messages"][0]["kind"], "system")
+                self.assertIn("继续启动", self.group["messages"][0]["text"])
+
+    def test_disabling_survives_foreign_broken_moved_or_unwritable_settings(self):
+        for reason, raw in self.quota_failure_cases():
+            with self.subTest(reason=reason):
+                self.put_settings('{}')
+                self.server.update_automation(self.group, {"claude_limits": True})
+                if reason == "write_failure":
+                    raw = self.settings_file.read_text()
+                self.put_settings(raw)
+                self.group["messages"].clear()
+                failure = patch.object(self.server, "atomic_project_settings", side_effect=OSError("synthetic disk failure"))
+                with failure if reason == "write_failure" else nullcontext():
+                    result = self.server.update_automation(self.group, {"claude_limits": False})
+                self.assertFalse(result["settings"]["claude_limits"])
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertEqual(self.settings_file.read_text(), raw)
+                self.assertEqual(len(self.group["messages"]), 1)
+
+    def test_deleting_survives_foreign_broken_moved_or_unwritable_settings(self):
+        for reason, raw in self.quota_failure_cases():
+            with self.subTest(reason=reason):
+                self.server.groups[self.group["id"]] = self.group
+                self.put_settings('{}')
+                self.server.update_automation(self.group, {"claude_limits": True})
+                if reason == "write_failure":
+                    raw = self.settings_file.read_text()
+                self.put_settings(raw)
+                self.group["messages"].clear()
+                handler = object.__new__(self.server.H)
+                handler.path = f"/api/groups/{self.group['id']}"
+                handler._json = lambda code, value: (code, value)
+                failure = patch.object(self.server, "atomic_project_settings", side_effect=OSError("synthetic disk failure"))
+                with patch.object(self.server, "stop_member") as stop, \
+                     failure if reason == "write_failure" else nullcontext():
+                    code, result = handler._route("DELETE")
+                self.assertEqual((code, result["ok"]), (200, True))
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertEqual(stop.call_count, len(self.group["members"]))
+                self.assertNotIn(self.group["id"], self.server.groups)
+                self.assertEqual(self.settings_file.read_text(), raw)
+
+    def test_disabled_quota_keeps_legacy_usage_contract(self):
+        member = {**self.developer, "provider": "claude_code", "plan": "pro"}
+        self.group["members"] = [member]
+        with patch.object(self.server, "all_prices", return_value={}), \
+             patch.object(self.server, "claude_usage", return_value=None):
+            for enabled in (False, True, False):
+                if enabled or "automation" in self.group:
+                    self.server.update_automation(self.group, {"claude_limits": enabled})
+                usage = self.server.group_usage(self.group)["members"][member["id"]]
+                self.assertEqual(usage["limits_available"], enabled)
+                if enabled:
+                    self.assertEqual(usage["limits"]["windows"], [])
+                else:
+                    self.assertIsNone(usage["limits"])
 
     def test_foreign_statusline_and_invalid_json_refuse_without_any_changes(self):
         for raw in ('{"statusLine":{"type":"command","command":"user-status"}}',

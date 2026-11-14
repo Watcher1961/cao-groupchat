@@ -29,6 +29,12 @@ class FrontendEffortTests(unittest.TestCase):
     def test_claude_quota_independent_windows_and_update_age(self):
         self.check_ui("partial", "frontend_limits.js")
 
+    def test_disabled_claude_quota_preserves_original_hint_and_api_cost(self):
+        self.check_ui("disabled", "frontend_limits.js")
+
+    def test_dissolve_displays_optional_quota_cleanup_warning_only_when_present(self):
+        self.check_ui("dissolve_warning", "frontend_limits.js")
+
     def test_claude_quota_missing_data_keeps_both_bars_and_api_cost(self):
         self.check_ui("missing", "frontend_limits.js")
 

@@ -751,7 +751,47 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads(settings_file.read_text()), settings)
         self.api("PUT", "/automation", {"claude_limits": False})
         self.assertEqual(json.loads(settings_file.read_text()), {"permissions": {"allow": ["Read"]}})
-        self.assertEqual(self.api("GET", "/usage")["members"][member["id"]]["limits"]["windows"], [])
+        self.assertIsNone(self.api("GET", "/usage")["members"][member["id"]]["limits"])
+
+    def test_claude_quota_settings_failures_do_not_block_restart_disable_or_dissolve(self):
+        group = self.create_group()
+        member = self.invite("额度容错", "claude_code", "developer", effort="low", plan="pro")
+        usage = self.api("GET", "/usage")["members"][member["id"]]
+        self.assertFalse(usage["limits_available"])
+        self.assertIsNone(usage["limits"])
+        settings_file = Path(group["workdir"]) / ".claude" / "settings.local.json"
+        for raw in ('{"statusLine":{"type":"command","command":"user-bar"}}', '{broken'):
+            settings_file.parent.mkdir(exist_ok=True)
+            settings_file.write_text('{}')
+            self.api("PUT", "/automation", {"claude_limits": True})
+            settings_file.write_text(raw)
+            old_tid = self.api("GET")["members"][0]["terminal_id"]
+            self.api("POST", f"/members/{member['id']}/restart", {})
+            def settled():
+                current = self.api("GET")["members"][0]
+                return current if current["status"] == "failed" or (
+                    current["terminal_id"] and current["terminal_id"] != old_tid and
+                    current.get("ready_terminal") == current["terminal_id"]) else None
+            current = self.until("quota failure does not block member restart", settled)
+            self.assertNotEqual(current["status"], "failed")
+            self.assertEqual(current["effort"], "low")
+            self.next_turn(current["terminal_id"], "配置冲突仍能回复")
+            previous = len(self.replies())
+            self.api("POST", "/messages", {"text": "只回复测试内容"})
+            self.assertEqual(self.wait_replies(previous + 1)[-1]["text"], "配置冲突仍能回复")
+            result = self.api("PUT", "/automation", {"claude_limits": False})
+            self.assertFalse(result["settings"]["claude_limits"])
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertEqual(settings_file.read_text(), raw)
+            self.assertFalse(self.api("GET", "/usage")["members"][member["id"]]["limits_available"])
+        settings_file.write_text('{}')
+        self.api("PUT", "/automation", {"claude_limits": True})
+        settings_file.write_text('{broken')
+        result = self.api("DELETE")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertEqual(settings_file.read_text(), '{broken')
+        self.assertEqual(self.http(self.server_url, "GET", "/api/groups"), [])
 
     def check_rendered_work_states_stop_idle_reminders(self, provider):
         self.create_group()
