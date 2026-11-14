@@ -177,6 +177,8 @@ def load_state() -> None:
             groups = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             for group in groups.values():
                 for member in group["members"]:
+                    member["permission_mode"] = clean_permission_mode(
+                        member.get("provider") or "claude_code", member.get("permission_mode"), strict=False)
                     if member.get("delivery_state") == "dispatching":
                         # The process may have died after CAO accepted the input.
                         # Keep polling and permit manual recovery; never auto-resend.
@@ -290,6 +292,17 @@ def clean_effort(provider: str, value) -> str:
     return effort
 
 
+def clean_permission_mode(provider: str, value, *, strict: bool = True) -> str:
+    if provider != "claude_code":
+        return ""
+    if isinstance(value, str) and value in ("", "acceptEdits", "plan"):
+        return value
+    if strict:
+        raise ValueError("Claude Code 权限模式只支持默认（空字符串）、acceptEdits 或 plan")
+    # Previously saved or in-memory legacy values must not break CLI startup.
+    return ""
+
+
 def profile_name(g: dict, m: dict) -> str:
     return f"grp_{g['id']}_{m['id']}"
 
@@ -320,8 +333,9 @@ def build_profile(g: dict, m: dict) -> str:
         fm.append(f"role: {m['role']}")
     fm.append("allowedTools:")
     fm += [f"  - \"{t}\"" for t in tools]
-    if m["provider"] == "claude_code" and m.get("permission_mode"):
-        fm.append(f"permissionMode: {m['permission_mode']}")
+    permission_mode = clean_permission_mode(m["provider"], m.get("permission_mode"), strict=False)
+    if permission_mode:
+        fm.append(f"permissionMode: {permission_mode}")
     fm.append("---")
     log_rule = (
         f"每完成一个实际动作（修改文件、运行命令、做出决定），立即在共享日志 `{log_path(g)}` 末尾追加一行，格式：\n"
@@ -946,7 +960,7 @@ def clean_member(raw: dict, existing: list[dict]) -> dict:
         "role": raw.get("role") or "developer",
         "tools": tools,
         "duty": (raw.get("duty") or "").strip(),
-        "permission_mode": raw.get("permission_mode") or "",
+        "permission_mode": clean_permission_mode(provider, raw.get("permission_mode", "")),
         "color": raw.get("color") or "",
         "terminal_id": None,
         "status": "new",

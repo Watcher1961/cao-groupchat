@@ -711,6 +711,68 @@ class IntegrationTests(unittest.TestCase):
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/advance")
         self.assertEqual([m["text"] for m in self.wait_replies(1)], [final])
 
+    def test_invalid_permission_modes_do_not_disrupt_running_member(self):
+        self.create_group()
+        member = self.invite("权限测试", "claude_code", "developer",
+                             permission_mode="acceptEdits", effort="low")
+        before = self.fake_state()
+        groups = self.http(self.server_url, "GET", "/api/groups")
+        invalid = {"name": "权限测试", "provider": "claude_code",
+                   "permission_mode": "bogus", "effort": "low"}
+        requests = [
+            ("POST", "/api/groups", {"name": "非法权限群", "workdir": str(self.root / "invalid"),
+                                     "members": [{"name": "合法成员", "provider": "claude_code"}, invalid]}),
+            ("POST", self.group_path + "/members", {**invalid, "name": "非法成员"}),
+            ("PUT", self.group_path + f"/members/{member['id']}", invalid),
+        ]
+        for method, path, body in requests:
+            with self.assertRaises(error.HTTPError) as caught:
+                self.http(self.server_url, method, path, body)
+            with caught.exception as response:
+                self.assertEqual(response.code, 400)
+                self.assertIn("权限模式", json.load(response)["error"])
+            self.assertEqual(self.http(self.server_url, "GET", "/api/groups"), groups)
+            self.assertEqual(self.api("GET")["members"], [member])
+            state = self.fake_state()
+            for key in ("profiles", "create_requests", "sessions"):
+                self.assertEqual(state[key], before[key])
+            self.assertEqual(set(state["terminals"]), {member["terminal_id"]})
+        self.next_turn(member["terminal_id"], "非法配置已拒绝，原成员仍可回复")
+        self.api("POST", "/messages", {"text": "@权限测试 继续回复"})
+        self.assertEqual([m["text"] for m in self.wait_replies(1)], ["非法配置已拒绝，原成员仍可回复"])
+
+    def test_legacy_permission_modes_default_on_load_and_member_restart(self):
+        self.create_group()
+        codex = self.invite("编码", "codex", "developer", permission_mode="bogus", effort="xhigh")
+        self.assertEqual(codex["permission_mode"], "")
+        claude = self.invite("权限测试", "claude_code", "reviewer", permission_mode="plan", effort="low")
+        state = self.fake_state()
+        self.assertNotIn("permissionMode:", state["profiles"][state["terminals"][codex["terminal_id"]]["profile"]])
+        self.assertIn("permissionMode: plan\n", state["profiles"][state["terminals"][claude["terminal_id"]]["profile"]])
+        self.until("silent notices finish", lambda: all(not m.get("pending") and not m.get("queued_count")
+                                                       for m in self.api("GET")["members"]))
+        self.stopped_server = self.server
+        self.stop_process(self.stopped_server)
+        saved = json.loads((self.data / "groups.json").read_text())
+        saved_group = saved[self.group_path.rsplit("/", 1)[1]]
+        for member in saved_group["members"]:
+            member["permission_mode"] = "bogus" if member["provider"] == "claude_code" else "plan"
+        (self.data / "groups.json").write_text(json.dumps(saved))
+        self.start_server()
+        restored = self.api("GET")["members"]
+        self.assertEqual([(m["id"], m["permission_mode"], m["effort"]) for m in restored],
+                         [(codex["id"], "", "xhigh"), (claude["id"], "", "low")])
+        self.api("POST", f"/members/{claude['id']}/restart", {})
+        def restarted():
+            current = next(m for m in self.api("GET")["members"] if m["id"] == claude["id"])
+            return current if current["terminal_id"] and current["terminal_id"] != claude["terminal_id"] and \
+                current.get("ready_terminal") == current["terminal_id"] else None
+        current = self.until("legacy member restarts with default permissions", restarted)
+        state = self.fake_state()
+        profile = state["profiles"][state["terminals"][current["terminal_id"]]["profile"]]
+        self.assertNotIn("permissionMode:", profile)
+        self.assertIn("claudeConfig:\n  effort: low\n", profile)
+
     def test_effort_survives_edit_member_restart_and_server_restore(self):
         self.create_group()
         member = self.invite("强度测试", "codex", "developer", effort="xhigh")
