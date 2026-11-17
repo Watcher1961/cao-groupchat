@@ -493,10 +493,14 @@ class Mock {
     this.msg(g,"system","系统",`${m.name} 已入群，终端 ${m.terminal_id}。（演示）`);
     this.log(g,"群主",`邀请 ${m.name} 入群：provider=${m.provider}，角色=${m.role}，权限=${eff(m).join(",")}，职责=${m.duty||"未指定"}`); }, 600+Math.random()*700); }
   mentions(g,text,ex){ return g.members.filter(x=>x.id!==ex && text.includes("@"+x.name)); }
-  deliver(g,m,text,hops){ m.status="processing";
+  drain(g,m){if(m.status!=="processing"&&m.outbox?.length&&(!g.automation?.quota_enabled||m.quota_state==="ok")){const job=m.outbox.shift();this.deliver(g,m,job.text,job.hops);}}
+  deliver(g,m,text,hops){
+    if(g.automation?.quota_enabled&&(m.quota_state==="exhausted"||m.quota_state==="near"||m.status==="processing")){(m.outbox??=[]).push({text,hops});return;}
+    m.status="processing";
     setTimeout(()=>{ m.status="idle"; const reply=this.fake(g,m,text,hops); this.msg(g,"agent",m.name,reply,m.id);
       (reply.match(/^\s*\[日志\]\s*(.+)$/gm)||[]).forEach(l=>this.log(g,m.name,l.replace(/^\s*\[日志\]\s*/,"")));
       const t=this.mentions(g,reply,m.id); if(t.length&&hops<6) t.forEach(x=>this.deliver(g,x,`[来自 ${m.name}] ${reply}`,hops+1));
+      this.drain(g,m);
     }, 1400+Math.random()*1800); }
   fake(g,m,text,hops){
     const others=g.members.filter(x=>x.id!==m.id), rev=others.find(x=>x.role==="reviewer"), dev=others.find(x=>x.role==="developer");
@@ -524,6 +528,11 @@ class Mock {
     const r=p.slice(2);
     if(!r.length&&method==="GET") return this.pub(g,+q.get("since")||0);
     if(!r.length&&method==="DELETE"){ delete this.groups[g.id]; return {ok:true}; }
+    if(r[0]==="automation"){
+      if(method==="PUT") {g.automation={quota_enabled:false,...g.automation,...body};
+        if(!g.automation.quota_enabled)g.members.forEach(m=>{m.quota_state="ok";this.drain(g,m);});}
+      return {settings:{quota_enabled:false,...g.automation},runtime:{}};
+    }
     if(r[0]==="usage") return {members:{},api_cost:0,api_cost_complete:true,prices_file:"~/.cao-groupchat/prices.json"};
     if(r[0]==="log") return {path:g.workdir.replace(/\/$/,"")+"/GROUP_LOG.md",content:this.logs[g.id]||""};
     if(r[0]==="messages"){ const text=body.text.trim(); let t=this.mentions(g,text);
@@ -534,6 +543,12 @@ class Mock {
     if(method==="DELETE"){ g.members.splice(g.members.indexOf(m),1); this.log(g,"群主",`将 ${m.name} 移出群`); this.msg(g,"system","系统",`${m.name} 已被移出群。`); return {ok:true}; }
     if(method==="PUT"){ const n=this.member({...body,id:m.id},g); g.members[g.members.indexOf(m)]=n;
       this.log(g,"群主",`调整 ${n.name} 的配置并重启：角色=${n.role}，权限=${eff(n).join(",")}，推理强度=${n.effort||"CLI 默认"}`); this.boot(g,n); return n; }
+    if(r[2]==="quota"){
+      if(!g.automation?.quota_enabled)throw new Error("请先开启本群按额度调度");
+      m.quota_state=body.action==="pause"?"exhausted":"ok";m.quota_resets_at=null;
+      this.msg(g,"system","系统",body.action==="pause"?`${m.name} 等额度 · 重置时间未知（演示）`:`${m.name} 已恢复（演示）`);
+      if(body.action==="resume")this.drain(g,m);return {ok:true};
+    }
     if(r[2]==="restart"){ m.status="starting"; this.boot(g,m); return {ok:true}; }
   }
   pub(g,since){ return {...g,log_file:g.workdir+"/GROUP_LOG.md",members:g.members.map(m=>({...m,effective_tools:eff(m)})),messages:g.messages.filter(m=>m.seq>since)}; }
@@ -660,7 +675,27 @@ function renderHead(){
     const result=await api("DELETE",`/groups/${g.id}`); S.cur=null; S.group=null; S.msgs=[]; await loadGroups(); renderAll();
     if(result.warnings?.length) alert(result.warnings.join("\n")); };
 }
+function quotaCaption(m){
+  if(!S.group?.automation?.quota_enabled) return "";
+  if(!["near","exhausted"].includes(m.quota_state)) return "";
+  const left=Number(m.quota_resets_at)-Date.now()/1000;
+  const reset=m.quota_resets_at?left>0?`约 ${Math.ceil(left/60)} 分钟后重置`:"等待确认额度重置":"重置时间未知";
+  return `${m.quota_state==="near"?"接近额度阈值 · 暂停新投递":"等额度"} · ${reset}${m.quota_needs_owner?" · 需要群主处理":""}`;
+}
+const changingQuota=new Set();
+async function changeQuota(id,action){
+  if(changingQuota.has(id)||!S.group) return;
+  changingQuota.add(id);
+  try{await api("POST",`/groups/${S.group.id}/members/${id}/quota`,{action});await refresh();}
+  catch(e){alert(e.message);}finally{changingQuota.delete(id);}
+}
+async function saveQuotaSettings(settings){
+  const g=S.group;if(!g) return;
+  try{await api("PUT",`/groups/${g.id}/automation`,settings);await refresh();}
+  catch(e){alert(e.message);renderPane();}
+}
 function statusOf(m){
+  if(quotaCaption(m)) return {st:quotaCaption(m),dc:"busy"};
   const delivery={uncertain:"delivery_uncertain",not_ready:"not_ready",failed:"delivery_failed",waiting_ready:"waiting_ready",waiting_user:"waiting_user_answer"};
   const st=delivery[m.delivery_state]||(m.pending&&!['processing','running','waiting_user_answer'].includes(m.status)?"processing":m.status);
   const dc=["idle","completed"].includes(st)?"ok":["processing","running","starting","new","waiting_ready","waiting_user_answer"].includes(st)?"busy":"bad";
@@ -789,6 +824,9 @@ function renderPane(){
   const online=g.members.filter(m=>statusOf(m).dc!=="bad").length;
   pane.innerHTML=`
     <div class="plabel">成员 · ${online}/${g.members.length} 在线</div>
+    <div class="mcard"><label><input type="checkbox" id="quotaEnabled" ${g.automation?.quota_enabled?"checked":""}> 按额度调度</label>
+      <p class="note">开启后等额度时保留队列，确认可用后自动继续。</p>
+      ${g.automation?.quota_enabled?`<label class="note">暂停阈值（%，留空仅硬限额） <input id="quotaThreshold" type="number" min="0" max="100" value="${g.automation.quota_pause_percent??""}" style="width:65px"></label>`:""}</div>
     <div class="mcard me"><div class="mtop"><div class="av md me">我</div>
       <div style="min-width:0"><div class="nm">群主（你）</div><div class="pv">建群、拉人、分配权限与职责</div></div></div></div>
     ${g.members.map(m=>{
@@ -801,12 +839,16 @@ function renderPane(){
         ${effortCaption(m)?`<div class="note">${esc(effortCaption(m))}</div>`:""}
         <div class="tools">${toolChips(m)}</div>${enf}${usageHTML(m)}
         ${m.queued_count?`<div class="note">待投递：${m.queued_count} 条</div>`:""}
-        <div class="mact">${m.can_retry?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
+        <div class="mact">${!g.automation?.quota_enabled?"":quotaCaption(m)?`<button class="mini" data-quota-resume="${m.id}">恢复</button>`:`<button class="mini" data-quota-pause="${m.id}">标记为等额度</button>`}${m.can_retry&&!quotaCaption(m)?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
       </div>`;}).join("")}
     <button class="addm" id="invite">${ico("plus")}邀请模型进群</button>
     <p class="note" style="margin:12px 4px 0">修改权限或职责会重启该成员（新会话），以便新的 profile 生效。</p>`;
+  $("#quotaEnabled").onchange=e=>saveQuotaSettings({quota_enabled:e.target.checked});
+  if(g.automation?.quota_enabled) $("#quotaThreshold").onchange=e=>saveQuotaSettings({quota_pause_percent:e.target.value===""?null:Number(e.target.value)});
   $("#invite").onclick=()=>openMemberModal(null);
   pane.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openMemberModal(g.members.find(m=>m.id===b.dataset.edit)));
+  pane.querySelectorAll("[data-quota-resume]").forEach(b=>b.onclick=()=>changeQuota(b.dataset.quotaResume,"resume"));
+  pane.querySelectorAll("[data-quota-pause]").forEach(b=>b.onclick=()=>changeQuota(b.dataset.quotaPause,"pause"));
   pane.querySelectorAll("[data-retry]").forEach(b=>b.onclick=()=>retryDelivery(b.dataset.retry));
   pane.querySelectorAll("[data-restart]").forEach(b=>b.onclick=async()=>{ await api("POST",`/groups/${g.id}/members/${b.dataset.restart}/restart`); refresh(); });
   pane.querySelectorAll("[data-kick]").forEach(b=>b.onclick=async()=>{ const m=g.members.find(x=>x.id===b.dataset.kick);
@@ -845,7 +887,7 @@ async function refresh(){
     const top=S.msgs.length?S.msgs.at(-1).seq:0;
     const fresh=g.messages.filter(m=>m.seq>top);
     S.group=g; S.msgs=S.msgs.concat(fresh);
-    const sig=JSON.stringify(g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort,m.delivery_state,m.can_retry,m.delivery_id,m.delivery_attempt,m.queued_count]));
+    const sig=JSON.stringify([g.automation?.quota_enabled,g.automation?.quota_pause_percent,g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort,m.delivery_state,m.can_retry,m.delivery_id,m.delivery_attempt,m.queued_count,m.quota_state,m.quota_resets_at,m.quota_needs_owner,Math.floor(Date.now()/60000)])]);
     if(fresh.length){ renderMsgs(); await loadGroups(); renderGroups(); if(S.tab==="log") loadLog();
       if(fresh.some(m=>m.kind==="agent")) setTimeout(loadUsage,1500); }
     if(sig!==lastSig){ lastSig=sig; renderHead(); renderComposer(); if(S.tab==="members") renderPane(); }

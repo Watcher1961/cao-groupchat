@@ -36,7 +36,8 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -580,7 +581,7 @@ def new_delivery(text: str, hops: int, silent: bool = False) -> dict:
 
 def queue_delivery(g: dict, m: dict, job: dict) -> None:
     # Caller holds this member's delivery lock, then the global state lock.
-    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"]:
+    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m):
         m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
         m.setdefault("outbox", []).insert(0, job)
     else:
@@ -595,6 +596,10 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
     with delivery_lock(g, m):
         queue = m.get("outbox", [])
         if not queue or m.get("active_delivery") or m.get("delivery_state") == "not_ready":
+            return False
+        blocked_screen = quota_refresh(g, m, terminal)
+        if blocked_screen or quota_waiting(g, m):
+            save_state()
             return False
         with lock:
             if not budget_available(g):
@@ -632,6 +637,12 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
 
 
 def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
+    blocked_screen = quota_refresh(g, m)
+    if blocked_screen or quota_waiting(g, m):
+        m.setdefault("outbox", []).insert(0, job)
+        m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+        save_state()
+        return False
     with lock:
         job["attempt"] += 1
         m.update(active_delivery=job, pending=True, delivery_state="dispatching", delivery_warned=False)
@@ -639,6 +650,9 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
     charged = False
     try:
         raw = get_full_output(m) if m.get("provider") == "codex" else None
+        if automation_settings(g)["quota_enabled"] and m.get("provider") in ("codex", "claude_code"):
+            quota_raw = raw if raw is not None else get_full_output(m)
+            m["quota_dispatch_hash"] = hashlib.sha256(quota_raw.encode()).hexdigest()
         with lock:
             m.update(boundary=None, reply_handled=False, sent_at=time.time(), saw_busy=False,
                      hops=job["hops"], silent=job["silent"], dispatch_confirmed=False,
@@ -687,6 +701,8 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
 
 
 def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
+    if quota_waiting(g, m) or (automation_settings(g)["quota_enabled"] and m.get("quota_interrupted_delivery")):
+        return
     if not m.get("active_delivery") or not m.get("pending") or m.get("delivery_state") == "dispatching":
         return
     now = time.time()
@@ -726,6 +742,8 @@ def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
 
 def retry_delivery(g: dict, m: dict, token: dict) -> None:
     with delivery_lock(g, m):
+        if quota_waiting(g, m):
+            raise ValueError("成员正在等额度，请使用恢复")
         job = m.get("active_delivery") or next(iter(m.get("outbox", [])), None)
         if (m.get("delivery_state") not in ("uncertain", "failed", "not_ready") or not job
                 or token.get("delivery_id") != job["id"] or token.get("delivery_attempt") != job["attempt"]):
@@ -735,6 +753,8 @@ def retry_delivery(g: dict, m: dict, token: dict) -> None:
         if m.get("active_delivery"):
             m.setdefault("outbox", []).insert(0, job)
         job["queued_at"] = time.time()
+        m.pop("quota_interrupted_delivery", None)
+        m.pop("quota_interrupted_attempt", None)
         m.update(active_delivery=None, pending=False, delivery_state="waiting_ready", delivery_warned=False)
         # An uncertain terminal may still be working; require a new idle prompt.
         m["ready_terminal"] = None
@@ -879,6 +899,8 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
         return
     m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed",
              delivery_started=True, last_progress_at=time.time())
+    m.pop("quota_interrupted_delivery", None)
+    m.pop("quota_interrupted_attempt", None)
     reported_state = m.pop("_reply_work_state", None)
     if m.pop("silent", False):          # 系统通知（如新成员入群）的回复不进群聊
         return
@@ -904,6 +926,7 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
 
 def poll_member(g: dict, m: dict) -> None:
     if not m.get("terminal_id"):
+        quota_refresh(g, m)
         flush_outbox(g, m)
         return
     try:
@@ -917,6 +940,7 @@ def poll_member(g: dict, m: dict) -> None:
                 m["delivery_state"] = "failed"
             add_msg(g, "system", "系统", f"{m['name']} 的终端已不存在。", log=False)
         else:
+            quota_refresh(g, m, {})
             watch_delivery(g, m, {})
         return
     if automation_settings(g)["idle_minutes"]:
@@ -926,6 +950,18 @@ def poll_member(g: dict, m: dict) -> None:
     gen, boundary = t.get("status_generation"), m.get("boundary")
     fresh = gen is None or boundary is None or gen > boundary
     m["status"] = st
+    if quota_refresh(g, m, t):
+        save_state()
+        return
+    if quota_waiting(g, m) and m.get("quota_interrupted_delivery"):
+        if m.get("provider") != "codex":
+            if st == "completed":
+                reply = get_reply(m)
+                if reply:
+                    handle_reply(g, m, reply)
+            return  # An empty idle prompt is not the interrupted task's completion.
+    if quota_continue(g, m, t):
+        return
     if not m.get("pending"):
         if m.get("outbox"):
             flush_outbox(g, m, t)
@@ -981,13 +1017,17 @@ def poll_loop() -> None:
         with lock:
             group_snapshot = list(groups.values())
             snapshot = [(g, m) for g in groups.values() for m in g["members"]
-                        if m.get("terminal_id") or m.get("outbox") or m.get("active_delivery")]
+                        if m.get("terminal_id") or m.get("outbox") or m.get("active_delivery") or quota_waiting(g, m)]
         for g, m in snapshot:
             with delivery_lock(g, m):
                 try:
                     poll_member(g, m)
                     m.pop("poll_error_type", None)
                 except Exception as e:
+                    if quota_waiting(g, m):
+                        m["poll_error_type"] = type(e).__name__
+                        print(f"group={g['id']} member={m['id']} quota_poll_error={type(e).__name__}", flush=True)
+                        continue
                     if m.get("active_delivery"):
                         m["delivery_state"] = "uncertain"
                     elif m.get("outbox"):
@@ -1109,9 +1149,11 @@ def public_group(g: dict, since: int = 0) -> dict:
     for m in g["members"]:
         member = {k: v for k, v in m.items() if k not in ("outbox", "active_delivery", "_reply_work_state")}
         job = m.get("active_delivery") or next(iter(m.get("outbox", [])), None)
-        member.update(effective_tools=member_tools(m), queued_count=len(m.get("outbox", [])),
+        member.update(quota_state=m.get("quota_state", "ok") if automation_settings(g)["quota_enabled"] else "ok",
+                      quota_resets_at=m.get("quota_resets_at") if automation_settings(g)["quota_enabled"] else None,
+                      effective_tools=member_tools(m), queued_count=len(m.get("outbox", [])),
                       delivery_id=job["id"] if job else None, delivery_attempt=job["attempt"] if job else None,
-                      can_retry=bool(job and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
+                      can_retry=bool(job and not quota_waiting(g, m) and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
         out["members"].append(member)
     return out
 
@@ -1120,7 +1162,368 @@ def public_group(g: dict, since: int = 0) -> dict:
 AUTOMATION_DEFAULTS = {
     "relay_limit": MAX_RELAY_HOPS, "delivery_budget": None, "idle_minutes": 0,
     "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None, "claude_limits": False,
+    "quota_enabled": False, "quota_pause_percent": None, "quota_reset_grace_seconds": 120,
+    "quota_probe_interval_seconds": 900, "quota_probe_max_failures": 8,
 }
+
+
+def quota_reset_time(text: str, now: float) -> float | None:
+    """Parse only the installed CLI date formats; ambiguity stays unknown."""
+    text = text.strip().rstrip(".")
+    zone = re.search(r" \(([^()]+)\)$", text)
+    try:
+        tz = ZoneInfo(zone[1]) if zone else None
+        if zone:
+            text = text[:zone.start()]
+        local = datetime.fromtimestamp(now, tz)
+        normalized = re.sub(r"(\d)(am|pm)$", r"\1 \2", text, flags=re.I).upper()
+        formats = (("%b %d, %Y %I:%M %p", False), ("%b %d, %I:%M %p", False),
+                   ("%b %d, %I %p", False), ("%b %d, %Y, %I:%M %p", False),
+                   ("%I:%M %p", True), ("%I %p", True))
+        for fmt, time_only in formats:
+            try:
+                # Python 3.15 rejects a day without a year; use the observed year.
+                value = datetime.strptime(f"{local.year} {normalized}", "%Y " + fmt) if "%d" in fmt and "%Y" not in fmt else datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+            value = value.replace(year=local.year if "%Y" not in fmt else value.year,
+                                  month=local.month if time_only else value.month,
+                                  day=local.day if time_only else value.day, tzinfo=tz)
+            if time_only and value.timestamp() <= now:
+                value += timedelta(days=1)
+            return value.timestamp() if value.timestamp() > now else None
+    except (ValueError, OverflowError, OSError, ZoneInfoNotFoundError):
+        pass
+    return None
+
+
+def quota_screen_lines(raw: str) -> list[str]:
+    lines, fence = [], None
+    for line in ANSI.sub("", raw).replace("\r", "\n").splitlines():
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            run = marker[1]
+            if fence is None:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence):
+                fence = None
+            continue
+        if fence is None and not line.startswith("    "):
+            lines.append(line.strip())
+    return lines[-24:]
+
+
+def terminal_quota_signal(provider: str, raw: str, now: float | None = None) -> dict | None:
+    # Binary literals / date format evidence is recorded in docs/TASKS.md.
+    # Never return or persist the screen or any unmatched tail text.
+    if provider not in ("codex", "claude_code"):
+        return None
+    now = time.time() if now is None else now
+    if provider == "codex":
+        done = [position for position, state in codex_markers(raw) if state == "done"]
+        if done:
+            completed = ANSI.sub("", raw[:max(done)])
+            bullets = list(re.finditer(r"(?m)^ {0,3}• (?!You have \d+ usage limit reset)[^\n]+", completed))
+            errors = list(re.finditer(r"You[’']ve hit your usage limit", completed))
+            if bullets and errors and bullets[-1].start() > errors[-1].start():
+                raw = completed[bullets[-1].start():] + raw[max(done):]
+    lines = quota_screen_lines(raw)
+    if provider == "codex":
+        pattern = r"(?:■ )?You[’']ve hit your usage limit(?: for [^.\n]{1,80})?\.(?: .*)?"
+    else:
+        pattern = (r"(?:[●⎿] )?You[’']ve hit your (?:session|5-hour|weekly|Opus|Sonnet|Fable|"
+                   r"usage credit|monthly spend) limit(?:[. ·].*)?")
+    for line in reversed(lines):
+        if not re.fullmatch(pattern, line):
+            continue
+        reset = re.search(r"(?:[Tt]ry again at |resets (?:at )?)(.+?)(?:\. |$)", line)
+        return {"state": "exhausted", "percent": 100, "source": "terminal",
+                "resets_at": quota_reset_time(reset[1], now) if reset else None}
+    return None
+
+
+def codex_quota_menu(raw: str) -> tuple[bool, str | None]:
+    lines = quota_screen_lines(raw)
+    title = next((i for i, line in enumerate(lines) if line in
+                  ("Approaching rate limits", "Usage limit reached")), None)
+    if title is None:
+        return False, None
+    options = []
+    for line in lines[title + 1:]:
+        match = re.fullmatch(r"[›>]?\s*([1-9])\. (.+)", line)
+        if match:
+            options.append((match[1], match[2]))
+    exact = [(number, label) for number, label in options if label == "Keep current model"]
+    unique = len({number for number, _ in options}) == len(options)
+    # The number is read from the actual rendered option, never guessed.
+    return True, exact[0][0] if len(exact) == 1 and unique and len(options) >= 2 else None
+
+
+def quota_waiting(g: dict, m: dict) -> bool:
+    return automation_settings(g)["quota_enabled"] and m.get("quota_state", "ok") in ("near", "exhausted")
+
+
+def quota_account(g: dict, m: dict, now: float) -> None:
+    with lock:
+        if not quota_waiting(g, m):
+            return
+        elapsed = max(0, now - m.get("quota_accounted_at", now))
+        totals = automation_state(g).setdefault("quota_wait_seconds", {})
+        totals[m["id"]] = totals.get(m["id"], 0) + elapsed
+        m["quota_accounted_at"] = now
+
+
+def quota_notice(g: dict, m: dict, text: str) -> None:
+    # Only fixed strings and allow-listed quota metadata reach diagnostics.
+    append_log(g, "系统", f"quota_state={m.get('quota_state', 'ok')} source={m.get('quota_source')} "
+               f"percent={m.get('quota_percent')} resets_at={m.get('quota_resets_at')}")
+    add_msg(g, "system", "系统", f"{m['name']} {text}", log=False)
+
+
+def quota_pause(g: dict, m: dict, signal: dict, now: float) -> None:
+    with lock:
+        if not automation_settings(g)["quota_enabled"]:
+            return
+        first = not quota_waiting(g, m)
+        if first:
+            m.update(quota_episode=m.get("quota_episode", 0) + 1, quota_accounted_at=now,
+                     quota_probe_failures=0, quota_needs_owner=False)
+        old_reset = m.get("quota_resets_at")
+        m.update(quota_state=signal["state"], quota_source=signal["source"],
+                 quota_percent=signal.get("percent"), quota_resets_at=signal.get("resets_at"))
+        settings = automation_settings(g)
+        if first or old_reset != m["quota_resets_at"]:
+            m["quota_next_probe_at"] = (m["quota_resets_at"] + settings["quota_reset_grace_seconds"]
+                                        if m["quota_resets_at"] else now + settings["quota_probe_interval_seconds"])
+        automation_state(g)["idle_since"] = None
+        if first:
+            reset = (f"约 {max(1, math.ceil((m['quota_resets_at'] - now) / 60))} 分钟后重置"
+                     if m["quota_resets_at"] else "重置时间未知")
+            quota_notice(g, m, f"{'接近额度阈值' if signal['state'] == 'near' else '等额度'} · {reset}；暂停新投递，保留队列。")
+
+
+def quota_resume(g: dict, m: dict, now: float, *, forced: bool = False) -> None:
+    with lock:
+        if not automation_settings(g)["quota_enabled"]:
+            return
+        quota_account(g, m, now)
+        m.update(quota_state="ok", quota_resets_at=None, quota_needs_owner=False, quota_probe_failures=0,
+                 quota_next_probe_at=None, last_progress_at=now)
+        for job in m.get("outbox", []):
+            job["queued_at"] = now
+        automation_state(g)["idle_since"] = None
+        quota_notice(g, m, "额度已恢复，按原顺序继续。" if not forced else "已由群主强制恢复，按原顺序继续。")
+
+
+def quota_windows(g: dict, m: dict, now: float) -> tuple[dict | None, bool]:
+    provider = m.get("provider")
+    data = codex_limits() if provider == "codex" else claude_limits(g) if provider == "claude_code" else None
+    windows = list((data or {}).get("windows") or [])
+    spend = (data or {}).get("spend_limit")
+    if isinstance(spend, dict):
+        windows.append({"used_percent": spend.get("used_percentage"), "resets_at": spend.get("resets_at")})
+    valid = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        used, reset = window.get("used_percent"), window.get("resets_at")
+        if (type(used) in (int, float) and type(reset) in (int, float)
+                and math.isfinite(used) and math.isfinite(reset) and 0 <= used <= 100 and reset > now):
+            valid.append((used, reset))
+    threshold = automation_settings(g)["quota_pause_percent"]
+    blocked = [(used, reset) for used, reset in valid if used >= 100 or (threshold is not None and used >= threshold)]
+    if not blocked:
+        return None, bool(valid)
+    exhausted = any(used >= 100 for used, _ in blocked)
+    return {"state": "exhausted" if exhausted else "near", "percent": max(used for used, _ in blocked),
+            "resets_at": max(reset for _, reset in blocked), "source": "structured"}, False
+
+
+def quota_prompt_ready(m: dict, terminal: dict, raw: str) -> bool:
+    if str(terminal.get("status", "")).lower() not in DONE:
+        return False
+    tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
+    if m.get("provider") == "codex":
+        return bool(CODEX_READY_FOOTER.search(tail))
+    if m.get("provider") == "claude_code":
+        return bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+    return False
+
+
+def quota_refresh(g: dict, m: dict, terminal: dict | None = None) -> bool:
+    """Return True only for a current hard screen that must not be read as a reply."""
+    if not automation_settings(g)["quota_enabled"]:
+        return False
+    now = time.time()
+    quota_account(g, m, now)
+    if quota_waiting(g, m) and not m.get("pending") and now < (m.get("quota_next_probe_at") or now):
+        return m.get("quota_source") in ("terminal", "menu")
+    try:
+        structured, available = quota_windows(g, m, now)
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        structured, available = None, False
+    raw, readable = "", False
+    if m.get("terminal_id") and m.get("provider") in ("codex", "claude_code"):
+        try:
+            terminal = terminal if terminal is not None else cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
+            raw, readable = get_full_output(m), True
+        except CaoError:
+            pass
+    terminal = terminal or {}
+    hard = terminal_quota_signal(m.get("provider"), raw, now) if readable else None
+    generation = terminal.get("output_generation")
+    if (hard and quota_waiting(g, m) and m.get("quota_source") == "terminal"
+            and generation == m.get("quota_pause_generation") and m.get("quota_resets_at") is not None):
+        hard["resets_at"] = m["quota_resets_at"]
+    reset = m.get("quota_resets_at")
+    known_reset_ready = (quota_waiting(g, m) and reset is not None
+                         and now >= reset + automation_settings(g)["quota_reset_grace_seconds"]
+                         and generation == m.get("quota_pause_generation")
+                         and readable and quota_prompt_ready(m, terminal, raw))
+    if hard and known_reset_ready and structured is None:
+        # The published reset has passed; the same old hint is history, not a new rejection.
+        m["quota_terminal_cleared_generation"] = generation
+        hard = None
+    if "quota_terminal_cleared_generation" in m and generation == m["quota_terminal_cleared_generation"]:
+        hard = None
+    if not automation_settings(g)["quota_enabled"]:
+        return False
+    menu, choice = codex_quota_menu(raw) if m.get("provider") == "codex" else (False, None)
+    menu = menu and str(terminal.get("status", "")).lower() == "waiting_user_answer"
+    if menu:
+        if choice is None:
+            quota_pause(g, m, {"state": "exhausted", "source": "menu", "resets_at": None}, now)
+            if not m.get("quota_needs_owner"):
+                m["quota_needs_owner"] = True
+                quota_notice(g, m, "切换模型菜单无法精确匹配，等待 @群主 处理；未发送按键。")
+            return True
+        if not m.get("quota_menu_attempted"):
+            # Persist before any key: an interrupted operation must not repeat it.
+            m["quota_menu_attempted"] = True
+            save_state()
+            try:
+                for key in (choice, "Enter"):
+                    cao("POST", f"/terminals/{m['terminal_id']}/key", {"key": key})
+                append_log(g, "系统", "quota_source=menu quota_action=Keep current model")
+                add_msg(g, "system", "系统", f"{m['name']} 已精确匹配菜单并选择 Keep current model（保持当前模型）。", log=False)
+            except CaoError:
+                quota_pause(g, m, {"state": "exhausted", "source": "menu", "resets_at": None}, now)
+                m["quota_needs_owner"] = True
+                quota_notice(g, m, "保持当前模型操作未确认，等待 @群主 处理；不重复发送按键。")
+        # Continue observing structured quotas even while this control menu is open.
+    if not menu:
+        m.pop("quota_menu_attempted", None)
+    signal = structured or hard
+    if signal and m.get("quota_override") == signal and (signal["source"] == "structured" or m.get("quota_override_generation") == generation):
+        signal = hard if signal["source"] == "structured" else None
+        if signal is None:
+            hard = None
+    elif signal or available:
+        m.pop("quota_override", None)
+        m.pop("quota_override_generation", None)
+    if hard and m.get("pending") and m.get("active_delivery") and not m.get("reply_handled"):
+        boundary = m.get("boundary")
+        fresh = (type(generation) is int and type(boundary) is int and generation > boundary)
+        # Providers without generations need a changed screen compared with dispatch.
+        if generation is None and m.get("quota_dispatch_hash"):
+            fresh = hashlib.sha256(raw.encode()).hexdigest() != m["quota_dispatch_hash"]
+        if fresh:
+            m["quota_interrupted_delivery"] = m["active_delivery"]["id"]
+            m["quota_interrupted_attempt"] = m["active_delivery"]["attempt"]
+    if not quota_waiting(g, m):
+        if signal:
+            quota_pause(g, m, signal, now)
+            m["quota_pause_generation"] = generation
+    else:
+        # Update a newly observed later reset, but never slide an unknown probe deadline.
+        if signal and (signal.get("resets_at") != m.get("quota_resets_at") or signal["state"] != m["quota_state"]):
+            quota_pause(g, m, signal, now)
+        due = now >= (m.get("quota_next_probe_at") or now)
+        if due and not m.get("quota_needs_owner"):
+            changed_prompt = (readable and quota_prompt_ready(m, terminal, raw) and not hard
+                              and generation is not None and generation != m.get("quota_pause_generation"))
+            if not menu and not signal and (available or changed_prompt or known_reset_ready):
+                quota_resume(g, m, now)
+            else:
+                m["quota_probe_failures"] = m.get("quota_probe_failures", 0) + 1
+                m["quota_next_probe_at"] = now + automation_settings(g)["quota_probe_interval_seconds"]
+                if m["quota_probe_failures"] >= automation_settings(g)["quota_probe_max_failures"]:
+                    m["quota_needs_owner"] = True
+                    quota_notice(g, m, "需要群主处理：连续额度探测未确认可用，等待 @群主 手动恢复。")
+    return bool(menu) or bool(hard) or (quota_waiting(g, m) and m.get("quota_source") == "menu")
+
+
+def quota_continue(g: dict, m: dict, terminal: dict) -> bool:
+    """Schedule a single continuation before later queued messages, never the original."""
+    if not automation_settings(g)["quota_enabled"] or quota_waiting(g, m):
+        return False
+    job = m.get("active_delivery")
+    if not job or job["id"] != m.get("quota_interrupted_delivery") or job["attempt"] != m.get("quota_interrupted_attempt") or m.get("reply_handled"):
+        return False
+    if str(terminal.get("status", "")).lower() not in DONE:
+        return True
+    # A done marker may close an error turn. It is not a successful reply.
+    raw = get_full_output(m)
+    hard_in_history = terminal_quota_signal(m.get("provider"), raw)
+    # A late, positively completed reply wins over any continuation.
+    if not hard_in_history and m.get("provider") == "codex":
+        reply = get_codex_reply(m, output_generation=terminal.get("output_generation"))
+        if reply is not None:
+            handle_reply(g, m, reply)
+            return False
+    elif not hard_in_history and str(terminal.get("status", "")).lower() == "completed":
+        reply = get_reply(m)
+        if reply:
+            handle_reply(g, m, reply)
+            return False
+    if not quota_prompt_ready(m, terminal, raw):
+        return True
+    token = f"quota:{g['id']}:{m['id']}:{m.get('quota_episode', 0)}"
+    if m.get("quota_continuation_token") != token:
+        text = (f"[自动续接 quota:{g['id']}:{m.get('quota_episode', 0)}] "
+                "额度已恢复，请从中断处继续刚才的任务，完成后按规则在末行写状态。")
+        continuation = new_delivery(text, job["hops"], job["silent"])
+        continuation.update(id=token, quota_continuation=True)
+        m.setdefault("outbox", []).insert(0, continuation)
+        m.update(quota_continuation_token=token, active_delivery=None, pending=False,
+                 delivery_state="waiting_ready", ready_terminal=None)
+        m.pop("ready_candidate", None)
+        m.pop("quota_interrupted_delivery", None)
+        m.pop("quota_interrupted_attempt", None)
+        save_state()
+    flush_outbox(g, m, terminal)
+    return True
+
+
+def set_member_quota(g: dict, m: dict, body: dict) -> None:
+    with delivery_lock(g, m):
+        if not automation_settings(g)["quota_enabled"]:
+            raise ValueError("请先开启本群按额度调度")
+        if not isinstance(body, dict) or set(body) != {"action"} or body["action"] not in ("pause", "resume"):
+            raise ValueError("额度操作必须为 pause 或 resume")
+        now = time.time()
+        terminal, hard = {}, None
+        if m.get("terminal_id"):
+            try:
+                terminal = cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
+                if body["action"] == "resume":
+                    hard = terminal_quota_signal(m.get("provider"), get_full_output(m), now)
+            except CaoError:
+                pass  # Explicit owner control must work even when observation fails.
+        if body["action"] == "pause":
+            quota_pause(g, m, {"state": "exhausted", "source": "manual", "resets_at": None}, now)
+            m["quota_pause_generation"] = terminal.get("output_generation")
+        elif quota_waiting(g, m):
+            try:
+                signal, _ = quota_windows(g, m, now)
+            except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+                signal = None
+            m["quota_override"] = signal or hard
+            if hard:
+                m["quota_terminal_cleared_generation"] = terminal.get("output_generation")
+            m["quota_override_generation"] = terminal.get("output_generation")
+            quota_resume(g, m, now, forced=True)
+        save_state()
 
 
 def automation_settings(g: dict) -> dict:
@@ -1128,9 +1531,12 @@ def automation_settings(g: dict) -> dict:
 
 
 def automation_state(g: dict) -> dict:
-    return g.setdefault("automation_state", {"deliveries_used": 0, "budget_notified": False,
-                                           "reminders_sent": 0, "last_reminder_at": None, "idle_since": None,
-                                           "awaiting_owner": False})
+    state = g.setdefault("automation_state", {})
+    for key, value in {"deliveries_used": 0, "budget_notified": False, "reminders_sent": 0,
+                       "last_reminder_at": None, "idle_since": None, "awaiting_owner": False,
+                       "quota_wait_seconds": {}}.items():
+        state.setdefault(key, value)
+    return state
 
 
 def budget_available(g: dict) -> bool:
@@ -1141,8 +1547,14 @@ def budget_available(g: dict) -> bool:
 def automation_view(g: dict) -> dict:
     with lock:
         state = {"deliveries_used": 0, "reminders_sent": 0, "last_reminder_at": None,
-                 "idle_since": None, "awaiting_owner": False, **g.get("automation_state", {})}
+                 "idle_since": None, "awaiting_owner": False, "quota_wait_seconds": {}, **g.get("automation_state", {})}
         state.pop("budget_notified", None)
+        state["quota_wait_seconds"] = dict(state["quota_wait_seconds"])
+        now = time.time()
+        for member in g["members"]:
+            if quota_waiting(g, member):
+                totals = state["quota_wait_seconds"]
+                totals[member["id"]] = totals.get(member["id"], 0) + max(0, now - member.get("quota_accounted_at", now))
         state["budget_exhausted"] = not budget_available(g)
         return {"settings": automation_settings(g), "runtime": state}
 
@@ -1152,6 +1564,17 @@ def update_automation(g: dict, body: dict) -> dict:
         if not isinstance(body, dict) or any(key not in AUTOMATION_DEFAULTS for key in body):
             raise ValueError("自主运行设置必须是对象，且只能包含支持的配置字段")
         settings = {**automation_settings(g), **body}
+        if type(settings["quota_enabled"]) is not bool:
+            raise ValueError("quota_enabled 必须是布尔值")
+        threshold = settings["quota_pause_percent"]
+        if threshold is not None and (type(threshold) not in (int, float) or not math.isfinite(threshold) or not 0 <= threshold <= 100):
+            raise ValueError("quota_pause_percent 必须为 0–100 的有限数或 null")
+        for key in ("quota_reset_grace_seconds", "quota_probe_interval_seconds"):
+            value = settings[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (key == "quota_probe_interval_seconds" and value == 0):
+                raise ValueError(f"{key} 必须是合法秒数")
+        if type(settings["quota_probe_max_failures"]) is not int or settings["quota_probe_max_failures"] < 1:
+            raise ValueError("quota_probe_max_failures 必须是正整数")
         if type(settings["claude_limits"]) is not bool:
             raise ValueError("claude_limits 必须是布尔值")
         for key in ("relay_limit", "delivery_budget", "reminder_limit"):
@@ -1177,8 +1600,23 @@ def update_automation(g: dict, body: dict) -> dict:
                 restore_project, warning = optional_claude_statusline(g, False)
         previous_settings, previous_state = g.get("automation"), g.get("automation_state")
         previous_state = dict(previous_state) if previous_state is not None else None
+        if previous_state is not None and "quota_wait_seconds" in previous_state:
+            previous_state["quota_wait_seconds"] = dict(previous_state["quota_wait_seconds"])
+        member_rollback = []
         try:
             if body and ("automation" not in g or settings != automation_settings(g)):
+                if not settings["quota_enabled"] and automation_settings(g)["quota_enabled"]:
+                    for member in g["members"]:
+                        values = {k: v for k, v in member.items() if k.startswith("quota_") or k == "last_progress_at"}
+                        member_rollback.append((member, values, [(job, job["queued_at"]) for job in member.get("outbox", [])]))
+                        quota_account(g, member, time.time())
+                        member.update(quota_state="ok", quota_resets_at=None, quota_needs_owner=False, last_progress_at=time.time())
+                        member.pop("quota_interrupted_delivery", None)
+                        member.pop("quota_interrupted_attempt", None)
+                        for key in ("quota_override", "quota_override_generation", "quota_terminal_cleared_generation", "quota_menu_attempted"):
+                            member.pop(key, None)
+                        for job in member.get("outbox", []):
+                            job["queued_at"] = time.time()
                 g["automation"] = settings
                 state = automation_state(g)
                 state["idle_since"] = None
@@ -1187,6 +1625,13 @@ def update_automation(g: dict, body: dict) -> dict:
                 save_state()
                 budget_notice(g)
         except Exception:
+            for member, values, jobs in member_rollback:
+                for key in list(member):
+                    if key.startswith("quota_") or key == "last_progress_at":
+                        member.pop(key, None)
+                member.update(values)
+                for job, queued_at in jobs:
+                    job["queued_at"] = queued_at
             if previous_settings is None:
                 g.pop("automation", None)
             else:
@@ -1236,7 +1681,8 @@ def reply_work_state(text: str) -> str:
 def idle_coordinator(g: dict, settings: dict) -> dict | None:
     if g.get("automation_state", {}).get("awaiting_owner"):
         return None
-    members = g["members"]
+    members = [m for m in g["members"] if not quota_waiting(g, m) and not
+               (settings["quota_enabled"] and m.get("quota_interrupted_delivery"))]
     for m in members:
         if (m.get("pending") or m.get("active_delivery") or m.get("outbox")
                 or m.get("work_state", "进行中") in ("等群主", "阻塞", "已交付")
@@ -1889,6 +2335,12 @@ class H(BaseHTTPRequestHandler):
                                              f"职责={new['duty'] or '未指定'}")
                         run_bg(bootstrap_members, g, [new], False)
                         return self._json(200, new)
+                if len(rest) == 3 and rest[0] == "members" and rest[2] == "quota" and method == "POST":
+                    m = next((x for x in g["members"] if x["id"] == rest[1]), None)
+                    if not m:
+                        return self._json(404, {"error": "成员不存在"})
+                    set_member_quota(g, m, self._body())
+                    return self._json(200, {"ok": True})
                 if len(rest) == 3 and rest[0] == "members" and rest[2] == "retry" and method == "POST":
                     m = next((x for x in g["members"] if x["id"] == rest[1]), None)
                     if not m:

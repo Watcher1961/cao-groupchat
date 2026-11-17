@@ -167,6 +167,134 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_quota_structured_pause_recovery_fifo_and_restart(self):
+        self.create_group()
+        member = self.invite("额度成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        settings = self.api("PUT", "/automation", {"quota_enabled": True,
+            "quota_reset_grace_seconds": 0, "quota_probe_interval_seconds": 0.1})
+        self.assertTrue(settings["settings"]["quota_enabled"])
+        import datetime
+        def limits(percent):
+            path = self.home / ".codex/sessions/synthetic/11/17/rollout-quota.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"type": "event_msg", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "payload": {"type": "token_count", "rate_limits": {"primary": {
+                    "used_percent": percent, "resets_at": time.time() + 0.5, "window_minutes": 300}}}}) + "\n")
+        limits(100)
+        self.until("structured quota pause", lambda: self.api("GET")["members"][0].get("quota_state") == "exhausted")
+        baseline = len(self.terminal(tid)["inputs"])
+        self.api("POST", "/messages", {"text": "第一条"})
+        self.api("POST", "/messages", {"text": "第二条"})
+        self.assertEqual(len(self.terminal(tid)["inputs"]), baseline)
+        self.until("two queued messages", lambda: self.api("GET")["members"][0]["queued_count"] == 2)
+        self.stopped_server = self.server
+        self.stop_process(self.server)
+        self.start_server()
+        limits(0)
+        self.wait_replies(2)
+        delivered = [x["message"] for x in self.terminal(tid)["inputs"][baseline:]]
+        self.assertEqual(delivered, ["[群主] 第一条", "[群主] 第二条"])
+        runtime = self.api("GET", "/automation")["runtime"]
+        self.assertGreater(runtime["quota_wait_seconds"][member["id"]], 0)
+
+    def test_quota_hard_stop_auto_continuation_precedes_later_queue(self):
+        self.create_group()
+        member = self.invite("续接成员", "claude_code", "developer")
+        tid = member["terminal_id"]
+        self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        self.api("PUT", "/automation", {"quota_enabled": True, "delivery_budget": 3,
+            "quota_probe_interval_seconds": 0.15})
+        baseline = len(self.terminal(tid)["inputs"])
+        self.next_turn(tid, "unused", quota_prompt="You've hit your session limit")
+        self.api("POST", "/messages", {"text": "当前任务"})
+        self.until("quota interrupted", lambda: self.api("GET")["members"][0].get("quota_interrupted_delivery"))
+        self.api("POST", "/messages", {"text": "后续任务"})
+        self.until("later queued", lambda: self.api("GET")["members"][0]["queued_count"] == 1)
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota-clear", {})
+        self.wait_replies(2)
+        delivered = [item["message"] for item in self.terminal(tid)["inputs"][baseline:]]
+        self.assertEqual(len(delivered), 3, delivered)
+        self.assertEqual(delivered[0], "[群主] 当前任务")
+        self.assertTrue(delivered[1].startswith("[自动续接 quota:"))
+        self.assertNotIn("当前任务", delivered[1])
+        self.assertEqual(delivered[2], "[群主] 后续任务")
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 3)
+        self.assertFalse(any("可能未送达" in item["text"] for item in self.api("GET")["messages"]))
+
+    def test_quota_claude_structured_cache_pause_and_recovery(self):
+        group = self.create_group()
+        member = self.invite("缓存成员", "claude_code", "developer")
+        tid = member["terminal_id"]
+        self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        self.api("PUT", "/automation", {"quota_enabled": True, "claude_limits": True,
+            "quota_reset_grace_seconds": 0, "quota_probe_interval_seconds": 0.1})
+        cache = self.data / "claude_limits" / f"{group['id']}.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        reset = time.time() + 0.6
+        def limits(percent, resets):
+            cache.write_text(json.dumps({"updated_at": time.time(), "rate_limits": {
+                "five_hour": {"used_percentage": percent, "resets_at": resets}}}))
+        limits(100, reset)
+        self.until("Claude structured pause", lambda: self.api("GET")["members"][0].get("quota_state") == "exhausted")
+        count = len(self.terminal(tid)["inputs"])
+        self.api("POST", "/messages", {"text": "等窗口恢复"})
+        self.until("queued", lambda: self.api("GET")["members"][0]["queued_count"] == 1)
+        self.assertEqual(len(self.terminal(tid)["inputs"]), count)
+        limits(0, reset + 100)
+        self.wait_replies(1)
+        self.assertEqual(len(self.terminal(tid)["inputs"]), count + 1)
+        self.assertEqual(self.api("GET")["members"][0]["quota_state"], "ok")
+
+    def test_quota_codex_menu_keys_exact_and_unknown_is_read_only(self):
+        self.create_group()
+        member = self.invite("菜单成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        self.api("PUT", "/automation", {"quota_enabled": True})
+        # Labels from installed 0.164.0; these rendered numbers are synthetic.
+        menu = "Approaching rate limits\n  1. Switch to another model\n› 2. Keep current model\n  3. Keep current model (never show again)"
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota", {"prompt": menu, "status": "waiting_user_answer"})
+        self.until("exact menu keys", lambda: self.terminal(tid).get("keys") == ["2", "Enter"])
+        # /key leaves FIFO history; normal readiness only appends a fresh prompt.
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {})
+        self.api("POST", "/messages", {"text": "菜单关闭后继续"})
+        self.wait_replies(1)
+        self.assertEqual(self.terminal(tid)["keys"], ["2", "Enter"])
+        budget = self.api("GET", "/automation")["runtime"]["deliveries_used"]
+        unknown = "PRIVATE_MENU_SNIPPET\n" + menu.replace("2. Keep current model", "2. Keep the current model")
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota", {"prompt": unknown, "status": "waiting_user_answer"})
+        self.until("unknown menu waits for owner", lambda: self.api("GET")["members"][0].get("quota_needs_owner"))
+        self.assertEqual(self.terminal(tid)["keys"], ["2", "Enter"])
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], budget)
+        self.assertNotIn("PRIVATE_MENU_SNIPPET", self.api("GET", "/log")["content"])
+        self.assertNotIn("PRIVATE_MENU_SNIPPET", (self.data / "groups.json").read_text())
+
+    def test_quota_terminal_unknown_manual_and_private_output(self):
+        self.create_group()
+        member = self.invite("额度成员", "claude_code", "developer")
+        tid = member["terminal_id"]
+        self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        self.api("PUT", "/automation", {"quota_enabled": True,
+            "quota_probe_interval_seconds": 0.08, "quota_probe_max_failures": 2})
+        # Claude Code 2.1.326 Zn/ZTe; no reset is also a supported rendering.
+        self.next_turn(tid, "unused", quota_prompt="PRIVATE_SYNTHETIC_BODY\nYou've hit your session limit")
+        self.api("POST", "/messages", {"text": "开始"})
+        self.until("hard quota", lambda: self.api("GET")["members"][0].get("quota_state") == "exhausted")
+        self.api("POST", "/messages", {"text": "随后"})
+        self.until("owner escalation", lambda: self.api("GET")["members"][0].get("quota_needs_owner"))
+        group = self.api("GET")
+        self.assertEqual(sum("@群主" in x["text"] for x in group["messages"]), 1)
+        self.assertFalse(any("可能未送达" in x["text"] for x in group["messages"]))
+        self.assertNotIn("PRIVATE_SYNTHETIC_BODY", json.dumps(group))
+        self.assertNotIn("PRIVATE_SYNTHETIC_BODY", self.api("GET", "/log")["content"])
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota-clear", {})
+        self.api("POST", f"/members/{member['id']}/quota", {"action": "resume"})
+        self.until("quota resumed", lambda: self.api("GET")["members"][0].get("quota_state") == "ok")
+        self.api("POST", f"/members/{member['id']}/quota", {"action": "pause"})
+        self.assertEqual(self.api("GET")["members"][0]["quota_state"], "exhausted")
+
     def test_fake_rejects_duplicate_session_creation_with_the_real_400(self):
         self.create_group()
         member=self.invite("开发","codex","developer")

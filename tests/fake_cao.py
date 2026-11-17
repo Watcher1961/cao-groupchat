@@ -195,12 +195,20 @@ class Handler(BaseHTTPRequestHandler):
                                    not any(t.get("deferred_init_failure") for t in terminals)):
                     return self.respond(404, {"detail": "session missing"})
                 return self.respond(200, {"session": session, "terminals": terminals})
-            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress)", path)
+            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress|quota|quota-clear)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
                 if terminal is None:
                     return self.respond(404, {"detail": "terminal missing"})
-                if control[2] == "next-turn":
+                if control[2] in ("quota", "quota-clear"):
+                    options = self.body()
+                    terminal["full_out"] = options.get("prompt", "") if control[2] == "quota" else self.prompt(terminal["provider"])
+                    terminal["out"] = ""
+                    terminal["status"] = options.get("status", "error") if control[2] == "quota" else "idle"
+                    terminal["pending"] = None
+                    terminal["output_generation"] += 1
+                    terminal["status_generation"] = terminal["output_generation"]
+                elif control[2] == "next-turn":
                     terminal["next_turn"] = self.body()
                 elif control[2] == "ready":
                     terminal["startup_ready"] = True
@@ -256,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(200, {"ok": True})
                 if sub == "/exit" and method == "POST":
                     return self.respond(200, {"success": True})
+                if sub == "/key" and method == "POST":
+                    terminal.setdefault("keys", []).append(query["key"])
+                    return self.respond(200, {"success": True})
                 if sub == "/input" and method == "POST":
                     message = query["message"]
                     boundary = terminal["output_generation"]
@@ -286,6 +297,12 @@ class Handler(BaseHTTPRequestHandler):
                             terminal["status"] = "idle"
                             terminal["output_generation"] += 1
                             self.write_raw(terminal, self.prompt(terminal["provider"]))
+                    elif options.get("quota_prompt"):
+                        terminal["status"] = "error"
+                        terminal["pending"] = None
+                        terminal["output_generation"] += 1
+                        terminal["status_generation"] = terminal["output_generation"]
+                        terminal["full_out"] = options["quota_prompt"]
                     elif turn["complete_on_input"]:
                         self.complete(terminal, turn)
                     elif turn["idle_stream"]:

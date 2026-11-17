@@ -422,7 +422,7 @@ AST 确认仅 handle_reply/post_message/automation_state/automation_view/idle_co
 | 2 | 30.727 秒 | 141 项，OK |
 | 3 | 30.320 秒 | 141 项，OK |
 
-AST 确认生产仅 reply_work_state 变化，预算/群主等待/relay/完成判定/聊天清洗/effort 均不变；7 文件范围、相对链接/围栏、新增隐私、`git diff --check` 和运行日志忽略检查通过。独立修复为本节所属提交，交接给出 SHA，待 Claude 复审、不推送。预算/协调成员/提及群主的真实联调结论以本节群主报告为准，新缩进修复仍待群主复测；本次未操作临时真实实例或开发群，也未修改前端/推理强度。
+AST 确认生产仅 reply_work_state 变化，预算/群主等待/relay/完成判定/聊天清洗/effort 均不变；7 文件范围、相对链接/围栏、新增隐私、`git diff --check` 和运行日志忽略检查通过。独立修复 `d32dc4b` 已复审，群主真实复测通过，结案。预算/协调成员/提及群主的真实联调结论以本节群主报告为准；本次未操作临时真实实例或开发群，也未修改前端/推理强度。
 
 
 2026-11-14，群主确认 `d32dc4b` 真实复测通过：Codex 回复“状态：等群主”后不再提醒，状态回到“进行中”后提醒恢复；本项结案。此前等待群主的独立修复为 `e438bdf`，预算暂停/恢复、定向协调成员和群主发言恢复的真实通过结果沿用上节群主报告。
@@ -484,6 +484,61 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 项目本地设置会影响人在同目录另开的 Claude CLI，属于方案 B 的边界；多个群共享目录被拒绝。识别所有权用本群完整生成命令，仓库/Python/数据目录迁移后需先清理旧项再开启。读改写只做进程内串行和补偿，不与外部编辑器或崩溃建立多文件事务；不要同时手改该设置。
 
+
+## 新一轮第 2 项：按额度调度（待审查）
+
+群主于 2026-11-17 确认第 1 项 `059e01d` 已审查通过并结案（不推送），仅授权本项。范围为 server.py、index.html、tests/、docs/；不改采集脚本、全局设置或忽略规则，不操作真实开发群。完成后全量验证、本地提交并交 Claude 独立审查，交接后停止写入。
+
+### 群主已确认设计与实现
+
+群主确认 `quota_enabled=false`，只在显式开启的群自动暂停/恢复；关闭群不显示等额度操作，原只读额度显示不受影响。成员面板提供开关和阈值，自动化 API 同样可配置。群主确认硬限额中断后固定中文续接、不重发原文，每次等待最多一次、计入预算。
+
+选择“先续接、后投递保留队列”：中断的 active_delivery 原本早于 outbox 所有消息，先发后续消息会越过未完成任务。只在硬限额来自本轮新输出、原投递 ID/attempt 仍匹配且未完成时，把固定 `[自动续接 quota:<群ID>:<次数>] 额度已恢复，请从中断处继续刚才的任务，完成后按规则在末行写状态。` 放在队首；保留 hops/silent，不附带原文。续接作业使用确定的持久化 ID 和 quota_continuation_token，先保存再走原 input/预算路径；预算不足保留队首，崩溃或不确定投递不自动重发。迟到完成优先，空 idle 输入框与关闭错误轮的 done 都不能单独证明任务完成。
+
+| 验收 | 实现与回归 |
+| --- | --- |
+| 额度与阈值 | 成员 quota_state=ok/near/exhausted，已知 quota_resets_at；合法未来窗口达到 100% 耗尽，可选阈值达到为 near；多窗口取最晚阻塞 reset，Claude 含 spend_limit；无有效初始数据为 ok |
+| 暂停与保序 | flush/dispatch 前都检查，原 FIFO 保留、attempt/预算不增加；near 继续提取在途回复；暂停抑制 watchdog 和该成员空闲提醒；每次等待只一条初始说明 |
+| 恢复与累计 | 默认宽限 120 秒，未知每 900 秒探测、8 次失败后仅一次 @群主；按成员累计 quota_wait_seconds，重启保留；恢复重设排队/进展时钟，等待不算空闲、不扣预算或提醒次数 |
+| 正向恢复证据 | 重新读取额度和终端；可用窗口或新代就绪提示，无数据/空输出不算可用。已知 reset 已过宽限且同代历史提示后有就绪输入框、无新阻塞窗口时，可确认旧提示过期，不依赖新模型调用；旧 time-only 提示不滚成次日 |
+| 手动控制 | 仅开启群可 pause/resume；手动未知标记记录当前代际，旧就绪不自动解除；强制恢复不依赖观察成功，忽略同一旧结构化快照，新终端拒绝仍暂停；关闭清除覆盖，保存失败恢复成员/累计/队列时钟 |
+| Codex 菜单 | 仅 waiting_user_answer 才是活动菜单；标题和唯一编号的 Keep current model 精确匹配才发数字及 Enter；动作前持久化标记，失败不重试按键，不确定时等待群主；idle 中 FIFO 菜单历史不阻断投递 |
+| 兼容/隐私 | 默认关闭不读新信号、不显示操作按钮，旧 JSON 实际加载通过；不改原 usage、采集脚本、profile/effort 或全局设置；新增诊断只含固定动作及元数据，状态不保存原始终端 |
+| 前端 | 默认关闭开关可操作，开启后阈值/卡片/恢复/标记；轮询包含额度与分钟签名；4 项新增 Node 实际执行，演示只模拟手动状态/队列，无真实采集或自动恢复承诺 |
+
+未知 provider（包括 hermes、antigravity_cli）的终端检测待验证，不进入识别分支。真实 provider 限额和菜单端到端联调仍待验证，不将本轮隔离结果记成真实通过。
+
+### 只读提示依据（2026-11-17，codex）
+
+先查本机已安装 CAO providers/codex.py、claude_code.py、hermes.py、antigravity_cli.py：未找到可直接复用的硬限额检测。Codex provider:472 的 “You have 1 usage limit reset available” 是可用 reset 通知，不能判为耗尽；本轮不匹配它。hermes、antigravity_cli 的终端限额特征查无可靠证据，本轮不支持，标“待验证”。其他未证实 provider 同样不猜测。
+
+| 来源 | 已确认内容与使用边界 |
+| --- | --- |
+| 已安装 `@openai/codex` package.json 版本 0.164.0；其 darwin-arm64 vendor 原生二进制字面量 | `You’ve hit your usage limit.`，以及 `Try again at` / `or try again at`；同处日期格式 `%b %-d`、`, %Y %-I:%M %p`。按独立整行匹配，允许原生错误前缀 `■ `；不匹配正文前带 Example/引用/代码的行。未知日期保留未知，不推断额度已恢复 |
+| 同一 Codex 二进制菜单字面量 | `Approaching rate limits`、`Usage limit reached`、`Keep current model`、`Keep current model (never show again)`。菜单编号不来自二进制推断；必须从当前屏幕唯一的 `N. Keep current model` 精确解析 N，同时存在标题和多个编号选项，无重复编号/同名选项；否则不给按键。测试中的 1/2/3 是合成渲染输入，不声称真实菜单固定编号为 2 |
+| 已安装 Claude Code 原生版本 2.1.326 中的可读 JavaScript，`Zn` / `ZTe` 及 session 兼容字符串 | `You've hit your session limit` 与 5-hour/weekly/Opus/Sonnet/Fable/usage credit 等名称；月度 spend 文案也有实际字面量。`Zn` 拼接 ` · resets ...`，缺 reset 时不拼接。不是单凭 HTTP 429 或泛化 “limit” 判断 |
+| 同版 Claude `y0` 时间格式化函数 | en-US，12 小时制小写 am/pm；整点省略分钟；超过一天带月/日，跨年带年份；可带 `(IANA timezone)`。合成测试使用 `10pm (Asia/Singapore)` 和 `Nov 20, 2:30pm (Asia/Singapore)`，无真实账号数据 |
+| 已安装 CAO api/main.py:4740–4758 | `POST /terminals/{id}/key?key=...` 支持单个数字和 Enter；可用于精确匹配后的菜单操作，避免经 input 清空 FIFO、创建投递或消耗预算。实现使用此接口，先持久化去重再发送按键 |
+
+未触碰真实终端或凭据。尝试只读获取 Codex 同版本公开源码文件返回 HTTPError，未将该 URL 当作证据；依据为已安装二进制的实际字符串。以上不等于真实限额端到端验证。匹配样本都只含合成数据，原终端正文不写入新日志/持久化字段。
+
+### 测试先行与当前验证
+
+生产未改时运行 14 项后端新测试：`Ran 14 tests in 0.174s`，16 个错误子项，原因为新设置、额度字段/接口尚不存在。随后生产仍未改时运行 2 项 HTTP + 3 项 Node：`Ran 5 tests in 0.750s`，2 errors、3 failures；均复现缺少对应行为。fake 已增加限额屏幕、恢复和按键观察，仅运行于临时 HOME/数据/日志及随机端口。
+
+首次实现仅含独立终端/日期/菜单解析与前端显示，当时等待群主确认启用和续接策略。扩展日期测试后发现 Python 3.15 禁止无年份的日历解析：先失败，再显式补入观察年份修复。修正 Node refresh 夹具缺少 messages/composer 桩后，3 项解析 + 3 项 Node（卡片、按钮请求、额度变化刷新）实际通过：`Ran 6 tests in 0.237s`、OK，无跳过。前端 API 请求此时仍为沙盒桩，不代表后端按钮已接通。
+
+实现中全量基线（2026-11-17，codex）：实际运行 `python3 -B -m unittest discover -s tests -v`，`Ran 189 tests in 36.037s`，15 errors（13 项调度/手动 API 单测、2 项 HTTP；均为待实现契约），其余 174 项通过，无 skipped。不能记为全量通过。Python AST 语法、文档相对链接及 `git diff --check` 通过；尚无真实 provider 限额联调。
+
+群主补充约束后再补续接先行测试，22 项中 1 failure、18 errors（0.460 秒）后实现。专项和 HTTP 又依次复现并修复：空闲输入框误收结束、旧错误遮蔽真实 done、time-only 重置滚到次日、围栏样本误判、菜单遮蔽结构化信号和抢先派发、旧结构化快照因输出代际误暂停、关闭保存失败不回滚、强制恢复依赖观察、FIFO 历史菜单阻断。每个修复均先有失败断言；保留队列、预算、令牌、迟到完成及正文不进入新日志/状态的独立预期，未用生产解析器生成测试期望。HTTP 夹具等待实际初始静默轮完成/异步队列可见；Codex rollout 使用实际年月日目录结构，不以固定 sleep 推断已入队。
+
+历史完整实现全量：203 项在 39.240 秒通过；补手动覆盖/错误 done/设置回滚等边界后 210 项在 40.599 秒、212 项在 40.480 秒通过，均无跳过，后两轮把 ResourceWarning 视为错误。最终菜单历史修复后的全量证据见下段。第 5 项媒体查询收尾仍待复审，未改其真实状态。
+
+最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 213 tests in 40.675s`、OK，退出 0，无跳过、无资源警告；其中 157 后端（含新增 36 项额度）、36 HTTP（新增 5 项）、20 Node（新增 4 项）均实际执行。HTTP 使用真实后端与 fake 子进程、随机端口、临时 HOME/数据/日志/项目，未触碰真实 CAO 或开发群；fake 新增限额屏幕/恢复/按键观察，未启动真实 provider。前端为行为回归，浏览器布局与真实限额时机仍待验证。
+
+提交前检查：Python AST、文档相对链接/围栏、新增隐私、`git diff --check`、11 文件范围和 GROUP_LOG 忽略通过。AST 对比确认 build_profile/effort/install_profile/start_member/member_ready/get_codex_reply/get_reply/clean_output/group_usage/claude_limits 不变，claude_statusline.py 未改。生产仅把额度控制接入原队列、派发、watchdog、轮询、空闲及设置，新增成员 quota API；无独立无关重构。d32dc4b 残留已修正为“已复审，群主真实复测通过，结案”，第 5 项媒体查询状态仍待复审。
+
+状态：本项本地提交待 Claude 独立审查，交接给出 SHA；不推送、不进入下一项。
 
 ## 任务 3 提交顺序与边界
 

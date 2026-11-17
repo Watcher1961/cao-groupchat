@@ -23,6 +23,18 @@ class FrontendEffortTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "OK\n")
 
+    def test_quota_switch_and_disabled_actions(self):
+        self.check_ui("settings", "frontend_quota.js")
+
+    def test_quota_cards_known_unknown_near_and_owner(self):
+        self.check_ui("cards", "frontend_quota.js")
+
+    def test_quota_manual_buttons_call_member_api(self):
+        self.check_ui("buttons", "frontend_quota.js")
+
+    def test_quota_changes_refresh_member_cards(self):
+        self.check_ui("refresh", "frontend_quota.js")
+
     def test_provider_specific_choices_and_edit_selection(self):
         self.check_ui("choices")
 

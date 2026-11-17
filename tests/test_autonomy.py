@@ -35,7 +35,9 @@ class AutonomyTests(ServerTestCase):
         settings = self.server.automation_view(self.group)
         self.assertEqual(settings["settings"], {
             "relay_limit": 6, "delivery_budget": None, "idle_minutes": 0,
-            "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None, "claude_limits": False})
+            "reminder_cooldown_minutes": 5, "reminder_limit": 3, "coordinator_id": None, "claude_limits": False,
+            "quota_enabled": False, "quota_pause_percent": None, "quota_reset_grace_seconds": 120,
+            "quota_probe_interval_seconds": 900, "quota_probe_max_failures": 8})
         self.assertEqual(self.group, before)
         self.server.check_idle_reminder(self.group, now=1000)
         self.server.check_idle_reminder(self.group, now=100000)
