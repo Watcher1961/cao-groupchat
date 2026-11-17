@@ -500,7 +500,7 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 | 额度与阈值 | 成员 quota_state=ok/near/exhausted，已知 quota_resets_at；合法未来窗口达到 100% 耗尽，可选阈值达到为 near；多窗口取最晚阻塞 reset，Claude 含 spend_limit；无有效初始数据为 ok |
 | 暂停与保序 | flush/dispatch 前都检查，原 FIFO 保留、attempt/预算不增加；near 继续提取在途回复；暂停抑制 watchdog 和该成员空闲提醒；每次等待只一条初始说明 |
 | 恢复与累计 | 默认宽限 120 秒，未知每 900 秒探测、8 次失败后仅一次 @群主；按成员累计 quota_wait_seconds，重启保留；恢复重设排队/进展时钟，等待不算空闲、不扣预算或提醒次数 |
-| 正向恢复证据 | 重新读取额度和终端；可用窗口或新代就绪提示，无数据/空输出不算可用。已知 reset 已过宽限且同代历史提示后有就绪输入框、无新阻塞窗口时，可确认旧提示过期，不依赖新模型调用；旧 time-only 提示不滚成次日 |
+| 正向恢复证据 | 重新读取额度和终端；可用窗口或新代就绪提示，无数据/空输出不算可用。已知 reset 已过宽限且同一限额提示后有就绪输入框（不依赖重绘代际）、无新阻塞窗口时，可确认旧提示过期，不依赖新模型调用；旧 time-only 提示不滚成次日 |
 | 手动控制 | 仅开启群可 pause/resume；手动未知标记记录当前代际，旧就绪不自动解除；强制恢复不依赖观察成功，忽略同一旧结构化快照，新终端拒绝仍暂停；关闭清除覆盖，保存失败恢复成员/累计/队列时钟 |
 | Codex 菜单 | 仅 waiting_user_answer 才是活动菜单；标题和唯一编号的 Keep current model 精确匹配才发数字及 Enter；动作前持久化标记，失败不重试按键，不确定时等待群主；idle 中 FIFO 菜单历史不阻断投递 |
 | 兼容/隐私 | 默认关闭不读新信号、不显示操作按钮，旧 JSON 实际加载通过；不改原 usage、采集脚本、profile/effort 或全局设置；新增诊断只含固定动作及元数据，状态不保存原始终端 |
@@ -538,7 +538,20 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 提交前检查：Python AST、文档相对链接/围栏、新增隐私、`git diff --check`、11 文件范围和 GROUP_LOG 忽略通过。AST 对比确认 build_profile/effort/install_profile/start_member/member_ready/get_codex_reply/get_reply/clean_output/group_usage/claude_limits 不变，claude_statusline.py 未改。生产仅把额度控制接入原队列、派发、watchdog、轮询、空闲及设置，新增成员 quota API；无独立无关重构。d32dc4b 残留已修正为“已复审，群主真实复测通过，结案”，第 5 项媒体查询状态仍待复审。
 
-状态：本项本地提交待 Claude 独立审查，交接给出 SHA；不推送、不进入下一项。
+状态：首版 `e37a4c9` 已被 Claude 阻塞；以下为独立修复记录，完成后交复审，不推送、不进入下一项。
+
+### e37a4c9 审查修复：重绘不能把钟点限额推到次日（待复审）
+
+审查来源：2026-11-17 Claude 独立复跑 213 项通过（40.27 秒），但在首次限额后推进 output_generation，发现 `resets 10pm` 在 reset+宽限后变成次日，随后每天再顺延，失败次数保持 0，无法恢复或提及群主。首版“同代旧提示”的保护不足，审查不通过。只读核对本机 CAO 2.5.4 `services/status_monitor.py:322`：每个输出片段都会增加代际，输入框/状态栏重绘不能当作新拒绝。
+
+修复仅改变提示身份和恢复锚定：对已匹配限额行去 ANSI、规范化空白后取 SHA-256，保留摘要及首次解析的绝对重置时间；重读相同提示沿用该时间，无关终端内容和代际变化不改变锚点。不保存原行或页脚。到期且有正向就绪输入框时按旧提示摘要恢复；没有就绪证据则按原时点累计失败并达到上限后提及群主，不能因每次重绘重设探测时间。不同提示仍能表示新限额。成功接受新 input 后清除历史提示摘要，防止忽略新轮在下一天出现的相同钟点提示；手动解除也改为按提示摘要识别。缺少摘要的首版等待数据，用已保存 reset 前一秒校验当前提示，匹配原 reset 才迁移，旧 JSON 仍可加载。
+
+新增 6 项回归，每项覆盖 Claude/Codex：代际前进并实际更改无关页脚，原时点恢复且一天后不复发；无就绪时保留原 reset、累计失败至 @群主；后端重启保留锚点；真正改变提示可更新限额；新 input 后相同钟点是新拒绝；无摘要旧状态迁移。钟点样本沿用本节已证实的 Claude `resets ...` 与 Codex `Try again at ...` 模板及已有 12 小时制解析格式，属于合成回归，不声称捕获了新的真实账号提示。测试直接推进时间和输出代际，不用生产解析器生成期望。
+
+测试先行：生产未改时 42 项额度专项出现 10 个失败子项（0.813 秒），复现审查问题；实现后 42 项通过（0.812 秒）。再实际改变无关页脚，并断言页脚和原提示不进入状态/日志，随后运行完整验收。审查者提出的轮询写盘频率及派发前额外 GET 属非阻塞建议，本次未调整。
+
+修复后最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 219 tests in 41.186s`、OK，退出 0，无跳过/资源警告。包含 163 后端（额度 42 项，新增 6 项分别覆盖两种 provider）、36 HTTP、20 Node，全部实际执行；仍为随机端口、临时 HOME/项目/数据/日志和 fake CAO，无真实 provider 限额联调结论。AST 核对仅 dispatch_delivery/terminal_quota_signal/quota_refresh/set_member_quota/update_automation 五个额度相关函数变化；前端、采集脚本、provider/profile/effort、完成提取原函数不变。文档链接/围栏、私人路径/密钥模式、5 文件范围、`git diff --check` 和共享日志忽略均核对通过。独立修复本地提交待 Claude 复审，交接给出 SHA；不推送。
+
 
 ## 任务 3 提交顺序与边界
 

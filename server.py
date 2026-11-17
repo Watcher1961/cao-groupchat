@@ -680,6 +680,9 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
         r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})
         # Fresh statuses belong to this dispatch only above CAO's boundary.
         with lock:
+            # A newly accepted input may produce the same clock hint on another day.
+            for key in ("quota_terminal_hint_id", "quota_terminal_hint_reset", "quota_terminal_cleared_hint_id"):
+                m.pop(key, None)
             m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
             m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
             save_state()
@@ -1237,7 +1240,9 @@ def terminal_quota_signal(provider: str, raw: str, now: float | None = None) -> 
         if not re.fullmatch(pattern, line):
             continue
         reset = re.search(r"(?:[Tt]ry again at |resets (?:at )?)(.+?)(?:\. |$)", line)
-        return {"state": "exhausted", "percent": 100, "source": "terminal",
+        # A repaint changes output_generation, but not this matched hint's identity.
+        hint_id = hashlib.sha256(re.sub(r"\s+", " ", line).encode()).hexdigest()
+        return {"state": "exhausted", "percent": 100, "source": "terminal", "hint_id": hint_id,
                 "resets_at": quota_reset_time(reset[1], now) if reset else None}
     return None
 
@@ -1372,19 +1377,31 @@ def quota_refresh(g: dict, m: dict, terminal: dict | None = None) -> bool:
     terminal = terminal or {}
     hard = terminal_quota_signal(m.get("provider"), raw, now) if readable else None
     generation = terminal.get("output_generation")
-    if (hard and quota_waiting(g, m) and m.get("quota_source") == "terminal"
-            and generation == m.get("quota_pause_generation") and m.get("quota_resets_at") is not None):
-        hard["resets_at"] = m["quota_resets_at"]
+    same_hint = False
+    if hard:
+        same_hint = hard["hint_id"] == m.get("quota_terminal_hint_id")
+        if same_hint:
+            hard["resets_at"] = m.get("quota_terminal_hint_reset")
+        elif ("quota_terminal_hint_id" not in m and quota_waiting(g, m)
+              and m.get("quota_source") == "terminal" and m.get("quota_resets_at") is not None):
+            # Pre-fix saved states lack an identity. Match the hint against the
+            # already published reset, rather than interpreting its clock tomorrow.
+            anchored = terminal_quota_signal(m.get("provider"), raw, m["quota_resets_at"] - 1)
+            if anchored and anchored["resets_at"] == m["quota_resets_at"]:
+                same_hint = True
+                hard["resets_at"] = m["quota_resets_at"]
+        m["quota_terminal_hint_id"] = hard["hint_id"]
+        m["quota_terminal_hint_reset"] = hard["resets_at"]
     reset = m.get("quota_resets_at")
     known_reset_ready = (quota_waiting(g, m) and reset is not None
                          and now >= reset + automation_settings(g)["quota_reset_grace_seconds"]
-                         and generation == m.get("quota_pause_generation")
+                         and (hard is None or same_hint)
                          and readable and quota_prompt_ready(m, terminal, raw))
     if hard and known_reset_ready and structured is None:
-        # The published reset has passed; the same old hint is history, not a new rejection.
-        m["quota_terminal_cleared_generation"] = generation
+        # Published reset + ready prompt retire this hint, regardless of repaint output.
+        m["quota_terminal_cleared_hint_id"] = hard["hint_id"]
         hard = None
-    if "quota_terminal_cleared_generation" in m and generation == m["quota_terminal_cleared_generation"]:
+    if hard and hard["hint_id"] == m.get("quota_terminal_cleared_hint_id"):
         hard = None
     if not automation_settings(g)["quota_enabled"]:
         return False
@@ -1520,7 +1537,7 @@ def set_member_quota(g: dict, m: dict, body: dict) -> None:
                 signal = None
             m["quota_override"] = signal or hard
             if hard:
-                m["quota_terminal_cleared_generation"] = terminal.get("output_generation")
+                m["quota_terminal_cleared_hint_id"] = hard["hint_id"]
             m["quota_override_generation"] = terminal.get("output_generation")
             quota_resume(g, m, now, forced=True)
         save_state()
@@ -1613,7 +1630,8 @@ def update_automation(g: dict, body: dict) -> dict:
                         member.update(quota_state="ok", quota_resets_at=None, quota_needs_owner=False, last_progress_at=time.time())
                         member.pop("quota_interrupted_delivery", None)
                         member.pop("quota_interrupted_attempt", None)
-                        for key in ("quota_override", "quota_override_generation", "quota_terminal_cleared_generation", "quota_menu_attempted"):
+                        for key in ("quota_override", "quota_override_generation", "quota_terminal_cleared_generation", "quota_terminal_hint_id", "quota_terminal_hint_reset",
+                                    "quota_terminal_cleared_hint_id", "quota_menu_attempted"):
                             member.pop(key, None)
                         for job in member.get("outbox", []):
                             job["queued_at"] = time.time()

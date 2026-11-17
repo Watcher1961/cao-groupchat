@@ -325,6 +325,121 @@ class QuotaTests(ServerTestCase):
         self.tick(1)
         self.assertEqual(self.m["quota_state"], "ok")
 
+    def clock_hint_case(self, provider, *, ready=True):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        self.now.return_value = datetime(2026, 11, 17, 21, 59, tzinfo=ZoneInfo("Asia/Singapore")).timestamp()
+        self.m = {"id": "dev", "name": "开发", "terminal_id": "dev-terminal", "ready_terminal": "dev-terminal",
+                  "provider": provider, "status": "idle", "pending": False, "outbox": []}
+        self.group["members"] = [self.m]
+        self.group["messages"] = []
+        self.group.pop("automation_state", None)
+        self.inputs = []
+        self.generation = 2
+        self.status = "idle" if ready else "error"
+        self.hint = CLAUDE_LIMIT if provider == "claude_code" else CODEX_LIMIT + " Try again at 10:00 PM."
+        self.prompt = "────────────\n❯ \n────────────\n? for shortcuts" if provider == "claude_code" else "codex>\n? for shortcuts"
+        self.raw = self.hint + ("\n" + self.prompt if ready else "")
+        self.enable(quota_reset_grace_seconds=120, quota_probe_interval_seconds=30, quota_probe_max_failures=2)
+        if provider == "codex":
+            # Codex's time-only formatter uses the terminal's local timezone.
+            from unittest.mock import patch
+            import os, time
+            zone_patch = patch.dict(os.environ, {"TZ": "Asia/Singapore"})
+            zone_patch.start()
+            time.tzset()
+            self.addCleanup(lambda: (zone_patch.stop(), time.tzset()))
+        self.tick()
+        return self.now.return_value + 60
+
+    def test_redrawn_clock_hint_recovers_at_original_reset_for_both_providers(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                reset = self.clock_hint_case(provider)
+                self.assertEqual(self.m["quota_resets_at"], reset)
+                self.generation += 1
+                self.raw += "\nPRIVATE_REDRAW_FOOTER"
+                self.tick(179)
+                self.assertEqual(self.m["quota_resets_at"], reset)
+                self.generation += 1
+                self.tick(1)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.generation += 1
+                self.tick(86400)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.assertEqual(self.server.automation_view(self.group)["runtime"]["quota_wait_seconds"]["dev"], 180)
+                self.assertNotIn("PRIVATE_REDRAW_FOOTER", self.server.STATE_FILE.read_text())
+                self.assertNotIn(self.hint, self.server.STATE_FILE.read_text())
+                self.assertNotIn("PRIVATE_REDRAW_FOOTER", self.log_text())
+
+    def test_redrawn_clock_hint_without_prompt_counts_failures_and_escalates(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                reset = self.clock_hint_case(provider, ready=False)
+                self.generation += 1
+                self.tick(180)
+                self.assertEqual(self.m["quota_resets_at"], reset)
+                self.assertEqual(self.m["quota_probe_failures"], 1)
+                self.generation += 1
+                self.tick(86400)
+                self.assertEqual(self.m["quota_resets_at"], reset)
+                self.assertEqual(self.m["quota_probe_failures"], 2)
+                self.assertTrue(self.m["quota_needs_owner"])
+                self.assertEqual(sum("@群主" in item["text"] for item in self.group["messages"]), 1)
+
+    def test_redrawn_clock_hint_keeps_anchor_across_restart(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.clock_hint_case(provider)
+                self.server.save_state()
+                self.server.load_state()
+                self.group = self.server.groups[self.group["id"]]
+                self.m = self.group["members"][0]
+                self.generation += 1
+                self.tick(180)
+                self.assertEqual(self.m["quota_state"], "ok")
+
+    def test_changed_clock_hint_is_a_new_blocking_signal(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                reset = self.clock_hint_case(provider)
+                self.raw = self.raw.replace("10pm", "11pm").replace("10:00 PM", "11:00 PM")
+                self.generation += 1
+                self.tick(180)
+                self.assertEqual(self.m["quota_state"], "exhausted")
+                self.assertEqual(self.m["quota_resets_at"], reset + 3600)
+
+    def test_same_clock_hint_after_new_input_is_a_new_rejection(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                reset = self.clock_hint_case(provider)
+                self.generation += 1
+                self.tick(180)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.raw = self.prompt
+                self.generation += 1
+                self.server.send_to(self.group, self.m, "new task", 0)
+                self.assertEqual(self.inputs, ["new task"])
+                self.raw = self.hint + "\n" + self.prompt
+                self.generation += 1
+                self.tick(86400 - 180)
+                self.assertEqual(self.m["quota_state"], "exhausted")
+                self.assertEqual(self.m["quota_resets_at"], reset + 86400)
+
+    def test_legacy_paused_clock_hint_without_fingerprint_can_recover(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.clock_hint_case(provider)
+                self.m.pop("quota_terminal_hint_id", None)
+                self.m.pop("quota_terminal_hint_reset", None)
+                self.server.save_state()
+                self.server.load_state()
+                self.group = self.server.groups[self.group["id"]]
+                self.m = self.group["members"][0]
+                self.generation += 1
+                self.tick(180)
+                self.assertEqual(self.m["quota_state"], "ok")
+
     def test_empty_idle_after_hard_limit_does_not_complete_interrupted_job(self):
         job = self.interrupted()
         self.raw = "────────────\n❯ \n────────────\n? for shortcuts"

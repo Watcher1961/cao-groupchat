@@ -122,13 +122,13 @@
 
 `automation` 增加 `quota_enabled=false`、`quota_pause_percent=null`、`quota_reset_grace_seconds=120`、`quota_probe_interval_seconds=900`、`quota_probe_max_failures=8`。开关严格 bool，阈值有限且 0–100 或 null，宽限非负、间隔正数、失败上限正整数。`GET/PUT /api/groups/{id}/automation` 沿用部分更新；成员面板开关与阈值直接调用此接口，Mock 只模拟手动状态/队列，不模拟真实账号额度。未开启时不读取新额度信号，不显示操作按钮，原只读 usage 不受影响。
 
-`quota_windows` 复用账号共享 Codex rollout 和本群可选 Claude 快照；只接受合法百分比与未来重置时间。阻塞窗口合并取最晚 reset，避免一个窗口恢复而另一个仍耗尽。`terminal_quota_signal` 仅返回状态、百分比、reset、来源；排除围栏/四空格代码与引用示例。Codex done 可能关闭错误轮，不单凭 done 吞掉硬限额；后续原生 reply bullet 和 done 才可淘汰历史错误。`codex_quota_menu` 要求已知标题、唯一选项和编号，不猜固定编号；操作前先持久化已尝试标记，然后经 CAO `/key` 发送数字和 Enter，不走 input 或预算，失败不重复按键。来源见 [任务记录](TASKS.md)。
+`quota_windows` 复用账号共享 Codex rollout 和本群可选 Claude 快照；只接受合法百分比与未来重置时间。阻塞窗口合并取最晚 reset，避免一个窗口恢复而另一个仍耗尽。`terminal_quota_signal` 仅返回状态、百分比、reset、来源及匹配提示的 SHA-256 摘要；排除围栏/四空格代码与引用示例。Codex done 可能关闭错误轮，不单凭 done 吞掉硬限额；后续原生 reply bullet 和 done 才可淘汰历史错误。`codex_quota_menu` 要求已知标题、唯一选项和编号，不猜固定编号；操作前先持久化已尝试标记，然后经 CAO `/key` 发送数字和 Enter，不走 input 或预算，失败不重复按键。来源见 [任务记录](TASKS.md)。
 
 暂停沿用成员投递锁：flush 和真正 dispatch 前都复核额度/控制菜单，未派发作业留原 outbox，不增加 attempt 或预算预留；预算仍由原全局锁统一预留。near/exhausted 都抑制 watchdog，near 仍提取当前轮回复；被硬限额中断的轮次不能因空 idle 输入框当作完成。暂停成员从空闲协调候选中排除；全员暂停则重置群 idle_since。状态转换和累计等待计数使用全局状态锁，网络探测在其外；成员锁在全局锁之前。设置关闭清理强制覆盖，写盘失败恢复额度字段、排队时钟和累计值。
 
 每次进入等待增加成员 quota_episode，记录 quota_state、quota_resets_at、quota_source、quota_percent、下一探测时间、失败数和人工处理标记。`automation_state.quota_wait_seconds` 按成员累计，API 摘要补上尚未持久化的当前等待时长而不改变状态。重启保留等待、队列和令牌，停机时段计入额度等待而不算连续空闲。恢复重设排队启动时钟和在途进展时钟；不扣除原已发送作业的预算。
 
-已知 reset 加宽限后重新读取窗口和终端，未知按间隔检查；缺数据不作为已暂停成员的恢复证据。新有效窗口低于阈值，或不同代输出中的就绪输入框且无硬限额，可解除；已知 reset 到期且同代旧提示之后已有就绪输入框、没有新的阻塞窗口时，旧提示被标为历史并可解除，防止依赖下一次模型调用刷新额度的死锁。旧 time-only 文案不随时钟滚成次日。连续失败达上限后只提及群主一次，维持等待，仍可接收迟到完成。读取状态/额度均不发送模型请求。手动恢复忽略同一份旧结构化信号；终端硬限额只有同代旧信号被忽略，新拒绝仍会暂停。
+已知 reset 加宽限后重新读取窗口和终端，未知按间隔检查；缺数据不作为已暂停成员的恢复证据。新有效窗口低于阈值，或不同代输出中的就绪输入框且无硬限额，可解除；已知 reset 到期且同一条旧限额提示之后已有就绪输入框、没有新的阻塞窗口时，旧提示被标为历史并可解除，防止依赖下一次模型调用刷新额度的死锁。提示标识取去除 ANSI、规范化空白后的匹配限额行摘要，忽略无关页脚/输入框重绘；不持久化原行。quota_terminal_hint_id/quota_terminal_hint_reset 把首次观察映射到绝对 reset，同一提示重新读取不按当前日期滚到次日，不依赖 output_generation。缺少摘要的旧等待记录，用原 reset 前一秒重新解析当前提示，只有仍对应原 reset 才迁移锚点。不同提示仍可更新阻塞时间；未就绪的旧提示到期后正常累计失败、最终交群主。连续失败达上限后只提及群主一次，维持等待，仍可接收迟到完成。读取状态/额度均不发送模型请求。手动恢复忽略同一份旧结构化信号；已确认过期或手动解除的终端提示按 quota_terminal_cleared_hint_id 忽略，重绘不会重新激活；成功接受新 input 后清除旧提示/解除摘要，因此新轮即使出现相同钟点提示也会重新判定，新拒绝仍会暂停。
 
 中断确认要求当前 active_delivery 未完成，硬限额属于发送后新输出（output_generation 超过投递 boundary；缺代际时使用发送前屏幕摘要比较），并保存原投递 ID/attempt。只有这对标识仍匹配时才可续接。恢复时优先接收真实完成，否则等正向就绪，把固定中文提示放在队首，ID=`quota:<群ID>:<成员ID>:<等待次数>`，持久化 quota_continuation_token 后才允许 input；清掉旧中断标识，不重发原正文。顺序选择“先续接、后新消息”，因为中断的 active_delivery 早于所有 outbox 消息；反向顺序会越过未完成任务。续接沿用 hops/silent 并计 delivery_budget，预算不足时仍在队首。崩溃/不确定 input 保留既有 uncertain 语义，不自动重发；不承诺 CAO 与本地文件的跨进程事务。
 
