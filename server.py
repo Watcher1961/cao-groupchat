@@ -653,6 +653,11 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
         if automation_settings(g)["quota_enabled"] and m.get("provider") in ("codex", "claude_code"):
             quota_raw = raw if raw is not None else get_full_output(m)
             m["quota_dispatch_hash"] = hashlib.sha256(quota_raw.encode()).hexdigest()
+            text = quota_text(quota_raw)
+            _, hints = terminal_quota_matches(m.get("provider"), quota_raw)
+            m.update(quota_dispatch_delivery=[job["id"], job["attempt"]], quota_dispatch_hints=hints,
+                     quota_dispatch_seen_hints={}, quota_dispatch_text_len=len(text),
+                     quota_dispatch_text_hash=hashlib.sha256(text.encode()).hexdigest())
         with lock:
             m.update(boundary=None, reply_handled=False, sent_at=time.time(), saw_busy=False,
                      hops=job["hops"], silent=job["silent"], dispatch_confirmed=False,
@@ -680,9 +685,6 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
         r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})
         # Fresh statuses belong to this dispatch only above CAO's boundary.
         with lock:
-            # A newly accepted input may produce the same clock hint on another day.
-            for key in ("quota_terminal_hint_id", "quota_terminal_hint_reset", "quota_terminal_cleared_hint_id"):
-                m.pop(key, None)
             m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
             m.update(delivery_state="sent", dispatch_confirmed=True, progress_generation=m["boundary"])
             save_state()
@@ -1200,9 +1202,15 @@ def quota_reset_time(text: str, now: float) -> float | None:
     return None
 
 
-def quota_screen_lines(raw: str) -> list[str]:
-    lines, fence = [], None
-    for line in ANSI.sub("", raw).replace("\r", "\n").splitlines():
+def quota_text(raw: str) -> str:
+    return ANSI.sub("", raw).replace("\r", "\n")
+
+
+def quota_screen_lines(raw: str, *, offsets: bool = False, limit: int | None = 24) -> list:
+    lines, fence, offset = [], None, 0
+    for chunk in quota_text(raw).splitlines(keepends=True):
+        line, start = chunk.rstrip("\n"), offset
+        offset += len(chunk)
         marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if marker:
             run = marker[1]
@@ -1212,39 +1220,87 @@ def quota_screen_lines(raw: str) -> list[str]:
                 fence = None
             continue
         if fence is None and not line.startswith("    "):
-            lines.append(line.strip())
-    return lines[-24:]
+            lines.append((start, line.strip()) if offsets else line.strip())
+    return lines[-limit:] if limit is not None else lines
 
 
-def terminal_quota_signal(provider: str, raw: str, now: float | None = None) -> dict | None:
-    # Binary literals / date format evidence is recorded in docs/TASKS.md.
-    # Never return or persist the screen or any unmatched tail text.
+
+def terminal_quota_matches(provider: str, raw: str, now: float | None = None) -> tuple[list, dict]:
+    # Return only positions, counts and allow-listed metadata, never screen text.
     if provider not in ("codex", "claude_code"):
-        return None
+        return [], {}
     now = time.time() if now is None else now
+    after_reply = 0
     if provider == "codex":
         done = [position for position, state in codex_markers(raw) if state == "done"]
         if done:
-            completed = ANSI.sub("", raw[:max(done)])
+            completed = quota_text(raw[:max(done)])
             bullets = list(re.finditer(r"(?m)^ {0,3}• (?!You have \d+ usage limit reset)[^\n]+", completed))
             errors = list(re.finditer(r"You[’']ve hit your usage limit", completed))
             if bullets and errors and bullets[-1].start() > errors[-1].start():
-                raw = completed[bullets[-1].start():] + raw[max(done):]
-    lines = quota_screen_lines(raw)
+                after_reply = bullets[-1].start()
+    rows = quota_screen_lines(raw, offsets=True, limit=None)
     if provider == "codex":
         pattern = r"(?:■ )?You[’']ve hit your usage limit(?: for [^.\n]{1,80})?\.(?: .*)?"
     else:
         pattern = (r"(?:[●⎿] )?You[’']ve hit your (?:session|5-hour|weekly|Opus|Sonnet|Fable|"
                    r"usage credit|monthly spend) limit(?:[. ·].*)?")
-    for line in reversed(lines):
-        if not re.fullmatch(pattern, line):
+    matches, counts = [], {}
+    for row, (position, line) in enumerate(rows):
+        if position < after_reply or not re.fullmatch(pattern, line):
             continue
         reset = re.search(r"(?:[Tt]ry again at |resets (?:at )?)(.+?)(?:\. |$)", line)
-        # A repaint changes output_generation, but not this matched hint's identity.
         hint_id = hashlib.sha256(re.sub(r"\s+", " ", line).encode()).hexdigest()
-        return {"state": "exhausted", "percent": 100, "source": "terminal", "hint_id": hint_id,
-                "resets_at": quota_reset_time(reset[1], now) if reset else None}
-    return None
+        counts[hint_id] = counts.get(hint_id, 0) + 1
+        if row >= len(rows) - 24:
+            signal = {"state": "exhausted", "percent": 100, "source": "terminal", "hint_id": hint_id,
+                      "resets_at": quota_reset_time(reset[1], now) if reset else None}
+            matches.append((position, counts[hint_id], signal))
+    return matches, counts
+
+
+def terminal_quota_signal(provider: str, raw: str, now: float | None = None) -> dict | None:
+    matches, _ = terminal_quota_matches(provider, raw, now)
+    return matches[-1][2] if matches else None
+
+
+def quota_delivery_hint(g: dict, m: dict, raw: str, now: float) -> dict | None:
+    matches, counts = terminal_quota_matches(m.get("provider"), raw, now)
+    job = m.get("active_delivery")
+    token = [job["id"], job["attempt"]] if job else None
+    baseline = m.get("quota_dispatch_hints")
+    if not m.get("pending") or token != m.get("quota_dispatch_delivery") or baseline is None:
+        return matches[-1][2] if matches else None
+    text = quota_text(raw)
+    length = m["quota_dispatch_text_len"]
+    appended = len(text) >= length and hashlib.sha256(text[:length].encode()).hexdigest() == m["quota_dispatch_text_hash"]
+    if not appended:
+        # A clear/roll can remove old copies. Never infer a new rejection from
+        # a changed generation or a moved copy alone; require an extra copy.
+        for hint_id in baseline:
+            baseline[hint_id] = min(baseline[hint_id], counts.get(hint_id, 0))
+    candidates = [match for match in matches if
+                  (match[0] >= length if appended else match[1] > baseline.get(match[2]["hint_id"], 0))]
+    if not candidates:
+        # Once confirmed, a current wait still owns its hint if the buffer rolls.
+        if (matches and quota_waiting(g, m) and m.get("quota_terminal_hint_delivery") == token
+                and matches[-1][2]["hint_id"] == m.get("quota_terminal_hint_id")):
+            return matches[-1][2]
+        return None
+    _, ordinal, hard = candidates[-1]
+    seen = m.setdefault("quota_dispatch_seen_hints", {})
+    copies = max(1, ordinal - baseline.get(hard["hint_id"], 0))
+    if copies > seen.get(hard["hint_id"], 0):
+        seen[hard["hint_id"]] = copies
+        if m.get("quota_terminal_hint_delivery") != token or m.get("quota_terminal_hint_id") != hard["hint_id"]:
+            for key in ("quota_terminal_hint_id", "quota_terminal_hint_reset", "quota_terminal_cleared_hint_id"):
+                m.pop(key, None)
+            if (m.get("quota_override") or {}).get("source") == "terminal":
+                m.pop("quota_override", None)
+                m.pop("quota_override_generation", None)
+    m["quota_terminal_hint_delivery"] = token
+    return hard
+
 
 
 def codex_quota_menu(raw: str) -> tuple[bool, str | None]:
@@ -1375,7 +1431,7 @@ def quota_refresh(g: dict, m: dict, terminal: dict | None = None) -> bool:
         except CaoError:
             pass
     terminal = terminal or {}
-    hard = terminal_quota_signal(m.get("provider"), raw, now) if readable else None
+    hard = quota_delivery_hint(g, m, raw, now) if readable else None
     generation = terminal.get("output_generation")
     same_hint = False
     if hard:
@@ -1444,7 +1500,10 @@ def quota_refresh(g: dict, m: dict, terminal: dict | None = None) -> bool:
         # Providers without generations need a changed screen compared with dispatch.
         if generation is None and m.get("quota_dispatch_hash"):
             fresh = hashlib.sha256(raw.encode()).hexdigest() != m["quota_dispatch_hash"]
-        if fresh:
+        job = m["active_delivery"]
+        has_hint_boundary = (m.get("quota_dispatch_delivery") == [job["id"], job["attempt"]]
+                             and isinstance(m.get("quota_dispatch_hints"), dict))
+        if fresh and has_hint_boundary:
             m["quota_interrupted_delivery"] = m["active_delivery"]["id"]
             m["quota_interrupted_attempt"] = m["active_delivery"]["attempt"]
     if not quota_waiting(g, m):
@@ -1631,7 +1690,9 @@ def update_automation(g: dict, body: dict) -> dict:
                         member.pop("quota_interrupted_delivery", None)
                         member.pop("quota_interrupted_attempt", None)
                         for key in ("quota_override", "quota_override_generation", "quota_terminal_cleared_generation", "quota_terminal_hint_id", "quota_terminal_hint_reset",
-                                    "quota_terminal_cleared_hint_id", "quota_menu_attempted"):
+                                    "quota_terminal_cleared_hint_id", "quota_terminal_hint_delivery", "quota_dispatch_delivery",
+                                    "quota_dispatch_hints", "quota_dispatch_seen_hints", "quota_dispatch_text_len",
+                                    "quota_dispatch_text_hash", "quota_menu_attempted"):
                             member.pop(key, None)
                         for job in member.get("outbox", []):
                             job["queued_at"] = time.time()

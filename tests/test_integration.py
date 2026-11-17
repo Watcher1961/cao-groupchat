@@ -271,6 +271,45 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_MENU_SNIPPET", self.api("GET", "/log")["content"])
         self.assertNotIn("PRIVATE_MENU_SNIPPET", (self.data / "groups.json").read_text())
 
+    def test_quota_recovered_history_then_new_rejection_in_appended_output(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.create_group()
+                member = self.invite("边界成员", provider, "developer")
+                tid = member["terminal_id"]
+                self.until("initial silent turn", lambda: not self.api("GET")["members"][0].get("pending"))
+                self.api("PUT", "/automation", {"quota_enabled": True})
+                # Existing installed-CLI literals; retain this hint as terminal history.
+                hint = "You've hit your session limit" if provider == "claude_code" else "■ You’ve hit your usage limit."
+                prompt = "────────────\n❯ \n────────────\n? for shortcuts" if provider == "claude_code" else "codex>\n? for shortcuts"
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota", {"prompt": hint + "\n" + prompt, "status": "idle"})
+                self.until("quota pause", lambda: self.api("GET")["members"][0].get("quota_state") == "exhausted")
+                self.api("POST", f"/members/{member['id']}/quota", {"action": "resume"})
+                before = len(self.terminal(tid)["inputs"])
+                self.next_turn(tid, "unused", hold=True, append_output=True)
+                self.api("POST", "/messages", {"text": "new task"})
+                self.until("new input accepted", lambda: len(self.terminal(tid)["inputs"]) == before + 1)
+                work = "\n> new task\nPRIVATE_HISTORY_WORK"
+                if provider == "codex":
+                    work += chr(27) + "]7501;state=working:app=codex" + chr(27) + chr(92)
+                polls = self.terminal(tid)["status_reads"]
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/progress", {"text": work})
+                self.until("observe normal work", lambda: self.terminal(tid)["status_reads"] >= polls + 3)
+                current = self.api("GET")["members"][0]
+                self.assertEqual(current["quota_state"], "ok")
+                self.assertTrue(current["pending"])
+                self.assertIsNone(current.get("quota_interrupted_delivery"))
+                self.assertIn(hint, self.terminal(tid)["full_out"])
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/progress", {"text": "\n" + hint})
+                self.until("new quota rejection", lambda: self.api("GET")["members"][0].get("quota_state") == "exhausted")
+                current = self.api("GET")["members"][0]
+                self.assertEqual(current["quota_interrupted_delivery"], current["delivery_id"])
+                self.assertEqual(len(self.terminal(tid)["inputs"]), before + 1)
+                self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 1)
+                self.assertNotIn("PRIVATE_HISTORY_WORK", (self.data / "groups.json").read_text())
+                self.assertNotIn("PRIVATE_HISTORY_WORK", self.api("GET", "/log")["content"])
+                self.api("DELETE")
+
     def test_quota_terminal_unknown_manual_and_private_output(self):
         self.create_group()
         member = self.invite("额度成员", "claude_code", "developer")

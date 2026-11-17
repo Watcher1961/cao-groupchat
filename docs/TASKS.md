@@ -540,7 +540,7 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 状态：首版 `e37a4c9` 已被 Claude 阻塞；以下为独立修复记录，完成后交复审，不推送、不进入下一项。
 
-### e37a4c9 审查修复：重绘不能把钟点限额推到次日（待复审）
+### e37a4c9 审查修复：重绘不能把钟点限额推到次日（原阻塞已修复，9224363 另有阻塞）
 
 审查来源：2026-11-17 Claude 独立复跑 213 项通过（40.27 秒），但在首次限额后推进 output_generation，发现 `resets 10pm` 在 reset+宽限后变成次日，随后每天再顺延，失败次数保持 0，无法恢复或提及群主。首版“同代旧提示”的保护不足，审查不通过。只读核对本机 CAO 2.5.4 `services/status_monitor.py:322`：每个输出片段都会增加代际，输入框/状态栏重绘不能当作新拒绝。
 
@@ -550,7 +550,18 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 测试先行：生产未改时 42 项额度专项出现 10 个失败子项（0.813 秒），复现审查问题；实现后 42 项通过（0.812 秒）。再实际改变无关页脚，并断言页脚和原提示不进入状态/日志，随后运行完整验收。审查者提出的轮询写盘频率及派发前额外 GET 属非阻塞建议，本次未调整。
 
-修复后最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 219 tests in 41.186s`、OK，退出 0，无跳过/资源警告。包含 163 后端（额度 42 项，新增 6 项分别覆盖两种 provider）、36 HTTP、20 Node，全部实际执行；仍为随机端口、临时 HOME/项目/数据/日志和 fake CAO，无真实 provider 限额联调结论。AST 核对仅 dispatch_delivery/terminal_quota_signal/quota_refresh/set_member_quota/update_automation 五个额度相关函数变化；前端、采集脚本、provider/profile/effort、完成提取原函数不变。文档链接/围栏、私人路径/密钥模式、5 文件范围、`git diff --check` 和共享日志忽略均核对通过。独立修复本地提交待 Claude 复审，交接给出 SHA；不推送。
+修复后最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 219 tests in 41.186s`、OK，退出 0，无跳过/资源警告。包含 163 后端（额度 42 项，新增 6 项分别覆盖两种 provider）、36 HTTP、20 Node，全部实际执行；仍为随机端口、临时 HOME/项目/数据/日志和 fake CAO，无真实 provider 限额联调结论。AST 核对仅 dispatch_delivery/terminal_quota_signal/quota_refresh/set_member_quota/update_automation 五个额度相关函数变化；前端、采集脚本、provider/profile/effort、完成提取原函数不变。文档链接/围栏、私人路径/密钥模式、5 文件范围、`git diff --check` 和共享日志忽略均核对通过。独立修复为 `9224363`；Claude 已确认本节原阻塞修复，但该提交因投递后残留旧提示的新问题未通过复审，见下节；不推送。
+
+### 9224363 审查修复：新轮不能把残留旧限额当成新拒绝（待复审）
+
+来源：2026-11-17 Claude 实际复跑 219 项通过（40.724 秒），确认时间锚、重绘恢复、失败上限及旧状态迁移通过；但 `dispatch_delivery` 成功后清空提示标识，导致新一轮尚在 working 时把最后 24 行中的旧提示再识别为新拒绝，误暂停并错误记录 quota_interrupted_delivery。本轮继续独立提交，不改写此前历史，不处理非阻塞性能建议。
+
+修复改为投递前保存边界，投递成功不清旧提示锚。规范化文本的字符长度/前缀摘要证明追加关系时，只看该边界后的提示位置；前缀因清空/滚动不匹配时，按投递前已有匹配摘要的副本数排除历史，明确观察到副本消失才降低保留计数，额外副本才是新拒绝。检测仍限最后 24 个有效显示行，但副本基线统计全部有效匹配行，不能靠历史滚出 24 行窗口伪造新实例。无法证明新增的移动旧行不自动标中断。基线和所属投递 ID/attempt 先随 dispatching 持久化；新实例第一次确认才使旧锚点失效，之后同一投递反复观察该提示不重新解释日期。已有等待在缓冲滚动时仍保持原原因。新字段仅含摘要、位置/长度、计数及投递标识，无终端正文。
+
+新增 6 项后端回归：两种 provider 各覆盖钟点、带日期、无时间三种格式的“旧提示仍在且正常工作”及“同句追加到新位置才拒绝”；另覆盖工作中重启、缓冲前缀被裁去、观察清空后同句重现。恢复后保留 raw 历史，不再用只剩 prompt 的夹具证明该场景。断言不误暂停、不误标中断、不额外续接、预算只计一次；真正新增拒绝仍标当前投递且重绘不顺延。生产未改先跑 47 项专项，16 个失败子项（0.944 秒）；实现后 47 项通过（1.145 秒）。另加 1 项 HTTP（两个 provider 子场景），用现有 fake 的 append_output/hold/progress 真实保留 FIFO：正常 working 后多次轮询保持 ok，再追加同句才变 exhausted，预算/隐私断言不变。未引入新终端提示特征，也未改变采集或前端。静态复核再补缺少投递前提示基线的旧在途场景：先失败 2 个 provider 子项（0.047 秒），再要求基线同时匹配当前 ID/attempt 才可确认中断；旧记录仍可进入额度等待，但不据代际变化自动续接。
+
+最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 226 tests in 43.324s`、OK，退出 0，无跳过/资源警告。169 后端（额度 48 项）、37 HTTP、20 Node 全部实际执行；新增 6 后端及 1 HTTP，两种 provider 均覆盖，未跑真实 CLI。此前未含最后一个旧在途保护的全量为 225 项（41.856 秒，OK），不以其替代最终结果。AST 核对仅 dispatch_delivery/quota_screen_lines/terminal_quota_signal/quota_refresh/update_automation 五个相关旧函数变更，新增三个规范化/匹配/边界辅助函数；原有测试断言、provider/profile/effort、采集、完成提取、前端及 API 路由未改。文档链接/围栏、隐私、6 文件范围、`git diff --check` 与共享日志忽略均核对通过。独立提交待 Claude 复审，交接给出 SHA；不推送、不进入下一项。
+
 
 
 ## 任务 3 提交顺序与边界

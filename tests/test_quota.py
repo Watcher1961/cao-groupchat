@@ -325,7 +325,7 @@ class QuotaTests(ServerTestCase):
         self.tick(1)
         self.assertEqual(self.m["quota_state"], "ok")
 
-    def clock_hint_case(self, provider, *, ready=True):
+    def clock_hint_case(self, provider, *, ready=True, kind="clock"):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         self.now.return_value = datetime(2026, 11, 17, 21, 59, tzinfo=ZoneInfo("Asia/Singapore")).timestamp()
@@ -338,6 +338,11 @@ class QuotaTests(ServerTestCase):
         self.generation = 2
         self.status = "idle" if ready else "error"
         self.hint = CLAUDE_LIMIT if provider == "claude_code" else CODEX_LIMIT + " Try again at 10:00 PM."
+        if kind == "dated":
+            self.hint = ("You've hit your session limit · resets Nov 17, 10pm (Asia/Singapore)"
+                         if provider == "claude_code" else CODEX_LIMIT + " Try again at Nov 17, 2026 10:00 PM.")
+        elif kind == "unknown":
+            self.hint = "You've hit your session limit" if provider == "claude_code" else CODEX_LIMIT
         self.prompt = "────────────\n❯ \n────────────\n? for shortcuts" if provider == "claude_code" else "codex>\n? for shortcuts"
         self.raw = self.hint + ("\n" + self.prompt if ready else "")
         self.enable(quota_reset_grace_seconds=120, quota_probe_interval_seconds=30, quota_probe_max_failures=2)
@@ -439,6 +444,131 @@ class QuotaTests(ServerTestCase):
                 self.generation += 1
                 self.tick(180)
                 self.assertEqual(self.m["quota_state"], "ok")
+
+    def recovered_hint_history(self, provider, kind="clock"):
+        reset = self.clock_hint_case(provider, kind=kind)
+        if kind == "unknown":
+            self.server.set_member_quota(self.group, self.m, {"action": "resume"})
+        else:
+            self.generation += 1
+            self.tick(180)
+        self.assertEqual(self.m["quota_state"], "ok")
+        return reset
+
+    def append_normal_work(self, provider):
+        self.raw += "\n> new task\nPRIVATE_NORMAL_WORKING"
+        if provider == "codex":
+            self.raw += chr(27) + "]7501;state=working:app=codex" + chr(27) + chr(92)
+        self.status = "processing"
+        self.generation += 1
+        self.tick(5)
+
+    def test_old_quota_history_does_not_interrupt_new_work(self):
+        for provider in ("claude_code", "codex"):
+            for kind in ("clock", "dated", "unknown"):
+                with self.subTest(provider=provider, kind=kind):
+                    self.recovered_hint_history(provider, kind)
+                    self.server.send_to(self.group, self.m, "new task", 0)
+                    job = self.m["active_delivery"]
+                    self.append_normal_work(provider)
+                    self.assertEqual(self.m["quota_state"], "ok")
+                    self.assertIs(self.m["active_delivery"], job)
+                    self.assertTrue(self.m["pending"])
+                    self.assertIsNone(self.m.get("quota_interrupted_delivery"))
+                    self.assertEqual(self.inputs, ["new task"])
+                    self.assertEqual(self.server.automation_view(self.group)["runtime"]["deliveries_used"], 1)
+                    self.server.save_state()
+                    self.assertNotIn("PRIVATE_NORMAL_WORKING", self.server.STATE_FILE.read_text())
+                    self.assertNotIn(self.hint, self.server.STATE_FILE.read_text())
+
+    def test_same_hint_at_new_position_after_input_is_a_new_rejection(self):
+        for provider in ("claude_code", "codex"):
+            for kind in ("clock", "dated", "unknown"):
+                with self.subTest(provider=provider, kind=kind):
+                    reset = self.recovered_hint_history(provider, kind)
+                    self.server.send_to(self.group, self.m, "new task", 0)
+                    job = self.m["active_delivery"]
+                    self.append_normal_work(provider)
+                    self.assertEqual(self.m["quota_state"], "ok")
+                    self.raw += "\n" + self.hint + "\n" + self.prompt
+                    self.status = "error"
+                    self.generation += 1
+                    self.tick(1)
+                    self.assertEqual(self.m["quota_state"], "exhausted")
+                    self.assertEqual(self.m["quota_interrupted_delivery"], job["id"])
+                    self.assertEqual(self.m["quota_resets_at"], reset + 86400 if kind == "clock" else None)
+                    anchored = self.m["quota_resets_at"]
+                    self.generation += 1
+                    self.tick(86400)
+                    self.assertEqual(self.m["quota_resets_at"], anchored)
+                    self.assertEqual(self.m["quota_probe_failures"], 1)
+                    self.assertEqual(self.inputs, ["new task"])
+
+    def test_old_hint_boundary_survives_restart_during_new_work(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.recovered_hint_history(provider)
+                self.server.send_to(self.group, self.m, "new task", 0)
+                self.append_normal_work(provider)
+                self.server.save_state()
+                self.server.load_state()
+                self.group = self.server.groups[self.group["id"]]
+                self.m = self.group["members"][0]
+                self.generation += 1
+                self.tick(5)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.assertIsNone(self.m.get("quota_interrupted_delivery"))
+                self.assertEqual(self.inputs, ["new task"])
+
+    def test_old_hint_with_trimmed_prefix_stays_history_until_another_copy(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.recovered_hint_history(provider)
+                history = self.raw
+                self.raw = "earlier output\n" * 60 + history
+                self.server.send_to(self.group, self.m, "new task", 0)
+                self.raw = history  # The rolling buffer dropped the unrelated prefix.
+                self.append_normal_work(provider)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.raw += "\n" + self.hint
+                self.status = "error"
+                self.generation += 1
+                self.tick(1)
+                self.assertEqual(self.m["quota_state"], "exhausted")
+
+    def test_same_hint_reappearing_after_observed_clear_is_new(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.recovered_hint_history(provider)
+                self.server.send_to(self.group, self.m, "new task", 0)
+                self.raw = self.prompt
+                self.status = "processing"
+                self.generation += 1
+                self.tick(1)
+                self.assertEqual(self.m["quota_state"], "ok")
+                self.raw += "\n" + self.hint
+                self.status = "error"
+                self.generation += 1
+                self.tick(1)
+                self.assertEqual(self.m["quota_state"], "exhausted")
+                self.assertEqual(self.m["quota_interrupted_delivery"], self.m["active_delivery"]["id"])
+
+    def test_missing_dispatch_hint_boundary_cannot_confirm_interruption(self):
+        for provider in ("claude_code", "codex"):
+            with self.subTest(provider=provider):
+                self.clock_hint_case(provider)
+                self.server.update_automation(self.group, {"quota_enabled": False})
+                self.raw = self.prompt
+                self.server.send_to(self.group, self.m, "legacy task", 0)
+                self.assertNotIn("quota_dispatch_delivery", self.m)
+                self.server.update_automation(self.group, {"quota_enabled": True})
+                self.raw += "\n" + self.hint
+                self.status = "error"
+                self.generation += 1
+                self.tick(1)
+                self.assertEqual(self.m["quota_state"], "exhausted")
+                self.assertIsNone(self.m.get("quota_interrupted_delivery"))
+                self.assertEqual(self.inputs, ["legacy task"])
 
     def test_empty_idle_after_hard_limit_does_not_complete_interrupted_job(self):
         job = self.interrupted()
