@@ -83,17 +83,29 @@ class Handler(BaseHTTPRequestHandler):
         terminal["status_generation"] = terminal["output_generation"]
         terminal["status"] = "completed"
         terminal["out"] = self.rendered_reply(terminal, turn["reply"])
-        if terminal["provider"] == "codex":
+        if terminal["provider"] == "hermes":
+            frame = ("☤ Hermes\n\n" + turn["reply"] + f"\n─ {terminal['output_generation']}.1s · read 1 file · 01:02 PM\n❯ synthetic prompt\n")
+            self.write_raw(terminal, frame)
+            terminal["out"] = "[NO RESPONSE - agent completed without producing a text response (99 lines in buffer)]\n" + terminal["full_out"]
+        elif terminal["provider"] == "codex":
             self.write_raw(terminal, "\x1b]7501;state=working:app=codex\x1b\\" + "x" * turn["padding_bytes"] + terminal["out"] +
                            "\x1b]7501;state=done:app=codex\x1b\\\n" + self.prompt(terminal["provider"]))
         else:
             self.write_raw(terminal, turn["reply"] + "\n" + self.prompt(terminal["provider"]))
+        if turn["full_output"] is not None:
+            terminal["full_out"] = ""
+            self.write_raw(terminal, turn["full_output"])
+        if turn["last_output"] is not None:
+            terminal["out"] = turn["last_output"]
         terminal["pending"] = None
 
     def route(self, method):
         url = parse.urlparse(self.path)
         query = {k: v[0] for k, v in parse.parse_qs(url.query).items()}
         path = url.path
+        maximum = self.server.config.get("max_input_target_bytes", 0)
+        if maximum and method == "POST" and re.fullmatch(r"/terminals/[^/]+/input", path) and len(self.path.encode("ascii")) > maximum:
+            return self.respond(400, {"detail": "Invalid HTTP request received."})
         creating = method == "POST" and (path == "/sessions" or
                    re.fullmatch(r"/sessions/[^/]+/terminals:operator", path))
         self.creation_event = None
@@ -130,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/agents/providers" and method == "GET":
                 return self.respond(200, [
                     {"name": name, "installed": True, "binary": "simulated"}
-                    for name in ("codex", "claude_code")])
+                    for name in ("codex", "claude_code", "hermes", "antigravity_cli")])
             if path == "/agents/profiles" and method == "POST":
                 body = self.body()
                 self.server.profiles[body["name"]] = body["content"]
@@ -276,7 +288,8 @@ class Handler(BaseHTTPRequestHandler):
                         terminal["full_out"] = ""
                     stale = terminal["status"] == "completed"
                     turn = {
-                        "message": message, "dispatch_boundary": boundary,
+                        "message": message, "dispatch_boundary": boundary, "target_bytes": len(self.path.encode("ascii")),
+                        "full_output": options.get("full_output"), "last_output": options.get("last_output"),
                         "reply": options.get("reply", self.default_reply(terminal, message)),
                         "held": options.get("hold", False),
                         "stale_remaining": options.get("stale_polls", 2) if stale else 0,

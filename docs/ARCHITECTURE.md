@@ -14,9 +14,10 @@
 | `tests/test_claude_limits.py` | 19 项脚本、项目设置所有权/回滚、生命周期容错、额度缓存及真实输入框字节回归 |
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
+| `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 19 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 31 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
-| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 16 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
+| `tests/test_integration.py` | 40 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 20 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
 
@@ -133,3 +134,17 @@
 中断确认要求当前 active_delivery 未完成，硬限额属于发送后新输出（output_generation 超过投递 boundary；缺代际时使用发送前屏幕摘要比较），并保存原投递 ID/attempt；还必须有匹配本次 ID/attempt 的提示基线，缺失基线的历史在途作业不能据代际变化确认中断、不能自动安排续接。只有这对标识仍匹配时才可续接。恢复时优先接收真实完成，否则等正向就绪，把固定中文提示放在队首，ID=`quota:<群ID>:<成员ID>:<等待次数>`，持久化 quota_continuation_token 后才允许 input；清掉旧中断标识，不重发原正文。顺序选择“先续接、后新消息”，因为中断的 active_delivery 早于所有 outbox 消息；反向顺序会越过未完成任务。续接沿用 hops/silent 并计 delivery_budget，预算不足时仍在队首。崩溃/不确定 input 保留既有 uncertain 语义，不自动重发；不承诺 CAO 与本地文件的跨进程事务。
 
 `POST /api/groups/{id}/members/{mid}/quota` 只接 `{action:"pause"}` 或 `{action:"resume"}`，关闭群拒绝操作。每次进入等待只一条说明；恢复、菜单动作及失败上限另有固定系统提示。新增持久化字段仅含额度/运行元数据和摘要，不含原始终端；诊断不附终端正文、异常正文或凭据。前端轮询签名包含开关、阈值、成员额度及当前分钟，关闭群保留原状态和只读额度显示。Node 行为回归不替代浏览器布局或真实限额联调。
+
+## Hermes 提取与消息长度边界
+
+插队修复只在本程序适配，不修改 CAO/provider。群主提供的仓库外样本按只读离线分析；没有把原文、路径、姓名或实验聊天拷入夹具。Hermes v0.22.5 的实际助手标题是独立 `☤ Hermes`；已安装 CAO 2.5.4 providers/hermes.py:42–45 仍按横线包围的标题匹配，293–334 的提取失败使 last 返回带 NO RESPONSE 的整块渲染缓冲。末帧以 `─ <秒数>s · <可选工具摘要> · <时:分> AM/PM` 结束；原始 full 有进度重绘和退格，进度栏末尾还可能混有旧输入残片，因此进度栏按固定前缀识别，不要求末尾仍是横线。
+
+发送 Hermes input 前，记录 full/last 的规范化长度/前缀摘要、所有完整答案帧的摘要副本计数、terminal ID 和投递 ID/attempt；随原 dispatching 事务持久化，不记录屏幕正文。提取时必须匹配这次投递：可证明追加时只认边界之后的帧；重置/截断时按双模式基线的最大副本数排除旧答案；相同完整内容只有新增实例才算新轮。不仅比较 CAO 代际或 NO RESPONSE 头的行数。若只剩无法证明属于本轮的旧帧，固定提示而不复用。
+
+`get_hermes_reply` 优先带本轮归属证据的 last 帧；这是渲染滚屏，区别于有退格/光标更新残片的原始 FIFO。full 用于判断新帧是否仍 working，以及无退格歧义的降级；有退格且没有可靠 last 时拒绝提取，未实现通用终端仿真。完整结束页脚前仍有未完成标题/工作栏时保持 pending；无可靠答案时清理本轮、只发一条固定短系统说明，不走 handle_reply、提及路由或全文存储。答案中的代码围栏保持，TUI 输入框/状态块过滤。
+
+`bounded_input_query` 统一限制完整编码请求目标（path+query，不含 authority/headers）为 6000 ASCII 字节，按 Python urlencode 的 UTF-8 百分号编码计数，二分 Unicode 字符前缀并把截断注记一并计入预算。原作业正文保留，派发层和 cao 传输层共用同一幂等保护；旧失败/不确定任务重试也走该路径，原文字符数含转发前缀。依据：本机 CAO api/main.py:4682–4688 的 message 是 query 参数，没有 body 入口；本机 uvicorn h11 路径默认采用 h11/_connection.py:69 的 16 KiB 未完整事件缓冲，6000 给请求行其他部分及头部留裕量。该默认不是所有部署固定的请求行极限；隔离 fake 用 8192 字节目标上限复现长度 400，不把模拟阈值冒充真实服务器测量。未尝试用超长请求冲击真实 CAO。
+
+`display_reply` 限成员可见正文为 8000 字符，截断标记包含原字符数。完整合法答案以消息 full_text 保存在私有 groups.json，公开 text 存显示摘要；public_message 在群详情/增量和列表 last 预览统一去掉 full_text，并对旧超长 agent text 只在视图中截断。工作状态、提及和转发仍依据完整合法答案，实际转发再受 input URL 限制。无新全文接口或前端构建；不是把退化终端整屏存为 full_text。既有聊天日志可能含正常正文，本项不声称对旧日志脱敏。
+
+Gemini 次要问题：已安装 providers/antigravity_cli.py:985–1068 以最后 `> query` 到下一条分隔线取回复，没有跳过完整多行输入；输入自身含提示/分隔线时可返回输入中段，只有第一行被删掉时则混入输入尾部。用实际发送文本作精确可见字符比较：完整候选若是长度至少 40 字符的输入片段（或完整输入，即使短）则拒绝；可精确对应的输入尾部用线性前缀匹配去掉，再移除样本中确认的圆点 Thought 元数据行。NO RESPONSE 回退固定拒绝。不做语义相似推断；短片段复述不能可靠区分，仍待联调。给定 Gemini 样本没有 Hermes 标题，且缺当时发送文本/边界，无法逐条证明历史两次污染的具体来源，记录为已知验证缺口。

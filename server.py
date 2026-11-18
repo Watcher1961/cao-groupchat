@@ -193,6 +193,55 @@ def load_state() -> None:
             groups = {}
 
 
+INPUT_URL_LIMIT = 6000
+MEMBER_REPLY_LIMIT = 8000
+
+
+class ReplyExtractionError(Exception):
+    """A completed provider turn has no reliably attributable text."""
+
+
+class ReplyNotReady(Exception):
+    """The provider still has an unfinished framed response."""
+
+
+def bounded_input_query(path: str, query: dict) -> dict:
+    q = dict(query)
+    text = q.get("message")
+    if not re.fullmatch(r"/terminals/[^/]+/input", path) or not isinstance(text, str):
+        return q
+    def size(value):
+        return len((path + "?" + parse.urlencode({**q, "message": value})).encode("ascii"))
+    if size(text) <= INPUT_URL_LIMIT:
+        return q
+    note = f"\n（已截断，原文 {len(text)} 字，全文见群聊记录或本地群聊数据）"
+    if size(note) > INPUT_URL_LIMIT:
+        raise CaoError(0, "投递元数据超过 URL 上限")
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if size(text[:mid] + note) <= INPUT_URL_LIMIT:
+            lo = mid
+        else:
+            hi = mid - 1
+    q["message"] = text[:lo] + note
+    return q
+
+
+def display_reply(text: str) -> str:
+    if len(text) <= MEMBER_REPLY_LIMIT:
+        return text
+    note = f"\n（已截断，原文 {len(text)} 字，全文保存在本地群聊数据）"
+    return text[:MEMBER_REPLY_LIMIT - len(note)] + note
+
+
+def public_message(message: dict) -> dict:
+    out = {k: v for k, v in message.items() if k != "full_text"}
+    if out.get("kind") == "agent":
+        out["text"] = display_reply(out["text"])
+    return out
+
+
 class CaoError(Exception):
     def __init__(self, status: int, msg: str):
         super().__init__(f"CAO {status}: {msg}")
@@ -201,6 +250,8 @@ class CaoError(Exception):
 
 def cao(method: str, path: str, query: dict | None = None, body=None, timeout=30):
     q = {k: v for k, v in (query or {}).items() if v not in (None, "")}
+    if method == "POST":
+        q = bounded_input_query(path, q)
     url = CAO_URL + path + ("?" + parse.urlencode(q) if q else "")
     data = json.dumps(body).encode() if body is not None else None
     req = request.Request(url, data=data, method=method)
@@ -254,7 +305,7 @@ def append_log(g: dict, who: str, what: str) -> None:
 
 
 # ───────────────────────── 消息 ─────────────────────────
-def add_msg(g: dict, kind: str, sender: str, text: str, to=None, log=True, mid=None) -> dict:
+def add_msg(g: dict, kind: str, sender: str, text: str, to=None, log=True, mid=None, full_text=None) -> dict:
     with lock:
         m = {
             "seq": len(g["messages"]) + 1,
@@ -265,6 +316,8 @@ def add_msg(g: dict, kind: str, sender: str, text: str, to=None, log=True, mid=N
             "text": text,
             "to": to or [],
         }
+        if full_text is not None:
+            m["full_text"] = full_text
         g["messages"].append(m)
     if log and kind != "system":
         target = f"（→ {', '.join(to)}）" if to else ""
@@ -650,6 +703,10 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
     charged = False
     try:
         raw = get_full_output(m) if m.get("provider") == "codex" else None
+        wire = bounded_input_query(f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})["message"]
+        m["input_wire_chars"] = len(wire)
+        if m.get("provider") == "hermes":
+            snapshot_hermes_reply(m, job)
         if automation_settings(g)["quota_enabled"] and m.get("provider") in ("codex", "claude_code"):
             quota_raw = raw if raw is not None else get_full_output(m)
             m["quota_dispatch_hash"] = hashlib.sha256(quota_raw.encode()).hexdigest()
@@ -682,7 +739,7 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
                 charged = True
             save_state()  # Persist the reservation and in-flight job before input.
         attempted = True
-        r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})
+        r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": wire})
         # Fresh statuses belong to this dispatch only above CAO's boundary.
         with lock:
             m["boundary"] = r.get("dispatch_boundary") if isinstance(r, dict) else None
@@ -862,7 +919,186 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
     return get_reply(m)
 
 
+HERMES_TITLE = re.compile(r"^☤ Hermes$")
+HERMES_END = re.compile(r"^─+ \d+(?:\.\d+)?s(?: · [^\n]+)? · \d{1,2}:\d{2} (?:AM|PM)$")
+HERMES_BAR = re.compile(r"^─{2,}\s*[\u2800-\u28ff]")
+HERMES_STATUS = re.compile(r"^☤\s+.*·.*(?:\d|[█░])")
+
+
+def hermes_text(raw: str) -> str:
+    text = ANSI.sub("", raw).replace("\r", "")
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+
+
+def hermes_body(lines: list[str]) -> str:
+    body, frame, fence = [], False, None
+    for line in lines:
+        stripped = line.strip()
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            run = marker[1]
+            if fence is None:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence):
+                fence = None
+            body.append(line)
+            continue
+        if fence is not None:
+            body.append(line)
+            continue
+        if HERMES_STATUS.match(stripped):
+            frame = False
+            continue
+        if HERMES_BAR.match(stripped) or re.match(r"^☤\s*❯", stripped):
+            frame = True
+            continue
+        if frame or re.fullmatch(r"[─━═-]+", stripped) or re.match(r"^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", stripped):
+            continue
+        body.append(line)
+    return clean_output("\n".join(body), preserve_indent=True).strip()
+
+
+def hermes_blocks(raw: str) -> tuple[list, bool]:
+    text = hermes_text(raw)
+    lines = text.splitlines(keepends=True)
+    blocks, start, offset, fence, working, finished = [], None, 0, None, -1, -1
+    for i, chunk in enumerate(lines):
+        line = chunk.rstrip("\n")
+        position = offset
+        offset += len(chunk)
+        if start is not None:
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if marker:
+                run = marker[1]
+                if fence is None:
+                    fence = run
+                elif run[0] == fence[0] and len(run) >= len(fence):
+                    fence = None
+                continue
+        if fence is not None:
+            continue
+        if HERMES_TITLE.fullmatch(line.strip()) and line == line.lstrip():
+            start = (i + 1, position)
+        elif HERMES_END.fullmatch(line.strip()):
+            finished = position
+            if start is not None:
+                body = hermes_body([x.rstrip("\n") for x in lines[start[0]:i]])
+                if body:
+                    identity = re.sub(r"\s+", "", body) + "|" + line.strip()
+                    blocks.append((start[1], offset, hashlib.sha256(identity.encode()).hexdigest(), body))
+                start = None
+        elif HERMES_BAR.match(line.strip()) or re.match(r"^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*Working", line.strip()):
+            working = position
+    return blocks, start is not None or working > finished
+
+
+def snapshot_hermes_reply(m: dict, job: dict) -> None:
+    modes, counts = {}, {}
+    for mode in ("full", "last"):
+        try:
+            result = cao("GET", f"/terminals/{m['terminal_id']}/output", {"mode": mode})
+        except CaoError as exc:
+            if mode == "last" and exc.status == 422:
+                continue
+            raise
+        raw = result.get("output", "") if isinstance(result, dict) else str(result)
+        text = hermes_text(raw)
+        blocks, _ = hermes_blocks(raw)
+        seen = {}
+        for _, _, identity, _ in blocks:
+            seen[identity] = seen.get(identity, 0) + 1
+        for identity, count in seen.items():
+            counts[identity] = max(counts.get(identity, 0), count)
+        modes[mode] = {"length": len(text), "hash": hashlib.sha256(text.encode()).hexdigest()}
+    m["hermes_reply_boundary"] = {"delivery": [job["id"], job["attempt"]], "terminal": m["terminal_id"],
+                                 "modes": modes, "counts": counts}
+
+
+def get_hermes_reply(m: dict) -> str:
+    boundary = m.get("hermes_reply_boundary") or {}
+    job = m.get("active_delivery")
+    if (not job or boundary.get("delivery") != [job["id"], job["attempt"]]
+            or boundary.get("terminal") != m.get("terminal_id")):
+        raise ReplyExtractionError()
+    candidates = {}
+    for mode in ("last", "full"):
+        try:
+            result = cao("GET", f"/terminals/{m['terminal_id']}/output", {"mode": mode})
+        except CaoError as exc:
+            if mode == "last" and exc.status == 422:
+                continue
+            raise
+        raw = result.get("output", "") if isinstance(result, dict) else str(result)
+        blocks, working = hermes_blocks(raw)
+        if mode == "full" and working:
+            raise ReplyNotReady()
+        if mode == "full" and "\b" in raw:
+            continue  # Raw FIFO erasure cannot be reconstructed by stripping ANSI.
+        snapshot = boundary["modes"].get(mode)
+        if snapshot is None:
+            continue
+        text = hermes_text(raw)
+        length = snapshot["length"]
+        appended = len(text) >= length and hashlib.sha256(text[:length].encode()).hexdigest() == snapshot["hash"]
+        seen = {}
+        for start, _, identity, body in blocks:
+            seen[identity] = seen.get(identity, 0) + 1
+            if ((start >= length if appended else seen[identity] > boundary["counts"].get(identity, 0))):
+                candidates[mode] = body
+    if not candidates:
+        raise ReplyExtractionError()
+    return candidates.get("last", candidates.get("full"))
+
+
+def strip_gemini_echo(text: str, wire: str) -> str:
+    # Longest prefix of the extracted text which is an exact suffix of the input.
+    positions = [i for i, char in enumerate(text) if not char.isspace()]
+    candidate = "".join(text[i] for i in positions)
+    sent = re.sub(r"\s+", "", clean_output(wire))
+    if not candidate or not sent:
+        return text
+    if candidate in sent and (len(candidate) >= 40 or candidate == sent):
+        raise ReplyExtractionError()
+    pattern = candidate[:len(sent)]
+    pi = [0] * len(pattern)
+    for i in range(1, len(pattern)):
+        j = pi[i - 1]
+        while j and pattern[i] != pattern[j]:
+            j = pi[j - 1]
+        if pattern[i] == pattern[j]:
+            j += 1
+        pi[i] = j
+    matched = 0
+    for char in sent:
+        while matched and (matched == len(pattern) or pattern[matched] != char):
+            matched = pi[matched - 1]
+        if pattern[matched] == char:
+            matched += 1
+    if matched >= 40 or (matched == len(sent) and matched == len(candidate)):
+        text = text[positions[matched - 1] + 1:].lstrip()
+        text = re.sub(r"^[▸○]\s*Thought for [^\n]*(?:\n|$)", "", text).lstrip()
+        if not text:
+            raise ReplyExtractionError()
+    return text
+
+
+def missing_reply(g: dict, m: dict) -> None:
+    if m.get("reply_handled"):
+        return
+    m.update(reply_handled=True, pending=False, active_delivery=None, delivery_state="completed",
+             delivery_started=True, last_progress_at=time.time())
+    m.pop("_reply_work_state", None)
+    if not m.pop("silent", False):
+        add_msg(g, "system", "系统", f"未能可靠提取 {m['name']} 本轮回复，请查看终端；本轮未转发。", log=False)
+    else:
+        save_state()
+
+
 def get_reply(m: dict) -> str:
+    if m.get("provider") == "hermes":
+        text = get_hermes_reply(m)
+        m["_reply_work_state"] = reply_work_state(text)
+        return text
     tid = m["terminal_id"]
     for mode in ("last", "full"):
         try:
@@ -876,6 +1112,13 @@ def get_reply(m: dict) -> str:
             prev = m.get("full_len", 0)
             m["full_len"] = len(text)
             text = text[prev:]
+        if m.get("provider") == "antigravity_cli" and text.lstrip().startswith("[NO RESPONSE -"):
+            raise ReplyExtractionError()
+        if m.get("provider") == "antigravity_cli" and m.get("active_delivery"):
+            job = m["active_delivery"]
+            wire = (bounded_input_query(f"/terminals/{tid}/input", {"message": job["text"]})["message"]
+                    if "input_wire_chars" in m else job["text"])
+            text = strip_gemini_echo(clean_output(text), wire)
         with lock:
             m["_reply_work_state"] = reply_work_state(clean_output(text, preserve_indent=True))
         return clean_output(text)
@@ -918,7 +1161,11 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
         m["work_state"] = reported_state if reported_state is not None else reply_work_state(text)
         if "automation" in g and (re.search(r"@群主(?![\w一-鿿])", text) or (targets and hops >= relay_limit)):
             automation_state(g).update(awaiting_owner=True, idle_since=None)
-    add_msg(g, "agent", m["name"], text, mid=m["id"])
+    shown = display_reply(text)
+    if shown == text:
+        add_msg(g, "agent", m["name"], text, mid=m["id"])
+    else:
+        add_msg(g, "agent", m["name"], shown, mid=m["id"], full_text=text)
     for line in re.findall(r"^[^\S\r\n]*\[日志\][^\S\r\n]*(\S[^\r\n]*)\r?$", text, flags=re.M):
         append_log(g, m["name"], line)
     if targets and hops < relay_limit:
@@ -996,7 +1243,7 @@ def poll_member(g: dict, m: dict) -> None:
     elif st == "waiting_user_answer" and prev != st and fresh:
         try:
             tail = get_reply(m)[-800:]
-        except CaoError:
+        except (CaoError, ReplyExtractionError, ReplyNotReady):
             tail = ""
         add_msg(g, "system", "系统",
                 f"{m['name']} 在等待确认。可以 @{m['name']} 回复它（例如“同意”或“1”）。\n\n{tail}", log=False)
@@ -1004,6 +1251,13 @@ def poll_member(g: dict, m: dict) -> None:
           and (m.get("saw_busy") or boundary is not None or time.time() - m.get("sent_at", 0) > 8)):
         try:
             reply = get_reply(m)
+        except ReplyNotReady:
+            watch_delivery(g, m, t)
+            return
+        except ReplyExtractionError:
+            missing_reply(g, m)
+            flush_outbox(g, m)
+            return
         except CaoError:
             watch_delivery(g, m, t)
             return
@@ -1148,7 +1402,7 @@ def post_message(g: dict, text: str) -> dict:
 
 def public_group(g: dict, since: int = 0) -> dict:
     out = {k: v for k, v in g.items() if k != "messages"}
-    out["messages"] = [m for m in g["messages"] if m["seq"] > since]
+    out["messages"] = [public_message(m) for m in g["messages"] if m["seq"] > since]
     out["log_file"] = str(log_path(g))
     out["members"] = []
     for m in g["members"]:
@@ -2343,7 +2597,7 @@ class H(BaseHTTPRequestHandler):
                 with lock:
                     return self._json(200, [
                         {"id": g["id"], "name": g["name"], "members": len(g["members"]),
-                         "last": (g["messages"][-1] if g["messages"] else None)}
+                         "last": (public_message(g["messages"][-1]) if g["messages"] else None)}
                         for g in groups.values()])
             if p == ["groups"] and method == "POST":
                 return self._json(201, public_group(create_group(self._body())))

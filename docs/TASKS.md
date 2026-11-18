@@ -1,5 +1,20 @@
 # 本轮任务与交接
 
+## 插队修复：Hermes 回复提取与超长投递（待审查）
+
+群主于 2026-11-18 授权插队，优先于下方既有顺序；仅修 Hermes 退化提取、超长 input 及回复显示，并查明可复现的 Gemini 回显机制。不恢复已暂停实验、不操作真实成员；范围仅 server.py、tests/ 和 PRD/ARCHITECTURE/TASKS，未改前端、采集脚本、CAO 或全局设置。第 2 项（a）三个提交按群主消息同步为“已审查通过，真实限额联调待验证”，其他待复审状态保持。
+
+- 本机私有四样本仅只读离线，未写入仓库、临时夹具或提交说明；结构显示 Hermes 实际标题与已安装 CAO 头部正则不兼容。渲染 last 无退格，raw full 含退格和进度栏尾部旧输入残片，不能把两者都当普通文本。新逻辑优先本轮渲染答案，双模式快照/完整帧计数防止旧轮复用；未完成等待，提取失败只发固定短系统消息，不转发原屏。
+- input 的编码 path+query 固定 6000 ASCII 字节，注记也在上限内；二分前缀保留 Unicode 完整编码，原作业正文/跳数/尝试令牌不改，failed 和 uncertain 旧任务在真实后端重启后人工重试同样受保护。依据与 fake 8192 字节模拟上限的区别见 ARCHITECTURE。
+- 成员显示最多 8000 字符，完整合法答案留私有 groups.json 的 full_text；详情、增量及列表预览不公开此字段，旧记录只裁剪视图不重写。没有把整屏 fallback 当答案存档。
+- Gemini 源码可复现多行输入尾部/中段被当回复；新增精确回显剥离及输入片段/NO RESPONSE 拒绝。私有 Gemini 样本不足以逐条还原历史两次污染，无法精确区分的短复述仍待真实复测，未声称历史根因均已端到端验证。
+
+测试先行：生产未改，首批 14 项单测为 14 failures、4 errors（0.293 秒，含子项），覆盖回合边界、长度、重试、留存和回显；另把 HEAD 原服务器复制到临时隔离目录，用新 fake 跑 3 项 HTTP，旧版 4 个失败子项、无错误，不改 Git 历史。实现后离线真实样本探针暴露进度栏尾部残片与 raw/渲染差异，分别合成先失败再修复；Gemini 中段及 NO RESPONSE 两项也先失败。新重试 HTTP 的多次进程回收和旧 uncertain 进展元数据夹具已修正，未放宽重试次数、长度或输出断言。所有夹具是合成数据。
+
+最终验证（2026-11-18，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 248 tests in 43.567s`、OK，退出 0，无跳过或资源警告；188 后端（新增回复安全 19 项）、40 HTTP（新增 3 项）和 20 Node 全部执行，原 226 项断言保留。离线纯正文探针读取仓库外实样，当前 last 帧得到短答案、没有回退前缀或标题、末行状态可识别；该探针不证明真实轮次归属，未向真实 CAO 发送任务或恢复实验。两次早期全量仅新 uncertain 重试夹具错误：它继承了上一个已完成轮的进展元数据，轮询合理恢复成 sent；修正为无确认/无工作证据的旧 uncertain 状态后最终全量通过，不改变生产重试竞争规则。
+
+静态检查：仅 7 个授权文件；Python AST 确认原 Codex 完成、全局 clean_output、profile/effort、启动就绪、retry_delivery 及额度核心函数未改；原测试断言不弱化。群列表与详情统一剥离私有全文，文档链接/围栏、敏感路径/密钥模式、私有样本正文未混入新增内容、`git diff --check` 和 GROUP_LOG 忽略检查通过。代码和测试无需 Node 构建或新第三方依赖，index.html 未改。独立本地提交待 Claude 审查，交接给出 SHA；不推送，交接后停止写入。
+
 ## 执行顺序与状态
 
 群主最终方案：Git → 规范 → 单测 → 集成，逐项串行。实现者完成验证并提交，再交独立审查者只读审查；通过后由群主决定是否进入下一项。任务 3 已由群主确认审查结案；群主于 2026-11-14 授权任务 4。任务 4 原自动验收已审查通过（群主确认）；群主已执行 8 步人工验收，7 步通过，第 7 步部分失败，窄窗口问题登记延期。重启后继续收发的补充测试也已由群主确认结案。
@@ -485,7 +500,7 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 项目本地设置会影响人在同目录另开的 Claude CLI，属于方案 B 的边界；多个群共享目录被拒绝。识别所有权用本群完整生成命令，仓库/Python/数据目录迁移后需先清理旧项再开启。读改写只做进程内串行和补偿，不与外部编辑器或崩溃建立多文件事务；不要同时手改该设置。
 
 
-## 新一轮第 2 项：按额度调度（待审查）
+## 新一轮第 2 项（a）：按额度调度（已审查通过，真实限额联调待验证）
 
 群主于 2026-11-17 确认第 1 项 `059e01d` 已审查通过并结案（不推送），仅授权本项。范围为 server.py、index.html、tests/、docs/；不改采集脚本、全局设置或忽略规则，不操作真实开发群。完成后全量验证、本地提交并交 Claude 独立审查，交接后停止写入。
 
@@ -538,9 +553,9 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 提交前检查：Python AST、文档相对链接/围栏、新增隐私、`git diff --check`、11 文件范围和 GROUP_LOG 忽略通过。AST 对比确认 build_profile/effort/install_profile/start_member/member_ready/get_codex_reply/get_reply/clean_output/group_usage/claude_limits 不变，claude_statusline.py 未改。生产仅把额度控制接入原队列、派发、watchdog、轮询、空闲及设置，新增成员 quota API；无独立无关重构。d32dc4b 残留已修正为“已复审，群主真实复测通过，结案”，第 5 项媒体查询状态仍待复审。
 
-状态：首版 `e37a4c9` 已被 Claude 阻塞；以下为独立修复记录，完成后交复审，不推送、不进入下一项。
+状态：`e37a4c9`、`9224363`、`5a17521` 的最终状态为“已审查通过，真实限额联调待验证”（群主 2026-11-18 确认）。以下保留各次失败及独立修复历史；本次未重跑真实限额。
 
-### e37a4c9 审查修复：重绘不能把钟点限额推到次日（原阻塞已修复，9224363 另有阻塞）
+### e37a4c9 审查修复：重绘不能把钟点限额推到次日（历史阻塞，后续已修复并审查通过）
 
 审查来源：2026-11-17 Claude 独立复跑 213 项通过（40.27 秒），但在首次限额后推进 output_generation，发现 `resets 10pm` 在 reset+宽限后变成次日，随后每天再顺延，失败次数保持 0，无法恢复或提及群主。首版“同代旧提示”的保护不足，审查不通过。只读核对本机 CAO 2.5.4 `services/status_monitor.py:322`：每个输出片段都会增加代际，输入框/状态栏重绘不能当作新拒绝。
 
@@ -552,7 +567,7 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 修复后最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 219 tests in 41.186s`、OK，退出 0，无跳过/资源警告。包含 163 后端（额度 42 项，新增 6 项分别覆盖两种 provider）、36 HTTP、20 Node，全部实际执行；仍为随机端口、临时 HOME/项目/数据/日志和 fake CAO，无真实 provider 限额联调结论。AST 核对仅 dispatch_delivery/terminal_quota_signal/quota_refresh/set_member_quota/update_automation 五个额度相关函数变化；前端、采集脚本、provider/profile/effort、完成提取原函数不变。文档链接/围栏、私人路径/密钥模式、5 文件范围、`git diff --check` 和共享日志忽略均核对通过。独立修复为 `9224363`；Claude 已确认本节原阻塞修复，但该提交因投递后残留旧提示的新问题未通过复审，见下节；不推送。
 
-### 9224363 审查修复：新轮不能把残留旧限额当成新拒绝（待复审）
+### 9224363 审查修复：新轮不能把残留旧限额当成新拒绝（已审查通过，真实限额联调待验证）
 
 来源：2026-11-17 Claude 实际复跑 219 项通过（40.724 秒），确认时间锚、重绘恢复、失败上限及旧状态迁移通过；但 `dispatch_delivery` 成功后清空提示标识，导致新一轮尚在 working 时把最后 24 行中的旧提示再识别为新拒绝，误暂停并错误记录 quota_interrupted_delivery。本轮继续独立提交，不改写此前历史，不处理非阻塞性能建议。
 
@@ -560,7 +575,7 @@ AST 核对生产仅 start_member/update_automation/configure_claude_statusline/g
 
 新增 6 项后端回归：两种 provider 各覆盖钟点、带日期、无时间三种格式的“旧提示仍在且正常工作”及“同句追加到新位置才拒绝”；另覆盖工作中重启、缓冲前缀被裁去、观察清空后同句重现。恢复后保留 raw 历史，不再用只剩 prompt 的夹具证明该场景。断言不误暂停、不误标中断、不额外续接、预算只计一次；真正新增拒绝仍标当前投递且重绘不顺延。生产未改先跑 47 项专项，16 个失败子项（0.944 秒）；实现后 47 项通过（1.145 秒）。另加 1 项 HTTP（两个 provider 子场景），用现有 fake 的 append_output/hold/progress 真实保留 FIFO：正常 working 后多次轮询保持 ok，再追加同句才变 exhausted，预算/隐私断言不变。未引入新终端提示特征，也未改变采集或前端。静态复核再补缺少投递前提示基线的旧在途场景：先失败 2 个 provider 子项（0.047 秒），再要求基线同时匹配当前 ID/attempt 才可确认中断；旧记录仍可进入额度等待，但不据代际变化自动续接。
 
-最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 226 tests in 43.324s`、OK，退出 0，无跳过/资源警告。169 后端（额度 48 项）、37 HTTP、20 Node 全部实际执行；新增 6 后端及 1 HTTP，两种 provider 均覆盖，未跑真实 CLI。此前未含最后一个旧在途保护的全量为 225 项（41.856 秒，OK），不以其替代最终结果。AST 核对仅 dispatch_delivery/quota_screen_lines/terminal_quota_signal/quota_refresh/update_automation 五个相关旧函数变更，新增三个规范化/匹配/边界辅助函数；原有测试断言、provider/profile/effort、采集、完成提取、前端及 API 路由未改。文档链接/围栏、隐私、6 文件范围、`git diff --check` 与共享日志忽略均核对通过。独立提交待 Claude 复审，交接给出 SHA；不推送、不进入下一项。
+最终验证（2026-11-17，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 226 tests in 43.324s`、OK，退出 0，无跳过/资源警告。169 后端（额度 48 项）、37 HTTP、20 Node 全部实际执行；新增 6 后端及 1 HTTP，两种 provider 均覆盖，未跑真实 CLI。此前未含最后一个旧在途保护的全量为 225 项（41.856 秒，OK），不以其替代最终结果。AST 核对仅 dispatch_delivery/quota_screen_lines/terminal_quota_signal/quota_refresh/update_automation 五个相关旧函数变更，新增三个规范化/匹配/边界辅助函数；原有测试断言、provider/profile/effort、采集、完成提取、前端及 API 路由未改。文档链接/围栏、隐私、6 文件范围、`git diff --check` 与共享日志忽略均核对通过。独立修复为 `5a17521`，与前两提交已获 Claude 审查通过（群主 2026-11-18 确认）；真实限额联调待验证，未推送。
 
 
 

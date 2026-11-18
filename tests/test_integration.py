@@ -167,6 +167,82 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_hermes_fallback_extracts_only_final_answer_and_suppresses_failed_extraction(self):
+        self.create_group()
+        member = self.invite("合成成员", "hermes", "developer")
+        tid = member["terminal_id"]
+        self.until("initial Hermes turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        answer = "合成最终答复。\n状态：已交付"
+        frame = "☤ Hermes\n\n" + answer + "\n─ 3.5s · read 2 files · 02:03 PM\n❯ synthetic prompt\n"
+        huge = "PRIVATE_TERMINAL_NOISE\n" * 7000 + frame
+        self.next_turn(tid, answer, full_output=frame, last_output="[NO RESPONSE - agent completed without producing a text response (999 lines in buffer)]\n" + huge)
+        self.api("POST", "/messages", {"text": "synthetic task"})
+        replies = self.wait_replies(1)
+        self.assertEqual(replies[0]["text"], answer)
+        self.assertNotIn("PRIVATE_TERMINAL_NOISE", json.dumps(self.api("GET")))
+        self.next_turn(tid, "unused", full_output="PRIVATE_BAD_SCREEN\n", last_output="[NO RESPONSE - agent completed without producing a text response (999 lines in buffer)]\n" + "PRIVATE_BAD_SCREEN\n" * 7000)
+        self.api("POST", "/messages", {"text": "second synthetic task"})
+        self.until("short extraction notice", lambda: any("未能可靠提取" in x["text"] for x in self.api("GET")["messages"]))
+        self.assertEqual(len(self.replies()), 1)
+        self.assertEqual(sum("未能可靠提取" in x["text"] for x in self.api("GET")["messages"]), 1)
+        self.assertNotIn("PRIVATE_BAD_SCREEN", (self.data / "groups.json").read_text())
+
+    def test_legacy_oversize_failed_and_uncertain_jobs_retry_with_safe_query(self):
+        self.create_group()
+        member = self.invite("重试成员", "claude_code", "developer")
+        tid = member["terminal_id"]
+        self.until("initial turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        self.http(self.cao_url, "POST", "/_test/config", {"max_input_target_bytes": 8192})
+        for index, state in enumerate(("failed", "uncertain")):
+            with self.subTest(state=state):
+                self.stopped_server = self.server
+                self.stop_process(self.server)
+                self.processes = [(proc, log) for proc, log in self.processes if proc is not self.server]
+                stored = json.loads((self.data / "groups.json").read_text())
+                group = stored[self.group_path.rsplit("/", 1)[1]]
+                current = group["members"][0]
+                original = "合成旧任务😀+" * 1000
+                job = {"id": f"legacy-{index}", "attempt": 1, "text": original,
+                       "hops": 2, "silent": False, "queued_at": time.time()}
+                current.update(active_delivery=job, outbox=[], pending=state == "uncertain", delivery_state=state,
+                               status="idle", reply_handled=False, dispatch_confirmed=False, boundary=None,
+                               delivery_started=False, saw_busy=False, progress_generation=None,
+                               sent_at=time.time(), last_progress_at=time.time(), delivery_warned=True)
+                (self.data / "groups.json").write_text(json.dumps(stored))
+                self.start_server()
+                before = len(self.terminal(tid)["inputs"])
+                self.next_turn(tid, "retry completed", complete_on_input=True)
+                self.api("POST", f"/members/{member['id']}/retry", {"delivery_id": job["id"], "delivery_attempt": 1})
+                def attempted():
+                    item = self.api("GET")["members"][0]
+                    return item if item.get("delivery_attempt") == 2 and item.get("delivery_state") in ("sent", "failed", "completed") or len(self.terminal(tid)["inputs"]) > before else None
+                self.until("legacy retry attempt", attempted)
+                self.assertEqual(len(self.terminal(tid)["inputs"]), before + 1)
+                wire = self.terminal(tid)["inputs"][-1]
+                self.assertLessEqual(wire["target_bytes"], 6000)
+                self.assertIn("已截断", wire["message"])
+                self.assertIn(str(len(original)), wire["message"])
+                self.until("retry finished", lambda: not self.api("GET")["members"][0].get("active_delivery") and not self.api("GET")["members"][0].get("pending"))
+
+    def test_gemini_echo_tail_and_long_reply_private_retention(self):
+        self.create_group()
+        member = self.invite("回显成员", "antigravity_cli", "developer")
+        tid = member["terminal_id"]
+        self.until("initial turn", lambda: not self.api("GET")["members"][0].get("pending"))
+        task = "first synthetic line\n" + "SYNTHETIC_INPUT_BANNER " * 5 + "\ninput tail"
+        echo = "SYNTHETIC_INPUT_BANNER " * 5 + "\ninput tail"
+        answer = "合成自己的回答。" * 1200 + "\n状态：已交付"
+        self.next_turn(tid, answer, last_output=echo + "\n○ Thought for 1.2s (synthetic title)\n" + answer)
+        self.api("POST", "/messages", {"text": task})
+        reply = self.wait_replies(1)[0]
+        self.assertLessEqual(len(reply["text"]), 8000)
+        self.assertNotIn("SYNTHETIC_INPUT_BANNER", reply["text"])
+        self.assertNotIn("full_text", reply)
+        groups = self.http(self.server_url, "GET", "/api/groups")
+        self.assertNotIn("full_text", groups[0]["last"])
+        private = json.loads((self.data / "groups.json").read_text())[self.group_path.rsplit("/", 1)[1]]
+        self.assertEqual(private["messages"][-1]["full_text"], answer)
+
     def test_quota_structured_pause_recovery_fifo_and_restart(self):
         self.create_group()
         member = self.invite("额度成员", "codex", "developer")
