@@ -14,9 +14,9 @@
 | `tests/test_claude_limits.py` | 19 项脚本、项目设置所有权/回滚、生命周期容错、额度缓存及真实输入框字节回归 |
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
-| `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 19 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
+| `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 40 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 41 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 20 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -143,8 +143,8 @@
 
 `get_hermes_reply` 优先带本轮归属证据的 last 帧；这是渲染滚屏，区别于有退格/光标更新残片的原始 FIFO。full 用于判断新帧是否仍 working，以及无退格歧义的降级；有退格且没有可靠 last 时拒绝提取，未实现通用终端仿真。完整结束页脚前仍有未完成标题/工作栏时保持 pending；无可靠答案时清理本轮、只发一条固定短系统说明，不走 handle_reply、提及路由或全文存储。答案中的代码围栏保持，TUI 输入框/状态块过滤。
 
-`bounded_input_query` 统一限制完整编码请求目标（path+query，不含 authority/headers）为 6000 ASCII 字节，按 Python urlencode 的 UTF-8 百分号编码计数，二分 Unicode 字符前缀并把截断注记一并计入预算。原作业正文保留，派发层和 cao 传输层共用同一幂等保护；旧失败/不确定任务重试也走该路径，原文字符数含转发前缀。依据：本机 CAO api/main.py:4682–4688 的 message 是 query 参数，没有 body 入口；本机 uvicorn h11 路径默认采用 h11/_connection.py:69 的 16 KiB 未完整事件缓冲，6000 给请求行其他部分及头部留裕量。该默认不是所有部署固定的请求行极限；隔离 fake 用 8192 字节目标上限复现长度 400，不把模拟阈值冒充真实服务器测量。未尝试用超长请求冲击真实 CAO。
+`bounded_input_query` 统一限制完整编码请求目标（path+query，不含 authority/headers）为 14000 ASCII 字节，按 Python urlencode 的 UTF-8 百分号编码计数，二分 Unicode 字符前缀并把截断注记一并计入预算。原作业正文保留，派发层和 cao 传输层共用同一幂等保护；旧失败/不确定任务重试也走该路径，原文字符数含转发前缀。依据：本机 CAO api/main.py:4682–4688 的 message 是 query 参数，没有 body 入口；本机 uvicorn h11 路径默认采用 h11/_connection.py:69 的 16384 字节（16 KiB）未完整事件缓冲。群主在 Claude 审查发现 6000 会截断以往成功消息后，确认上限为 14000，保留 2384 字节给请求行其余部分及头部，并以合成的约 12.6 KB 中文消息验证完整投递。此为本机默认及当前请求形态下的选择，不代表所有部署的请求行/请求头限制；自定义 h11 配置、代理或更长头部可能不同。隔离 fake 的目标阈值相应调为 15000 字节，仅用于模拟长度 400 与验证防护，不是 h11 默认或真实 CAO 的测量结果。未尝试用超长请求冲击真实 CAO。
 
 `display_reply` 限成员可见正文为 8000 字符，截断标记包含原字符数。完整合法答案以消息 full_text 保存在私有 groups.json，公开 text 存显示摘要；public_message 在群详情/增量和列表 last 预览统一去掉 full_text，并对旧超长 agent text 只在视图中截断。工作状态、提及和转发仍依据完整合法答案，实际转发再受 input URL 限制。无新全文接口或前端构建；不是把退化终端整屏存为 full_text。既有聊天日志可能含正常正文，本项不声称对旧日志脱敏。
 
-Gemini 次要问题：已安装 providers/antigravity_cli.py:985–1068 以最后 `> query` 到下一条分隔线取回复，没有跳过完整多行输入；输入自身含提示/分隔线时可返回输入中段，只有第一行被删掉时则混入输入尾部。用实际发送文本作精确可见字符比较：完整候选若是长度至少 40 字符的输入片段（或完整输入，即使短）则拒绝；可精确对应的输入尾部用线性前缀匹配去掉，再移除样本中确认的圆点 Thought 元数据行。NO RESPONSE 回退固定拒绝。不做语义相似推断；短片段复述不能可靠区分，仍待联调。给定 Gemini 样本没有 Hermes 标题，且缺当时发送文本/边界，无法逐条证明历史两次污染的具体来源，记录为已知验证缺口。
+Gemini 次要问题：已安装 providers/antigravity_cli.py:985–1068 以最后 `> query` 到下一条分隔线取回复，没有跳过完整多行输入；输入自身含提示/分隔线时可返回输入中段，只有第一行被删掉时则混入输入尾部。用实际发送文本作精确可见字符比较：完整候选若是长度至少 40 字符的输入片段（或完整输入，即使短）则拒绝；可精确对应的输入尾部用线性前缀匹配去掉，再移除样本中确认的圆点 Thought 元数据行。NO RESPONSE 回退固定拒绝。不做语义相似推断；短片段复述不能可靠区分，正常答案整段逐字引用输入且达到 40 字符时也可能被当作回显拒绝，仅影响 antigravity_cli，仍待真实联调。给定 Gemini 样本没有 Hermes 标题，且缺当时发送文本/边界，无法逐条证明历史两次污染的具体来源，记录为已知验证缺口。

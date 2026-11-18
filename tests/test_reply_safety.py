@@ -140,12 +140,41 @@ class ReplySafetyTests(ServerTestCase):
         self.assertFalse(any(x["kind"] == "agent" for x in self.group["messages"]))
         self.assertEqual(self.sent, [])
 
+    def test_twelve_kb_chinese_input_is_preserved_for_codex_and_claude(self):
+        text = "汉" * 1400
+        for provider in ("codex", "claude_code"):
+            with self.subTest(provider=provider):
+                self.m.update(provider=provider, pending=False, active_delivery=None, outbox=[])
+                self.server.send_to(self.group, self.m, text, 2)
+                wire = self.sent[-1][1]
+                target = "/terminals/dev-terminal/input?" + parse.urlencode({"message": wire})
+                self.assertGreater(len(target.encode("ascii")), 12500)
+                self.assertEqual(wire, text)
+                self.assertEqual(self.m["active_delivery"]["attempt"], 1)
+                self.assertEqual(self.m["hops"], 2)
+
+    def test_input_limit_exact_boundary_and_one_byte_over(self):
+        path = "/terminals/synthetic-boundary/input"
+        query = {"message": "中文😀 +%\n" * 250, "source": "synthetic"}
+        target_size = len((path + "?" + parse.urlencode(query)).encode("ascii"))
+        query["message"] += "A" * (14000 - target_size)
+        self.assertEqual(len((path + "?" + parse.urlencode(query)).encode("ascii")), 14000)
+        self.assertEqual(self.server.bounded_input_query(path, query), query)
+        original = {**query, "message": query["message"] + "A"}
+        bounded = self.server.bounded_input_query(path, original)
+        self.assertLessEqual(len((path + "?" + parse.urlencode(bounded)).encode("ascii")), 14000)
+        self.assertIn("已截断", bounded["message"])
+        self.assertIn(str(len(original["message"])), bounded["message"])
+        self.assertTrue(original["message"].startswith(bounded["message"].split("\n（已截断")[0]))
+        self.assertEqual(self.server.bounded_input_query(path, bounded), bounded)
+        self.assertEqual(parse.parse_qs(parse.urlencode(bounded))["message"][0], bounded["message"])
+
     def test_input_limit_counts_url_encoding_and_retains_original_job(self):
         text = "中文😀 +%\n" * 1200
         self.server.send_to(self.group, self.m, text, 2)
         wire = self.sent[-1][1]
         target = "/terminals/dev-terminal/input?" + parse.urlencode({"message": wire})
-        self.assertLessEqual(len(target.encode("ascii")), 6000)
+        self.assertLessEqual(len(target.encode("ascii")), 14000)
         self.assertIn("已截断", wire)
         self.assertIn(str(len(text)), wire)
         self.assertEqual(self.m["active_delivery"]["text"], text)
@@ -156,7 +185,7 @@ class ReplySafetyTests(ServerTestCase):
             with self.subTest(size=len(text)):
                 query = self.server.bounded_input_query("/terminals/synthetic/input", {"message": text})
                 target = "/terminals/synthetic/input?" + parse.urlencode(query)
-                self.assertLessEqual(len(target.encode("ascii")), 6000)
+                self.assertLessEqual(len(target.encode("ascii")), 14000)
                 query["message"].encode("utf-8").decode("utf-8")
                 if len(text) < 100:
                     self.assertEqual(query["message"], text)
@@ -171,7 +200,7 @@ class ReplySafetyTests(ServerTestCase):
                 with patch.object(self.server, "member_ready", return_value=True):
                     self.server.retry_delivery(self.group, self.m, {"delivery_id": job["id"], "delivery_attempt": 1})
                 wire = self.sent[-1][1]
-                self.assertLessEqual(len(("/terminals/dev-terminal/input?" + parse.urlencode({"message": wire})).encode()), 6000)
+                self.assertLessEqual(len(("/terminals/dev-terminal/input?" + parse.urlencode({"message": wire})).encode()), 14000)
                 self.assertEqual(job["text"], text)
                 self.assertEqual(job["attempt"], 2)
 

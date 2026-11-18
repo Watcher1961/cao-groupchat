@@ -187,12 +187,47 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(sum("未能可靠提取" in x["text"] for x in self.api("GET")["messages"]), 1)
         self.assertNotIn("PRIVATE_BAD_SCREEN", (self.data / "groups.json").read_text())
 
+    def test_chinese_owner_input_preserves_twelve_kb_and_bounds_oversize(self):
+        self.create_group()
+        members = [self.invite("开发", "codex", "developer"),
+                   self.invite("评审", "claude_code", "reviewer")]
+        self.until("initial turns", lambda: all(not m.get("pending") for m in self.api("GET")["members"]))
+        # Synthetic request-target cap, not a measurement of h11 or real CAO.
+        self.http(self.cao_url, "POST", "/_test/config", {"max_input_target_bytes": 15000})
+        self.api("PUT", "/automation", {"delivery_budget": 20})
+        used = self.api("GET", "/automation")["runtime"]["deliveries_used"]
+        for text in ("汉" * 1400, "中文😀 +%\n" * 1200):
+            for member in members:
+                with self.subTest(provider=member["provider"], chars=len(text)):
+                    tid = member["terminal_id"]
+                    expected = "[群主] @" + member["name"] + " " + text.strip()
+                    before = len(self.terminal(tid)["inputs"])
+                    self.next_turn(tid, "synthetic complete", complete_on_input=True)
+                    self.api("POST", "/messages", {"text": "@" + member["name"] + " " + text})
+                    self.until("one new input", lambda: len(self.terminal(tid)["inputs"]) == before + 1)
+                    wire = self.terminal(tid)["inputs"][-1]
+                    self.assertLessEqual(wire["target_bytes"], 14000)
+                    if len(text) == 1400:
+                        self.assertGreater(wire["target_bytes"], 12500)
+                        self.assertEqual(wire["message"], expected)
+                    else:
+                        self.assertGreater(wire["target_bytes"], 13900)
+                        self.assertIn("已截断", wire["message"])
+                        self.assertIn(str(len(expected)), wire["message"])
+                        prefix = wire["message"].split("\n（已截断")[0]
+                        self.assertTrue(expected.startswith(prefix))
+                        wire["message"].encode("utf-8").decode("utf-8")
+                    self.until("turn finished", lambda: not next(m for m in self.api("GET")["members"] if m["id"] == member["id"]).get("pending"))
+                    self.assertEqual(len(self.terminal(tid)["inputs"]), before + 1)
+                    used += 1
+                    self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], used)
+
     def test_legacy_oversize_failed_and_uncertain_jobs_retry_with_safe_query(self):
         self.create_group()
         member = self.invite("重试成员", "claude_code", "developer")
         tid = member["terminal_id"]
         self.until("initial turn", lambda: not self.api("GET")["members"][0].get("pending"))
-        self.http(self.cao_url, "POST", "/_test/config", {"max_input_target_bytes": 8192})
+        self.http(self.cao_url, "POST", "/_test/config", {"max_input_target_bytes": 15000})
         for index, state in enumerate(("failed", "uncertain")):
             with self.subTest(state=state):
                 self.stopped_server = self.server
@@ -219,7 +254,8 @@ class IntegrationTests(unittest.TestCase):
                 self.until("legacy retry attempt", attempted)
                 self.assertEqual(len(self.terminal(tid)["inputs"]), before + 1)
                 wire = self.terminal(tid)["inputs"][-1]
-                self.assertLessEqual(wire["target_bytes"], 6000)
+                self.assertLessEqual(wire["target_bytes"], 14000)
+                self.assertGreater(wire["target_bytes"], 13900)
                 self.assertIn("已截断", wire["message"])
                 self.assertIn(str(len(original)), wire["message"])
                 self.until("retry finished", lambda: not self.api("GET")["members"][0].get("active_delivery") and not self.api("GET")["members"][0].get("pending"))

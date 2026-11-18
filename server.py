@@ -193,7 +193,8 @@ def load_state() -> None:
             groups = {}
 
 
-INPUT_URL_LIMIT = 6000
+# Local h11 defaults to 16384 bytes; reserve 2384 for request framing/headers.
+INPUT_URL_LIMIT = 14000
 MEMBER_REPLY_LIMIT = 8000
 
 
