@@ -153,6 +153,119 @@ class ModelMenuTests(ServerTestCase):
         self.assertEqual(self.m["outbox"][0]["attempt"], 0)
         self.assertEqual(len([c for c in self.cao.call_args_list if c.args[1].endswith("/input")]), before)
 
+    def test_menu_appearing_during_dispatch_persistence_blocks_every_input_origin(self):
+        for origin, text, hops, attempt in (("owner", "[群主] queued owner", 0, 0),
+                                           ("relay", "[来自 评审] queued relay", 1, 0),
+                                           ("retry", "synthetic retry", 0, 3),
+                                           ("continuation", "fixed continuation", 1, 0)):
+            with self.subTest(origin=origin):
+                self.m.update(active_delivery=None, pending=False, outbox=[], ready_terminal="dev-terminal")
+                self.m.pop("model_menu", None)
+                self.raw, self.status, self.selected = "codex>\n? for shortcuts", "idle", 1
+                self.group["automation"] = {"delivery_budget": 20}
+                self.server.automation_state(self.group)["deliveries_used"] = 0
+                job = self.server.new_delivery(text, hops)
+                job["attempt"] = attempt
+                if origin == "relay":
+                    job.update(origin="relay", sender_id="review")
+                if origin == "continuation":
+                    job["quota_continuation"] = True
+                self.m["outbox"] = [job]
+                before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+                save = self.server.save_state
+                def arrive_after_reservation():
+                    if self.m.get("delivery_state") == "dispatching":
+                        self.raw, self.status = menu(1), "idle"
+                    save()
+                with patch.object(self.server, "save_state", side_effect=arrive_after_reservation):
+                    self.server.flush_outbox(self.group, self.m)
+                self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before)
+                self.assertEqual(self.m["outbox"][0]["id"], job["id"])
+                self.assertEqual(self.m["outbox"][0]["text"], text)
+                self.assertEqual(job["attempt"], attempt)
+                self.assertEqual(self.server.automation_state(self.group)["deliveries_used"], 0)
+                self.assertIsNone(self.m["active_delivery"])
+                self.assertFalse(self.m["pending"])
+
+    def test_unreadable_final_screen_keeps_job_without_input_or_budget(self):
+        self.m.update(active_delivery=None, pending=False, outbox=[], ready_terminal="dev-terminal")
+        self.raw, self.status = "codex>\n? for shortcuts", "idle"
+        self.group["automation"] = {"delivery_budget": 20}
+        self.server.automation_state(self.group)["deliveries_used"] = 0
+        job = self.server.new_delivery("[群主] preserve on probe failure", 0)
+        self.m["outbox"] = [job]
+        reads, original = 0, self.response
+        def response(method, path, query=None, **kwargs):
+            nonlocal reads
+            if path.endswith("/output") and query["mode"] == "full":
+                reads += 1
+                if reads > 1:
+                    raise self.server.CaoError(503, "synthetic final probe unavailable")
+            return original(method, path, query, **kwargs)
+        self.cao.side_effect = response
+        before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+        self.server.flush_outbox(self.group, self.m)
+        self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before)
+        self.assertEqual(self.m["outbox"][0]["id"], job["id"])
+        self.assertEqual(job["attempt"], 0)
+        self.assertEqual(self.server.automation_state(self.group)["deliveries_used"], 0)
+        self.assertTrue(self.m["model_menu_needs_owner"])
+
+    def test_late_menu_keeps_token_across_restart_then_delivers_exactly_once(self):
+        self.m.update(active_delivery=None, pending=False, outbox=[], ready_terminal="dev-terminal")
+        self.raw, self.status, self.selected = "codex>\n? for shortcuts", "idle", 1
+        self.group["automation"] = {"delivery_budget": 20}
+        self.server.automation_state(self.group)["deliveries_used"] = 0
+        job = self.server.new_delivery("[来自 评审] preserve this task", 1)
+        self.m["outbox"] = [job]
+        save = self.server.save_state
+        def appear():
+            if self.m.get("delivery_state") == "dispatching":
+                self.raw = menu(1)
+            save()
+        before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+        with patch.object(self.server, "save_state", side_effect=appear):
+            self.server.flush_outbox(self.group, self.m)
+        self.assertEqual(self.m["outbox"][0]["id"], job["id"])
+        self.server.save_state(); self.server.load_state()
+        self.group = self.server.groups[self.group["id"]]; self.m = self.group["members"][0]
+        self.assertEqual(self.m["outbox"][0]["attempt"], 0)
+        self.assertEqual(self.server.automation_state(self.group)["deliveries_used"], 0)
+        self.tick()  # Verify the arrow result and send only the menu Enter.
+        self.raw, self.status = "codex>\n? for shortcuts", "idle"
+        self.generation += 1
+        self.tick(); self.tick()
+        self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before + 1)
+        self.assertEqual(self.m["active_delivery"]["id"], job["id"])
+        self.assertEqual(self.m["active_delivery"]["text"], job["text"])
+        self.assertEqual(self.m["active_delivery"]["attempt"], 1)
+        self.assertEqual(self.server.automation_state(self.group)["deliveries_used"], 1)
+        self.assertEqual(self.keys, ["Down", "Enter"])
+
+    def test_late_menu_refunds_before_navigation_state_is_persisted(self):
+        self.m.update(active_delivery=None, pending=False, outbox=[], ready_terminal="dev-terminal")
+        self.raw, self.status, self.selected = "codex>\n? for shortcuts", "idle", 1
+        self.group["automation"] = {"delivery_budget": 20}
+        self.server.automation_state(self.group)["deliveries_used"] = 0
+        job = self.server.new_delivery("[来自 评审] durable unsent", 1)
+        self.m["outbox"] = [job]
+        saved, original, observed = self.server.save_state, self.response, []
+        def appear():
+            if self.m.get("delivery_state") == "dispatching":
+                self.raw = menu(1)
+            saved()
+        def response(method, path, query=None, **kwargs):
+            if path.endswith("/key"):
+                state = json.loads(self.server.STATE_FILE.read_text())[self.group["id"]]
+                member = state["members"][0]
+                pending_job = member.get("active_delivery") or member["outbox"][0]
+                observed.append((bool(member.get("active_delivery")), pending_job["attempt"], state["automation_state"]["deliveries_used"]))
+            return original(method, path, query, **kwargs)
+        self.cao.side_effect = response
+        with patch.object(self.server, "save_state", side_effect=appear):
+            self.server.flush_outbox(self.group, self.m)
+        self.assertEqual(observed, [(False, 0, 0)])
+
     def test_last_mode_menu_fragment_is_never_posted_as_member_reply(self):
         self.raw = W + "• final\n" + D + "\n? for shortcuts"
         self.last = "2. Keep current model\n3. Keep current model (never show again)\nenter select · esc back"

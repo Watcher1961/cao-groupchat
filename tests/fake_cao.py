@@ -223,12 +223,14 @@ class Handler(BaseHTTPRequestHandler):
                                    not any(t.get("deferred_init_failure") for t in terminals)):
                     return self.respond(404, {"detail": "session missing"})
                 return self.respond(200, {"session": session, "terminals": terminals})
-            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress|quota|quota-clear|model-menu)", path)
+            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress|quota|quota-clear|model-menu|arm-menu)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
                 if terminal is None:
                     return self.respond(404, {"detail": "terminal missing"})
-                if control[2] == "model-menu":
+                if control[2] == "arm-menu":
+                    terminal["menu_after_full_read"] = self.body()
+                elif control[2] == "model-menu":
                     terminal["model_menu_sim"] = self.body()
                     terminal["full_out"] = self.model_menu(terminal)
                     terminal["out"] = terminal["full_out"]
@@ -237,6 +239,8 @@ class Handler(BaseHTTPRequestHandler):
                     terminal["status_generation"] = terminal["output_generation"]
                 elif control[2] in ("quota", "quota-clear"):
                     options = self.body()
+                    if control[2] == "quota-clear":
+                        terminal["model_menu_sim"] = None
                     terminal["full_out"] = options.get("prompt", "") if control[2] == "quota" else self.prompt(terminal["provider"])
                     terminal["out"] = ""
                     terminal["status"] = options.get("status", "error") if control[2] == "quota" else "idle"
@@ -322,6 +326,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(200, {"success": True})
                 if sub == "/input" and method == "POST":
                     message = query["message"]
+                    if terminal.get("model_menu_sim") is not None:
+                        # Simulate the real failure: attached Enter consumes the message.
+                        terminal["menu_input_violations"] = terminal.get("menu_input_violations", 0) + 1
+                        terminal["synthetic_model_switched"] = terminal["model_menu_sim"].get("selected", 1) == 1
+                        return self.respond(200, {"dispatch_boundary": terminal["output_generation"]})
                     boundary = terminal["output_generation"]
                     options = terminal["next_turn"]
                     terminal["next_turn"] = {}
@@ -376,6 +385,14 @@ class Handler(BaseHTTPRequestHandler):
                     mode = query.get("mode")
                     terminal["full_reads" if mode == "full" else "last_reads"] += 1
                     output = terminal["full_out"] if mode == "full" else terminal["out"]
+                    armed = terminal.pop("menu_after_full_read", None) if mode == "full" else None
+                    if armed is not None:
+                        terminal["model_menu_sim"] = armed
+                        terminal["full_out"] = self.model_menu(terminal)
+                        terminal["out"] = terminal["full_out"]
+                        terminal["status"] = "idle"
+                        terminal["output_generation"] += 1
+                        terminal["status_generation"] = terminal["output_generation"]
                     return self.respond(200, {"output": output, "mode": mode})
             if path.startswith("/sessions/") and method == "DELETE":
                 session = path.split("/")[2]

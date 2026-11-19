@@ -167,6 +167,58 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_menu_appears_after_first_dispatch_read_never_receives_input(self):
+        self.create_group()
+        member = self.invite("合成晚菜单", "codex", "developer")
+        tid = member["terminal_id"]
+        # Freeze periodic polling so the armed first read is the dispatch preflight.
+        self.stopped_server = self.server
+        self.stop_process(self.server)
+        self.env["GROUPCHAT_POLL_SECONDS"] = "60"
+        self.start_server()
+        self.api("PUT", "/automation", {"delivery_budget": 10})
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/arm-menu", {"selected": 1})
+        self.api("POST", "/messages", {"text": "@合成晚菜单 preserve queued task"})
+        observed = self.until("late menu guard or unsafe input", lambda: (t if ((t := self.terminal(tid)).get("keys") or t.get("menu_input_violations")) else None))
+        self.assertEqual(observed.get("menu_input_violations", 0), 0)
+        self.assertFalse(observed.get("synthetic_model_switched", False))
+        self.assertEqual(observed["inputs"], [])
+        paused = self.until("late job restored", lambda: (m if (m := self.api("GET")["members"][0])["queued_count"] == 1 and not m["pending"] else None))
+        self.assertEqual(paused["delivery_attempt"], 0)
+        self.assertEqual(paused["model_menu"]["phase"], "verify")
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 0)
+
+    def test_visible_menu_blocks_both_relay_and_owner_until_closed_then_drains_once(self):
+        self.create_group()
+        target = self.invite("合成接收", "codex", "developer")
+        sender = self.invite("合成发送", "claude_code", "reviewer")
+        tid = target["terminal_id"]
+        self.until("intro done", lambda: len(self.terminal(tid)["inputs"]) >= 1 and all(not m.get("pending") for m in self.api("GET")["members"]))
+        baseline = len(self.terminal(tid)["inputs"])
+        self.api("PUT", "/automation", {"delivery_budget": 10})
+        budget = self.api("GET", "/automation")["runtime"]["deliveries_used"]
+        self.http(self.cao_url, "POST", "/_test/config", {"provider_replies": {
+            "claude_code": "@合成接收 请处理合成结果。", "codex": "合成任务已处理。"}})
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/model-menu", {"selected": 0})
+        self.until("menu awaiting owner", lambda: next(m for m in self.api("GET")["members"] if m["id"] == target["id"]).get("model_menu_needs_owner"))
+        self.api("POST", "/messages", {"text": "@合成发送 generate relay"})
+        self.until("relay queued", lambda: next(m for m in self.api("GET")["members"] if m["id"] == target["id"])["queued_count"] == 1)
+        self.api("POST", "/messages", {"text": "@合成接收 later owner"})
+        self.until("both queued", lambda: next(m for m in self.api("GET")["members"] if m["id"] == target["id"])["queued_count"] == 2)
+        reads = self.terminal(tid)["status_reads"]
+        self.until("menu polling continues", lambda: self.terminal(tid)["status_reads"] >= reads + 4)
+        self.assertEqual(len(self.terminal(tid)["inputs"]), baseline)
+        self.assertEqual(self.terminal(tid).get("menu_input_violations", 0), 0)
+        self.assertEqual(self.terminal(tid).get("keys", []), [])
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], budget + 1)
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota-clear", {})
+        self.until("both actual inputs", lambda: len(self.terminal(tid)["inputs"]) == baseline + 2)
+        self.until("both tasks complete", lambda: not next(m for m in self.api("GET")["members"] if m["id"] == target["id"])["pending"])
+        sent = [item["message"] for item in self.terminal(tid)["inputs"][baseline:]]
+        self.assertEqual(sent, ["[群主] @合成接收 later owner", "[来自 合成发送] @合成接收 请处理合成结果。"])
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], budget + 3)
+        self.assertEqual(self.terminal(tid).get("menu_input_violations", 0), 0)
+
     def test_codex_model_menu_verified_keys_and_reply_wait_with_quota_disabled(self):
         self.create_group()
         member = self.invite("合成菜单成员", "codex", "developer")

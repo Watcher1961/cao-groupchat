@@ -653,7 +653,7 @@ class CodexCompletionTests(ServerTestCase):
 
     def dispatch_from(self, previous):
         self.prepare()
-        self.cao.side_effect = [{"output": previous}, {"dispatch_boundary": 7}]
+        self.cao.side_effect = [{"output": previous}, {"output": previous}, {"dispatch_boundary": 7}]
         self.server.send_to(self.group, self.developer, "新一轮", 0)
 
     def test_real_codex_0164_bytes_and_legacy_formats_are_parsed(self):
@@ -832,12 +832,12 @@ class CodexCompletionTests(ServerTestCase):
         previous = self.WORKING + "上一轮" + self.DONE
         self.prepare()
         self.developer["codex_saw_working"] = True
-        self.cao.side_effect = [{"output": previous}, {"dispatch_boundary": 7}]
+        self.cao.side_effect = [{"output": previous}, {"output": previous}, {"dispatch_boundary": 7}]
         self.server.send_to(self.group, self.developer, "新一轮", 0)
         self.assertEqual(self.developer["codex_dispatch_markers"], 2)
         self.assertFalse(self.developer["codex_saw_working"])
         self.assertEqual(self.developer["full_len"], len(previous))
-        self.assertEqual([call.args[0] for call in self.cao.call_args_list], ["GET", "POST"])
+        self.assertEqual([call.args[0] for call in self.cao.call_args_list], ["GET", "GET", "POST"])
 
     def test_last_output_fallback_keeps_only_new_turn_and_cleans_control_sequences(self):
         previous = self.WORKING + "上一轮" + self.DONE

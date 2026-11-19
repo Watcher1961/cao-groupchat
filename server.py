@@ -956,6 +956,27 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
                 automation_state(g)["deliveries_used"] += 1
                 charged = True
             save_state()  # Persist the reservation and in-flight job before input.
+        if m.get("provider") == "codex":
+            unreadable = False
+            try:
+                final_raw = get_full_output(m)
+            except CaoError:
+                final_raw, unreadable = "", True
+            if unreadable or codex_menu_info(final_raw)["candidate"] or model_menu_blocked(m):
+                # Restore the unsent job before any menu key/save can be interrupted.
+                with lock:
+                    if charged:
+                        automation_state(g)["deliveries_used"] -= 1
+                        charged = False
+                    job["attempt"] -= 1
+                    m.setdefault("outbox", []).insert(0, job)
+                    m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+                    save_state()
+                if unreadable:
+                    model_menu_hold(g, m, "")
+                else:
+                    codex_menu_control(g, m, final_raw)
+                return False
         attempted = True
         r = cao("POST", f"/terminals/{m['terminal_id']}/input", {"message": wire})
         # Fresh statuses belong to this dispatch only above CAO's boundary.

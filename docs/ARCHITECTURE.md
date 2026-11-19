@@ -15,9 +15,9 @@
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
-| `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、15 项菜单隔离回归；全部合成数据 |
+| `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、19 项菜单隔离回归；全部合成数据 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 46 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 48 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 24 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -181,3 +181,11 @@ member_ready/flush 对 Claude/Hermes 每次派发重验当前 composer，正向�
 成员 model_menu 仅保存 phase、时间、目标编号、菜单选项摘要、屏幕摘要和通知标记。phase=verify 先持久化导航意图，按相对位置发 Up/Down（已在目标时零次导航），下一次 full 读屏必须看到同一菜单且选中精确目标才把 Enter 意图持久化并发送；2 秒未到目标或菜单变化则等待群主。phase=enter_sent 等菜单退出且出现原生工作/完成标记或就绪特征，10 秒仍在菜单即等待群主，重启不重发箭头/Enter。成功只通知一次并继续等待本轮 done，不把选择菜单当完成。
 
 phase=owner 停止新派发、提取、重试按钮、watchdog 和空闲提醒，保留原 active_delivery/队列/attempt/预算。群主在 CLI 处理后，只有屏幕已改变且明确退出菜单才恢复；若菜单来自 last 回退，还要复查 last 不再是菜单。model_menu_needs_owner 供卡片显示，不复用 quota_state，因此手动额度恢复不绕过控制屏。导航等待仍读取结构化额度，真实 exhausted/near 保持原暂停/计时/续接规则；模型菜单按键不算投递、不消耗预算，恢复重置无进展时钟。所有新诊断为固定动作，原终端正文不进状态/日志。
+
+### 第 4 项补充：发送前最后检查
+
+首检与 POST input 之间还有额度计算、标记快照和预算/在途状态落盘。`dispatch_delivery` 在这些步骤完成后、`attempted=True` 及唯一 input 调用之前再次读取 Codex full；出现候选菜单/已有控制等待，或 CAO 读屏失败时，先在状态锁中退回本次预算、将 attempt 恢复到旧值、原 ID/原文放回队列，解除假在途并落盘，然后才调用菜单导航或提示群主。故菜单导航中途重启，也不会把未发送任务当作已发送。群主消息、成员转发、人工重试和额度续接统一经过此入口，菜单期间均无 input；修复不改变其他 provider 路径或既有输入/重试令牌协议。
+
+fake 在首检的响应已取值、但返回前使屏幕出现默认选项 1 菜单；若旧版继续 POST，则计数并模拟附带 Enter 吞消息/切换模型，不向真实 CLI 发送任何材料。晚弹场景加四种作业来源、读屏失败、导航前回滚、重启后恰好一次恢复，以及菜单可见期间群主/转发都只排队的 HTTP 回归。
+
+边界：CAO 的 GET output 与 POST input 是两个独立 HTTP 操作，本修复关闭首检至落盘的可复现间隙；最后读屏后 CLI 自身变化到 POST 的极短窗口仍不具原子保证，GUI 成员锁不控制 CLI。严格消除这一窗口需要 CAO 层提供检查并发送的原子能力，当前授权不改 CAO；本项不声称模拟测试证明绝对原子性，真实复测须覆盖弹窗时机。GUI 需重启进程才加载新版本，开发提交本身不会热更新正在运行的进程。
