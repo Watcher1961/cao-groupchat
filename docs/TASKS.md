@@ -1,6 +1,18 @@
 # 本轮任务与交接
 
-## 第三轮第 1 项真实复测修复：还原当前屏幕（实现完成，待独立审查）
+## 842c0ce 审查修复：Hermes LF-only 与读屏失败关闭（实现完成，待独立审查）
+
+2026-11-19 Claude 审查 842c0ce 不通过：326 项测试通过、两份 Claude 实样修好，但四份 Hermes LF-only 实样回退，full 读屏失败还会错误放行回复；另要求覆盖低处历史空框不能盖过当前真实输入。788885d 的 waiting_user_answer 独立审查已通过（Claude 实跑 309 项/49.421 秒），本补充不改写这些提交、不更改其投递逻辑。范围仅 server.py、tests/、PRD/ARCHITECTURE/TASKS，不操作真实 GUI/CLI/配置，不推送。
+
+先写 7 项合成回归，未改生产时：屏幕 20 项中 6 个失败子项（0.523 秒），回复安全 23 项中 4 个失败子项（0.611 秒），新 LF-only HTTP 1 项失败（0.246 秒，旧 fake 改写为 CRLF）。首次汇总脚本只匹配复数 tests，未解析单项 test，后核对原始汇总确认失败；不把脚本错误当测试数。夹具均合成，不加载私有实样。
+
+无 CR 的捕获文本现在 LF 回列首；含 CR 保留 VT/LNM 规则。fake Hermes 不再强制 CRLF，HTTP 断言无 CR，覆盖长历史后自动投递/收本轮回复且不手动重试。显式 valid/empty 区分读屏失败，Hermes full 无效就 ReplyNotReady，last 候选也不能绕过。单格重绘序号选当前提示符，低处旧空框不能覆盖高处当前真实输入；画布与真实高度的差异、取舍和性能观察见 ARCHITECTURE。
+
+实现后相关 51 项通过（1.896 秒）；扩大至屏幕、composer、回复安全、原 server、额度/预算与 4 项 HTTP 共 198 项通过（7.973 秒）。只读离线四份 Hermes txt 与两份 Claude JSON，六份 valid=True、两次 ready 均 False→True，四份 Hermes idle=True，只输出真假；不复制正文到仓库/日志/提交说明。6000 行合成性能观察不是实测 CLI。真实端到端仍由群主在审查后安排，Hermes 环境磁盘提示仍不处理。
+
+本补充提交前全量（2026-11-19，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 333 tests in 53.729s`、OK，退出 0，258 后端、51 HTTP、24 Node 实际执行，无跳过/资源警告；本补充只跑一次全量。八个授权文件范围、AST、既有 Codex/菜单/投递函数不变、增量隐私模式、文档链接/围栏、`git diff --check` 和 GROUP_LOG 忽略通过；新独立提交待 Claude 审查，不推送。
+
+## 第三轮第 1 项真实复测修复：还原当前屏幕（842c0ce 审查不通过，补充修复见上）
 
 群主 2026-11-19 复测已加载 1c3d6bb：Claude sonnet 冷启动首条等待 180 秒需手动重试；Try 灰字下一轮 8 秒自动通过；预测灰字 100 秒仍 waiting_ready。本补充仅修第 1 项，范围 server.py、tests/、本目录三份文档；原六提交不改写，不动 CAO/provider/全局设置、不重启真实 GUI/CLI、不推送。清队列接口与按钮已获群主真实通过（默认保留群主，keep_owner=false 清全部）；第 2/4 项待自然触发观察，Hermes 磁盘提示由群主处理，不纳入修复。
 

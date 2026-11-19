@@ -1,6 +1,7 @@
 """Synthetic VT screen redraws; never read private terminal samples."""
 from unittest.mock import patch
 from test_server import ServerTestCase
+from test_reply_safety import hermes_frame
 
 ESC = "\x1b["
 RAIL = "─" * 32
@@ -131,3 +132,32 @@ class TerminalScreenTests(ServerTestCase):
         for suffix in (ESC + "999999;999999H", ESC + "12;", ESC + "2P"):
             with self.subTest(suffix=suffix):
                 self.assertFalse(self.ready(box() + suffix))
+
+    def test_lf_only_hermes_history_preserves_ready_and_completed_evidence(self):
+        for lines in (80, 700):
+            with self.subTest(lines=lines):
+                history = ("Synthetic historical row " + "x" * 80 + "\n") * lines
+                raw = history + hermes_frame("合成已完成答案。")
+                self.assertNotIn("\r", raw)
+                self.assertTrue(self.ready(raw, "hermes"))
+                self.assertTrue(self.server.hermes_idle(raw))
+
+    def test_lf_only_history_does_not_hide_current_real_input(self):
+        for provider in ("claude_code", "hermes"):
+            with self.subTest(provider=provider):
+                raw = ("Synthetic row " + "x" * 80 + "\n") * 80 + RAIL + "\n❯ real input\n" + RAIL
+                self.assertFalse(self.ready(raw, provider))
+
+    def test_recent_redrawn_composer_overrides_lower_historical_box(self):
+        for provider, style in (("claude_code", "2"), ("hermes", "38;5;240;3")):
+            for current, expected in (("real current input", False), (ESC + style + "mSynthetic hint" + ESC + "0m", True)):
+                with self.subTest(provider=provider, empty=expected):
+                    history = box("", row=70)
+                    current_box = box(current, row=5).replace(ESC + "2J", "", 1)
+                    self.assertEqual(self.ready(history + current_box, provider), expected)
+
+    def test_new_input_patch_does_not_reuse_old_lower_empty_prompt(self):
+        for provider in ("claude_code", "hermes"):
+            with self.subTest(provider=provider):
+                raw = box("", row=70) + box("", row=5).replace(ESC + "2J", "", 1) + ESC + "6;3Hreal current input"
+                self.assertFalse(self.ready(raw, provider))

@@ -590,6 +590,9 @@ class TerminalScreen:
         self.attrs, self.style = {}, ()
         self.saved = (0, 0, {})
         self.positioned = self.newline = False
+        # CAO also supplies serialized LF-only screens with CR removed.
+        self.lf_reset = "\r" not in raw
+        self.serial = 0
         if len(raw) > 1_000_000:
             raise TerminalScreenError()
         self.feed(raw)
@@ -637,8 +640,8 @@ class TerminalScreen:
             if line.get(x, (None, None, None))[2] == 0:
                 x -= 1
             if x in line:
-                text, style, width = line[x]
-                line[x] = (text + char, style, width)
+                text, style, width, stamp = line[x]
+                line[x] = (text + char, style, width, stamp)
             return
         width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
         if self.col + width > self.COLS:
@@ -646,9 +649,10 @@ class TerminalScreen:
         for x in range(self.col, self.col + width):
             self.erase_cell(self.row, x)
         line = self.cells.setdefault(self.row, {})
-        line[self.col] = (char, self.style, width)
+        self.serial += 1
+        line[self.col] = (char, self.style, width, self.serial)
         if width == 2:
-            line[self.col + 1] = ("", self.style, 0)
+            line[self.col + 1] = ("", self.style, 0, self.serial)
         self.count += width
         if self.count > self.CELLS:
             raise TerminalScreenError()
@@ -806,6 +810,8 @@ class TerminalScreen:
             if char == "\r":
                 self.col = 0
             elif char in ("\n", "\v", "\f"):
+                if char == "\n" and self.lf_reset:
+                    self.col = 0
                 self.linefeed()
             elif char == "\b":
                 self.col = max(0, self.col - 1)
@@ -824,17 +830,19 @@ class TerminalScreen:
         for row in range(last + 1):
             cells, chars = self.cells.get(row, {}), []
             for col in range(max(cells, default=-1) + 1):
-                char, _, width = cells.get(col, (" ", (), 1))
+                char, _, width, _ = cells.get(col, (" ", (), 1, -1))
                 if width:
                     chars.append(" " * width if (row, col) in masked else char)
             lines.append("".join(chars).rstrip(" \t"))
         return "\n".join(lines).rstrip("\n")
 
 
-def composer_region(text: str) -> tuple[str, bool, tuple[int, int, int] | None]:
+def composer_region(text: str, prompt_row: int | None = None) -> tuple[str, bool, tuple[int, int, int] | None]:
     lines = text.splitlines()
     prompts = [(i, re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", line)) for i, line in enumerate(lines)]
     prompts = [(i, match) for i, match in prompts if match]
+    if prompt_row is not None:
+        prompts = [(row, match) for row, match in prompts if row == prompt_row]
     if not prompts:
         return "", False, None
     row, prompt = prompts[-1]
@@ -848,19 +856,28 @@ def composer_region(text: str) -> tuple[str, bool, tuple[int, int, int] | None]:
 
 def composer_view(raw: str, provider: str) -> dict:
     if provider not in ("claude_code", "hermes"):
-        return {"text": ANSI.sub("", raw).replace("\r", "\n"), "field": "", "boxed": False, "hint": False, "positioned": False}
+        return {"text": ANSI.sub("", raw).replace("\r", "\n"), "field": "", "boxed": False, "hint": False, "positioned": False, "valid": True, "empty": False}
     try:
         screen = TerminalScreen(raw)
     except TerminalScreenError:
-        return {"text": "", "field": "", "boxed": False, "hint": False, "positioned": False}
+        return {"text": "", "field": "", "boxed": False, "hint": False, "positioned": False, "valid": False, "empty": False}
     plain = screen.text()
-    _, boxed, bounds = composer_region(plain)
+    # A bounded replay can retain history below a later CUP redraw. Prefer the
+    # most recently painted prompt glyph, rather than the lowest screen row.
+    prompts = []
+    for row, line in enumerate(plain.splitlines()):
+        match = re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", line)
+        if match:
+            col = len(match[0].rstrip(" \t\xa0")) - 1
+            prompts.append((screen.cells[row][col][3], row))
+    prompt_row = max(prompts)[1] if prompts else None
+    _, boxed, bounds = composer_region(plain, prompt_row)
     masked, hint, styles = set(), False, {}
     if bounds:
         first, prompt_row, end = bounds
         prompt = re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", plain.splitlines()[prompt_row])
         for row in range(first, end):
-            for col, (char, style, width) in screen.cells.get(row, {}).items():
+            for col, (char, style, width, _) in screen.cells.get(row, {}).items():
                 if row == prompt_row and col < prompt.end():
                     continue
                 if style not in styles:
@@ -872,16 +889,17 @@ def composer_view(raw: str, provider: str) -> dict:
                     masked.add((row, col))
                     hint = hint or bool(char.strip())
     text = screen.text(masked)
-    field, boxed, _ = composer_region(text)
-    return {"text": text, "field": field, "boxed": boxed, "hint": hint, "positioned": screen.positioned}
+    field, boxed, _ = composer_region(text, prompt_row)
+    return {"text": text, "field": field, "boxed": boxed, "hint": hint, "positioned": screen.positioned,
+            "valid": True, "empty": composer_empty(text, prompt_row)}
 
 
 def composer_text(raw: str, provider: str) -> str:
     return composer_view(raw, provider)["text"]
 
 
-def composer_empty(text: str) -> bool:
-    field, boxed, bounds = composer_region(text)
+def composer_empty(text: str, prompt_row: int | None = None) -> bool:
+    field, boxed, bounds = composer_region(text, prompt_row)
     if not bounds:
         return False
     rows = field.splitlines()
@@ -895,7 +913,7 @@ def composer_empty(text: str) -> bool:
 
 
 def claude_composer_ready(view: dict) -> bool:
-    if not composer_empty(view["text"]):
+    if not view["empty"]:
         return False
     if view["boxed"]:
         return bool(CLAUDE_INPUT_BOX.search(view["field"]))
@@ -905,10 +923,11 @@ def claude_composer_ready(view: dict) -> bool:
 
 
 def hermes_idle(raw: str) -> bool:
-    text = composer_text(raw, "hermes")
+    view = composer_view(raw, "hermes")
+    text = view["text"]
     _, working = hermes_blocks(text)
-    return (not working and any(HERMES_END.fullmatch(line.strip()) for line in text.splitlines())
-            and composer_empty(text))
+    return (view["valid"] and not working and any(HERMES_END.fullmatch(line.strip()) for line in text.splitlines())
+            and view["empty"])
 
 
 def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bool:
@@ -940,7 +959,7 @@ def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bo
         elif provider == "claude_code":
             positive = claude_composer_ready(view)
         elif provider == "hermes":
-            positive = composer_empty(tail)
+            positive = view["empty"]
         else:
             positive = bool(tail.strip())
         if not positive:
@@ -1542,8 +1561,10 @@ def get_hermes_reply(m: dict) -> str:
             raise
         raw = result.get("output", "") if isinstance(result, dict) else str(result)
         blocks, working = hermes_blocks(raw)
-        if mode == "full" and hermes_blocks(composer_text(raw, "hermes"))[1]:
-            raise ReplyNotReady()
+        if mode == "full":
+            view = composer_view(raw, "hermes")
+            if not view["valid"] or hermes_blocks(view["text"])[1]:
+                raise ReplyNotReady()
         if mode == "full" and "\b" in raw:
             continue  # Raw FIFO erasure cannot be reconstructed by stripping ANSI.
         snapshot = boundary["modes"].get(mode)

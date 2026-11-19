@@ -396,6 +396,27 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(current()["queued_count"], 0)
                 self.assertEqual(self.terminal(tid)["early_inputs"], 0)
 
+    def test_hermes_lf_only_history_dispatches_and_collects_without_crlf_rewrite(self):
+        self.create_group()
+        self.http(self.cao_url, "POST", "/_test/config", {"startup_hold": True})
+        member = self.api("POST", "/members", {"name": "合成LF成员", "provider": "hermes", "role": "developer"})
+        current = lambda: next(m for m in self.api("GET")["members"] if m["id"] == member["id"])
+        tid = self.until("LF terminal allocated", lambda: current().get("terminal_id"))
+        self.next_turn(tid, "合成LF最终回复。", complete_on_input=True)
+        self.api("POST", "/messages", {"text": "@合成LF成员 synthetic LF task"})
+        self.until("LF task queued", lambda: current()["queued_count"] == 1)
+        history = ("Synthetic LF history " + "x" * 80 + "\n") * 80
+        prompt = history + "☤ Hermes\n合成旧答案。\n─ 2.1s · 01:02 PM\n────────────\n❯ \x1b[38;5;240;3mSynthetic hint\x1b[0m\n────────────"
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {"prompt": prompt})
+        raw = self.http(self.cao_url, "GET", f"/terminals/{tid}/output?mode=full")["output"]
+        self.assertNotIn("\r", raw)
+        self.until("LF task delivered without manual retry", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        self.until("LF final reply collected", lambda: not current().get("pending"))
+        replies = [x["text"] for x in self.api("GET")["messages"] if x["kind"] == "agent"]
+        self.assertEqual(replies, ["合成LF最终回复。"])
+        self.assertEqual(current()["queued_count"], 0)
+        self.assertEqual(self.terminal(tid)["early_inputs"], 0)
+
     def test_styled_composers_and_hermes_stale_busy_complete_then_drain(self):
         self.create_group()
         for name, provider in (("合成甲", "claude_code"), ("合成乙", "hermes")):

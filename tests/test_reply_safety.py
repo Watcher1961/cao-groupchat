@@ -112,6 +112,25 @@ class ReplySafetyTests(ServerTestCase):
         self.assertTrue(self.m["pending"])
         self.assertFalse(any(x["kind"] == "agent" for x in self.group["messages"]))
 
+    def test_lf_only_working_screen_blocks_completed_last_candidate(self):
+        self.dispatch()
+        candidate = hermes_frame("合成候选，不能提前收取。")
+        history = ("Synthetic historical row " + "x" * 80 + "\n") * 80
+        raw = history + candidate + "☤ Hermes\npartial\n── ⠋ Working… · 3s ──\n"
+        self.outputs.update(full=raw, last=fallback(candidate))
+        with self.assertRaises(self.server.ReplyNotReady):
+            self.server.get_reply(self.m)
+
+    def test_screen_parse_failure_blocks_hermes_reply_instead_of_proving_done(self):
+        for suffix in ("\x1b[2P", "\x1b[12;", "\x1b[999999;1H"):
+            with self.subTest(control=suffix):
+                self.m.update(pending=False, active_delivery=None, outbox=[])
+                self.dispatch()
+                candidate = hermes_frame("合成候选，读屏失败不得放行。")
+                self.outputs.update(full=candidate + suffix, last=fallback(candidate))
+                with self.assertRaises(self.server.ReplyNotReady):
+                    self.server.get_reply(self.m)
+
     def test_hermes_unframed_huge_fallback_only_posts_short_notice_once(self):
         self.dispatch()
         raw = "PRIVATE_SCREEN_BODY\n" * 20000 + "@评审 do not relay"

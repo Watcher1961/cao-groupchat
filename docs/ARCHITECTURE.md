@@ -14,11 +14,11 @@
 | `tests/test_claude_limits.py` | 19 项脚本、项目设置所有权/回滚、生命周期容错、额度缓存及真实输入框字节回归 |
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
-| `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
+| `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 23 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
 | `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、23 项菜单隔离回归；全部合成数据 |
-| `tests/test_terminal_screen.py` | 16 项合成 VT/单格 SGR/输入框与真实输入、动画稳定、资源边界回归；不加载私有样本 |
+| `tests/test_terminal_screen.py` | 20 项合成 VT/单格 SGR/输入框与真实输入、动画稳定、LF-only 长历史、历史框和资源边界回归；不加载私有样本 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 50 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 51 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 24 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -155,9 +155,13 @@ Gemini 次要问题：已安装 providers/antigravity_cli.py:985–1068 以最�
 
 11-19 的真实复测证明“去 ANSI 后按行”不是当前屏幕：冷启动动画把输入框挤出 raw 尾部 12 行，预测文字又用 CUP/相对移动补画，输入框和分隔线在流中不相邻。TerminalScreen 因此先重放 raw 到仅内存的稀疏单元格画布，每格保存字符、显示宽度和不可变 SGR 属性；composer_view 在当前输入区域按这些属性移除占位，再执行判空。Claude/Hermes 共用此路径，解析失败不回退到线性 raw；Codex 仍沿用原有 OSC/就绪路径。
 
-支持 CR（只回列首）、LF（换行并保留列，LNM 开启时回列首）、BS、TAB；CUP H/f、CHA G、VPA d、CUU/CUD/CUF/CUB、CNL/CPL，EL K 和 ED J 的标准模式；保存/恢复光标、滚动区 r、IND/RI、常见设备/焦点/鼠标/键盘查询。SGR 保存 dim/斜体/粗体/下划线/反色等及基础、索引、RGB 前背景色；擦除/重绘真正替换原格，宽字符与组合字符不按字节截断。没有输出尺寸元数据时不猜实际终端宽度、也不猜软换行；以明确绘制的坐标和区域为证据，这是有限 VT 子集而非完整 xterm。画布上限 512 行、4096 列、131072 格，输入至多 100 万字符；超限、不完整或未知的普通 CSI 屏幕修改失败关闭。终端正文不进持久状态或新日志。
+支持 CR（只回列首）、LF、BS、TAB。CAO 输出兼有 raw 控制流与序列化文本：11-18/19 四份 Hermes full/last 实样只读确认 LF-only、没有 CR，不能按未转换的 PTY LF 留列累加；因此整份无 CR 时将 LF 当作换行并归零列，含 CR 时仍换行保留列（LNM 开启时归零）。这是适配 CAO 捕获格式的约定，不声称所有终端的 LF 都如此。fake 保留 Hermes LF-only，Claude 仍模拟 CRLF，并用 HTTP 验证；CUP H/f、CHA G、VPA d、CUU/CUD/CUF/CUB、CNL/CPL，EL K 和 ED J 的标准模式；保存/恢复光标、滚动区 r、IND/RI、常见设备/焦点/鼠标/键盘查询。SGR 保存 dim/斜体/粗体/下划线/反色等及基础、索引、RGB 前背景色；擦除/重绘真正替换原格，宽字符与组合字符不按字节截断。没有输出尺寸元数据时不猜实际终端宽度、也不猜软换行；以明确绘制的坐标和区域为证据，这是有限 VT 子集而非完整 xterm。画布上限 512 行、4096 列、131072 格，输入至多 100 万字符；超限、不完整或未知的普通 CSI 屏幕修改失败关闭。终端正文不进持久状态或新日志。
 
 已知占位为 Claude dim 与灰斜体、Hermes 灰色 240–247（或 90）加斜体，只在当前 composer 内掩去相应格，普通灰色真实输入、同文真实输入与真实续行仍非空。冷启动 JSON 含完整分隔线，重建后按框判定；预测 JSON 不含任何分隔线，不能凭空补框，使用还原屏上经绝对定位绘制、含占位格的空提示符兼容。原旧 CLI 的还原后裸提示符兼容仍保留；这不是 raw 尾行兜底。无边框时下方未知真实内容会阻止判空。
+
+单格还保存单调递增的重绘序号，当前提示符按其字形最后写入顺序选择，不按空间中最下方一行选择。512 行是资源上限，并非真实终端高度（群主现场约 50 行），缺少尺寸元数据仍不能精确模拟视口滚动；历史内容可能暂留在 CUP 当前重绘区域下方。合成回归因此保留低处旧空框，在高处重绘当前非空框/补画真实内容，必须判为未就绪，反向的当前空框也可就绪。无法证明当前框仍保守阻拦；完整尺寸/软换行恢复依赖上游元数据，真实联调待验证。
+
+composer_view 显式返回 valid/empty；解析失败 valid=False、empty=False。Hermes 的 full 工作中门禁遇到 invalid 直接抛 ReplyNotReady，即使 last 有候选也不收下，不回退到线性 raw 或把解析错误当完成。语法错误、未知修改、越界及截断控制的负例均覆盖。6000 行、186145 字符合成 LF-only 历史单次 composer_view 在本机观察约 0.302 秒；这是一次性能观察，非保证或真实 CLI 测量，解析仍受上述资源上限约束。
 
 member_ready 初次仍要求两次稳定观察，但指纹只取输入区域，不取无关动画；缓存就绪也复查当前屏的真实内容。quota_prompt_ready 的 Claude 分支同样走屏幕判定。Hermes 的 idle/当前 working 证据也来自重建屏，最终页脚支持 h/m/s 时长；最终答案的历史帧归属与投递 ID/attempt 双快照保持原协议，未改成从任意旧画面取答案。真实 Hermes 启动磁盘提示属环境问题，本修复不干预。
 

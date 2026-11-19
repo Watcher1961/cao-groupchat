@@ -84,7 +84,8 @@ class Handler(BaseHTTPRequestHandler):
         return "\n".join(rows) + "\nenter select · esc back"
 
     def write_raw(self, terminal, content):
-        if terminal["provider"] in ("claude_code", "hermes"):
+        # Hermes CAO captures are LF-only; retain that path in the fake.
+        if terminal["provider"] == "claude_code":
             content = re.sub(r"(?<!\r)\n", "\r\n", content)
         raw = (terminal["full_out"] + content).encode()
         terminal["full_out"] = raw[-self.server.buffer_limit:].decode(errors="ignore")
