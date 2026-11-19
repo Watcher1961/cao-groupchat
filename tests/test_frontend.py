@@ -32,6 +32,9 @@ class FrontendEffortTests(unittest.TestCase):
     def test_clear_outbox_demo_preserves_owner_and_active(self):
         self.check_ui("demo", "frontend_outbox.js")
 
+    def test_model_menu_status_without_quota_and_retry_is_hidden(self):
+        self.check_ui("menu", "frontend_quota.js")
+
     def test_quota_switch_and_disabled_actions(self):
         self.check_ui("settings", "frontend_quota.js")
 

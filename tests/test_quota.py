@@ -35,6 +35,9 @@ class QuotaTests(ServerTestCase):
             return {"status": self.status, "status_generation": self.generation, "output_generation": self.generation}
         if path.endswith("/key"):
             self.keys.append(query["key"])
+            if query["key"] == "Enter":
+                self.raw, self.status = "codex>\n? for shortcuts", "idle"
+                self.generation += 1
         else:
             self.inputs.append(query["message"])
         return {"dispatch_boundary": self.generation, "success": True}
@@ -309,7 +312,8 @@ class QuotaTests(ServerTestCase):
         self.status = "waiting_user_answer"
         self.server.send_to(self.group, self.m, "queued", 0)
         self.assertEqual(self.inputs, [])
-        self.assertEqual(self.keys, ["2", "Enter"])
+        self.tick()
+        self.assertEqual(self.keys, ["Enter"])
         self.assertEqual(self.m["outbox"][0]["text"], "queued")
 
     def test_known_reset_old_hint_and_ready_prompt_can_recover_without_new_model_call(self):
@@ -587,7 +591,9 @@ class QuotaTests(ServerTestCase):
         self.status = "waiting_user_answer"
         self.tick()
         self.assertEqual(self.m["quota_state"], "exhausted")
-        self.assertEqual(self.keys, ["2", "Enter"])
+        self.assertEqual(self.keys, [])
+        self.tick(); self.tick()
+        self.assertEqual(self.keys, ["Enter"])
 
     def test_codex_error_followed_by_done_is_still_exhaustion(self):
         raw = CODEX_LIMIT + "" + chr(27) + "]7501;state=done:app=codex" + chr(27) + chr(92) + "\ncodex>\n? for shortcuts"
@@ -699,13 +705,14 @@ class QuotaTests(ServerTestCase):
         self.status = "waiting_user_answer"
         self.tick()
         self.tick()
-        self.assertEqual(self.keys, ["2", "Enter"])
-        self.assertIn("Keep current model", self.log_text())
+        self.tick()
+        self.assertEqual(self.keys, ["Enter"])
+        self.assertIn("model_menu_action=keep_current_verified", self.log_text())
         self.raw = MENU.replace("2. Keep current model", "2. Keep the current model")
         self.generation += 1
         self.tick()
-        self.assertEqual(self.keys, ["2", "Enter"])
-        self.assertTrue(self.m["quota_needs_owner"])
+        self.assertEqual(self.keys, ["Enter"])
+        self.assertTrue(self.m["model_menu_needs_owner"])
         self.assertTrue(any("@群主" in x["text"] for x in self.group["messages"]))
 
     def test_privacy_no_terminal_text_in_state_messages_or_log(self):

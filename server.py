@@ -204,6 +204,10 @@ class ReplyExtractionError(Exception):
     """A completed provider turn has no reliably attributable text."""
 
 
+class ModelMenuScreen(Exception):
+    pass
+
+
 class ReplyNotReady(Exception):
     """The provider still has an unfinished framed response."""
 
@@ -810,7 +814,7 @@ def relay_allowed(g: dict, text: str) -> bool:
 
 def queue_delivery(g: dict, m: dict, job: dict) -> None:
     # Caller holds this member's delivery lock, then the global state lock.
-    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m):
+    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m) and not model_menu_blocked(m):
         m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
         m.setdefault("outbox", []).insert(0, job)
     else:
@@ -876,6 +880,25 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
 
 
 def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
+    codex_raw, probe_error = None, None
+    if m.get("provider") == "codex":
+        try:
+            codex_raw = get_full_output(m)
+            if codex_menu_control(g, m, codex_raw):
+                with lock:
+                    m.setdefault("outbox", []).insert(0, job)
+                    m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+                    save_state()
+                return False
+        except CaoError as exc:
+            if model_menu_blocked(m):
+                model_menu_hold(g, m, "")
+                with lock:
+                    m.setdefault("outbox", []).insert(0, job)
+                    m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+                    save_state()
+                return False
+            probe_error = exc
     if relay_paused(g, job):
         with lock:
             m.setdefault("outbox", []).insert(0, job)
@@ -895,7 +918,9 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
     attempted = False
     charged = False
     try:
-        raw = get_full_output(m) if m.get("provider") == "codex" else None
+        if probe_error is not None:
+            raise probe_error
+        raw = codex_raw
         wire = bounded_input_query(f"/terminals/{m['terminal_id']}/input", {"message": delivery_text(job)})["message"]
         m["input_wire_chars"] = len(wire)
         if m.get("provider") == "hermes":
@@ -956,7 +981,7 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
 
 
 def watch_delivery(g: dict, m: dict, terminal: dict) -> None:
-    if quota_waiting(g, m) or (automation_settings(g)["quota_enabled"] and m.get("quota_interrupted_delivery")):
+    if model_menu_blocked(m) or quota_waiting(g, m) or (automation_settings(g)["quota_enabled"] and m.get("quota_interrupted_delivery")):
         return
     if not m.get("active_delivery") or not m.get("pending") or m.get("delivery_state") == "dispatching":
         return
@@ -1054,11 +1079,11 @@ def codex_states(raw: str) -> list[str | None]:
     return [state for _, state in codex_markers(raw)]
 
 
-def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None:
+def get_codex_reply(m: dict, output_generation: int | None = None, *, raw: str | None = None) -> str | None:
     boundary = m.get("codex_dispatch_markers")
     if boundary is None:
         return None  # A pending turn from before this protocol has no proven boundary.
-    raw = get_full_output(m)
+    raw = get_full_output(m) if raw is None else raw
     markers = codex_markers(raw)
     states = [state for _, state in markers]
     snapshot_len, snapshot_hash = m.get("codex_snapshot_len"), m.get("codex_snapshot_hash")
@@ -1301,6 +1326,8 @@ def get_reply(m: dict) -> str:
                 continue
             raise
         text = r.get("output", "") if isinstance(r, dict) else str(r)
+        if m.get("provider") == "codex" and codex_menu_info(text)["candidate"]:
+            raise ModelMenuScreen()
         if mode == "full":   # 退化：只取新增部分
             prev = m.get("full_len", 0)
             m["full_len"] = len(text)
@@ -1397,6 +1424,17 @@ def poll_member(g: dict, m: dict) -> None:
     gen, boundary = t.get("status_generation"), m.get("boundary")
     fresh = gen is None or boundary is None or gen > boundary
     m["status"] = st
+    codex_raw = None
+    if m.get("provider") == "codex":
+        try:
+            codex_raw = get_full_output(m)
+            if codex_menu_control(g, m, codex_raw):
+                quota_refresh(g, m, t)
+                return
+        except CaoError:
+            if model_menu_blocked(m):
+                model_menu_hold(g, m, "")
+                return
     if quota_refresh(g, m, t):
         save_state()
         return
@@ -1407,7 +1445,11 @@ def poll_member(g: dict, m: dict) -> None:
                 if reply:
                     handle_reply(g, m, reply)
             return  # An empty idle prompt is not the interrupted task's completion.
-    if quota_continue(g, m, t):
+    try:
+        if quota_continue(g, m, t):
+            return
+    except ModelMenuScreen:
+        model_menu_hold(g, m, codex_raw or "", from_reply=True)
         return
     if not m.get("pending"):
         if m.get("outbox"):
@@ -1427,7 +1469,10 @@ def poll_member(g: dict, m: dict) -> None:
     if m.get("provider") == "codex" and st not in ("waiting_user_answer", "error"):
         m["status"] = "processing"
         try:
-            reply = get_codex_reply(m, output_generation=t.get("output_generation"))
+            reply = get_codex_reply(m, output_generation=t.get("output_generation"), raw=codex_raw)
+        except ModelMenuScreen:
+            model_menu_hold(g, m, codex_raw or "", from_reply=True)
+            return
         except CaoError:
             reply = None  # A failed probe is not evidence of completion.
         if reply is not None:
@@ -1447,6 +1492,9 @@ def poll_member(g: dict, m: dict) -> None:
     elif st == "waiting_user_answer" and prev != st and fresh:
         try:
             tail = get_reply(m)[-800:]
+        except ModelMenuScreen:
+            model_menu_hold(g, m, codex_raw or "", from_reply=True)
+            return
         except (CaoError, ReplyExtractionError, ReplyNotReady):
             tail = ""
         add_msg(g, "system", "系统",
@@ -1593,7 +1641,7 @@ def deliver_owner(g: dict, m: dict, delivery_id: str) -> None:
         with lock:
             queued = any(job["id"] == delivery_id for job in m.get("outbox", []))
             if (queued and m.get("pending") and m.get("status") == "waiting_user_answer"
-                    and not quota_waiting(g, m)):
+                    and not quota_waiting(g, m) and not model_menu_blocked(m)):
                 m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
                 save_state()
         flush_outbox(g, m)
@@ -1642,7 +1690,7 @@ def public_group(g: dict, since: int = 0) -> dict:
                       quota_resets_at=m.get("quota_resets_at") if automation_settings(g)["quota_enabled"] else None,
                       effective_tools=member_tools(m), queued_count=len(m.get("outbox", [])),
                       delivery_id=job["id"] if job else None, delivery_attempt=job["attempt"] if job else None,
-                      can_retry=bool(job and not quota_waiting(g, m) and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
+                      can_retry=bool(job and not quota_waiting(g, m) and not model_menu_blocked(m) and m.get("delivery_state") in ("uncertain", "failed", "not_ready")))
         out["members"].append(member)
     return out
 
@@ -1787,21 +1835,140 @@ def quota_delivery_hint(g: dict, m: dict, raw: str, now: float) -> dict | None:
 
 
 
+def codex_menu_info(raw: str) -> dict:
+    lines = [line for line in quota_screen_lines(raw) if line]
+    if lines and lines[0].startswith("• "):
+        lines[0] = lines[0][2:]
+    titles = [i for i, line in enumerate(lines) if line in ("Approaching rate limits", "Usage limit reached")]
+    option = re.compile(r"([›>❯]?)\s*([1-9])\. (.+)")
+    partial = bool(lines and any((match := option.fullmatch(line)) and "Keep current model" in match[3] for line in lines)
+                   and "enter select" in lines[-1].lower() and "esc back" in lines[-1].lower())
+    if not titles and not partial:
+        return {"candidate": False}
+    beginning = titles[-1] if titles else 0
+    block = lines[beginning:]
+    options = [(match[2], match[3], bool(match[1])) for line in block if (match := option.fullmatch(line))]
+    positions = [i for i, line in enumerate(block) if option.fullmatch(line)]
+    if positions:
+        after = block[positions[-1] + 1:]
+        if any(line.startswith(("• ", "codex>")) or CODEX_READY_FOOTER.search(line) for line in after):
+            return {"candidate": False}
+    markers = codex_markers(raw)
+    if markers and markers[-1][0] > max(raw.rfind("Keep current model"), raw.rfind("Approaching rate limits"), raw.rfind("Usage limit reached")):
+        return {"candidate": False}
+    keep = [number for number, label, _ in options if label == "Keep current model"]
+    selected = [number for number, _, chosen in options if chosen]
+    unique = len({number for number, _, _ in options}) == len(options)
+    footer = bool(block and (option.fullmatch(block[-1]) or block[-1].lower() == "enter select · esc back"))
+    safe = bool(titles and len(keep) == 1 and len(selected) == 1 and unique and len(options) >= 2 and footer)
+    signature = hashlib.sha256(json.dumps([(n, label) for n, label, _ in options], ensure_ascii=False).encode()).hexdigest()
+    return {"candidate": True, "safe": safe, "target": keep[0] if len(keep) == 1 else None,
+            "selected": selected[0] if len(selected) == 1 else None, "numbers": [n for n, _, _ in options], "signature": signature}
+
+
 def codex_quota_menu(raw: str) -> tuple[bool, str | None]:
-    lines = quota_screen_lines(raw)
-    title = next((i for i, line in enumerate(lines) if line in
-                  ("Approaching rate limits", "Usage limit reached")), None)
-    if title is None:
-        return False, None
-    options = []
-    for line in lines[title + 1:]:
-        match = re.fullmatch(r"[›>]?\s*([1-9])\. (.+)", line)
-        if match:
-            options.append((match[1], match[2]))
-    exact = [(number, label) for number, label in options if label == "Keep current model"]
-    unique = len({number for number, _ in options}) == len(options)
-    # The number is read from the actual rendered option, never guessed.
-    return True, exact[0][0] if len(exact) == 1 and unique and len(options) >= 2 else None
+    info = codex_menu_info(raw)
+    return info["candidate"], info.get("target") if info.get("safe") else None
+
+
+def model_menu_blocked(m: dict) -> bool:
+    return (m.get("model_menu") or {}).get("phase") in ("verify", "enter_sent", "owner")
+
+
+def model_menu_hold(g: dict, m: dict, raw: str, *, from_reply: bool = False) -> None:
+    state = m.get("model_menu") or {}
+    if state.get("phase") == "resolved":
+        state = {}
+    state.update(phase="owner", observed_hash=hashlib.sha256(raw.encode()).hexdigest())
+    if from_reply:
+        state["from_reply"] = True
+    m.update(model_menu=state, model_menu_needs_owner=True)
+    if not state.get("notified"):
+        state["notified"] = True
+        add_msg(g, "system", "系统", f"{m['name']} 的模型菜单未能安全确认，已暂停该成员；请 @群主 在终端选择 Keep current model，菜单退出后继续等待本轮完成。", log=False)
+        append_log(g, "系统", "model_menu_action=await_owner")
+    save_state()
+
+
+def codex_menu_control(g: dict, m: dict, raw: str) -> bool:
+    """Navigate once, read a selected exact label, Enter once, then confirm exit."""
+    info, now = codex_menu_info(raw), time.time()
+    state = m.get("model_menu") or {}
+    phase = state.get("phase")
+    if not info["candidate"]:
+        positive = bool(codex_markers(raw) or CODEX_READY_FOOTER.search("\n".join(ANSI.sub("", raw).splitlines()[-12:])))
+        if phase == "owner":
+            changed = hashlib.sha256(raw.encode()).hexdigest() != state.get("observed_hash")
+            if positive and changed:
+                if state.get("from_reply"):
+                    try:
+                        result = cao("GET", f"/terminals/{m['terminal_id']}/output", {"mode": "last"})
+                        if codex_menu_info(result.get("output", ""))["candidate"]:
+                            return True
+                    except CaoError:
+                        return True
+                state["phase"] = "resolved"
+                m["model_menu_needs_owner"] = False
+                m["last_progress_at"] = now
+                add_msg(g, "system", "系统", f"{m['name']} 的模型菜单已退出，继续等待本轮完成。", log=False)
+                save_state()
+                return False
+            return True
+        if phase == "enter_sent":
+            if positive:
+                state["phase"] = "resolved"
+                m["model_menu_needs_owner"] = False
+                m["last_progress_at"] = now
+                append_log(g, "系统", "model_menu_action=keep_current_verified")
+                add_msg(g, "system", "系统", f"{m['name']} 已核对选中项并保持当前模型，继续等待本轮完成。", log=False)
+                save_state()
+                return False
+            if now - state["at"] >= 10:
+                model_menu_hold(g, m, raw)
+            return True
+        if phase == "verify":
+            model_menu_hold(g, m, raw)
+            return True
+        if phase == "resolved" and not m.get("pending") and codex_states(raw) and codex_states(raw)[-1] == "working":
+            return True
+        return False
+    if phase == "owner":
+        return True
+    if phase == "enter_sent":
+        if now - state["at"] >= 10:
+            model_menu_hold(g, m, raw)
+        return True
+    if phase == "verify":
+        if not info.get("safe") or info["signature"] != state["signature"]:
+            model_menu_hold(g, m, raw)
+        elif info["selected"] == state["target"]:
+            state.update(phase="enter_sent", at=now)
+            save_state()  # Persist before Enter; an uncertain key is never replayed.
+            try:
+                response = cao("POST", f"/terminals/{m['terminal_id']}/key", {"key": "Enter"})
+                if not isinstance(response, dict) or response.get("success") is not True:
+                    model_menu_hold(g, m, raw)
+            except CaoError:
+                model_menu_hold(g, m, raw)
+        elif now - state["at"] >= 2:
+            model_menu_hold(g, m, raw)
+        return True
+    if not info.get("safe"):
+        model_menu_hold(g, m, raw)
+        return True
+    state = {"phase": "verify", "at": now, "signature": info["signature"], "target": info["target"]}
+    m.update(model_menu=state, model_menu_needs_owner=False)
+    save_state()  # Persist navigation intent; restart never repeats arrow keys.
+    distance = info["numbers"].index(info["target"]) - info["numbers"].index(info["selected"])
+    try:
+        for _ in range(abs(distance)):
+            response = cao("POST", f"/terminals/{m['terminal_id']}/key", {"key": "Down" if distance > 0 else "Up"})
+            if not isinstance(response, dict) or response.get("success") is not True:
+                model_menu_hold(g, m, raw)
+                break
+    except CaoError:
+        model_menu_hold(g, m, raw)
+    return True
 
 
 def quota_waiting(g: dict, m: dict) -> bool:
@@ -1945,31 +2112,7 @@ def quota_refresh(g: dict, m: dict, terminal: dict | None = None) -> bool:
         hard = None
     if not automation_settings(g)["quota_enabled"]:
         return False
-    menu, choice = codex_quota_menu(raw) if m.get("provider") == "codex" else (False, None)
-    menu = menu and str(terminal.get("status", "")).lower() == "waiting_user_answer"
-    if menu:
-        if choice is None:
-            quota_pause(g, m, {"state": "exhausted", "source": "menu", "resets_at": None}, now)
-            if not m.get("quota_needs_owner"):
-                m["quota_needs_owner"] = True
-                quota_notice(g, m, "切换模型菜单无法精确匹配，等待 @群主 处理；未发送按键。")
-            return True
-        if not m.get("quota_menu_attempted"):
-            # Persist before any key: an interrupted operation must not repeat it.
-            m["quota_menu_attempted"] = True
-            save_state()
-            try:
-                for key in (choice, "Enter"):
-                    cao("POST", f"/terminals/{m['terminal_id']}/key", {"key": key})
-                append_log(g, "系统", "quota_source=menu quota_action=Keep current model")
-                add_msg(g, "system", "系统", f"{m['name']} 已精确匹配菜单并选择 Keep current model（保持当前模型）。", log=False)
-            except CaoError:
-                quota_pause(g, m, {"state": "exhausted", "source": "menu", "resets_at": None}, now)
-                m["quota_needs_owner"] = True
-                quota_notice(g, m, "保持当前模型操作未确认，等待 @群主 处理；不重复发送按键。")
-        # Continue observing structured quotas even while this control menu is open.
-    if not menu:
-        m.pop("quota_menu_attempted", None)
+    menu = False  # Model menus are handled independently before reply extraction/dispatch.
     signal = structured or hard
     if signal and m.get("quota_override") == signal and (signal["source"] == "structured" or m.get("quota_override_generation") == generation):
         signal = hard if signal["source"] == "structured" else None
@@ -2250,7 +2393,7 @@ def idle_coordinator(g: dict, settings: dict) -> dict | None:
     members = [m for m in g["members"] if not quota_waiting(g, m) and not
                (settings["quota_enabled"] and m.get("quota_interrupted_delivery"))]
     for m in members:
-        if (m.get("pending") or m.get("active_delivery") or m.get("outbox")
+        if (model_menu_blocked(m) or m.get("pending") or m.get("active_delivery") or m.get("outbox")
                 or m.get("work_state", "进行中") in ("等群主", "阻塞", "已交付")
                 or m.get("status") not in DONE | {"gone", "failed", "stopped", "error"}
                 or m.get("poll_error_type") or (m.get("terminal_id") and m.get("autonomy_poll_ok") is False)):

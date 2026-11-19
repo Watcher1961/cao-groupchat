@@ -167,6 +167,50 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_codex_model_menu_verified_keys_and_reply_wait_with_quota_disabled(self):
+        self.create_group()
+        member = self.invite("合成菜单成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.next_turn(tid, "本轮合成最终答案", hold=True)
+        self.api("POST", "/messages", {"text": "synthetic menu task"})
+        self.until("task input", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/model-menu", {"selected": 1, "status": "idle"})
+        self.until("verified selection and exit", lambda: (self.api("GET")["members"][0].get("model_menu") or {}).get("phase") == "resolved")
+        terminal = self.terminal(tid)
+        self.assertEqual(terminal["keys"], ["Down", "Enter"])
+        self.assertEqual(terminal["selection_checks"][-1], {"key": "Enter", "selected": 2})
+        self.assertTrue(self.api("GET")["members"][0]["pending"])
+        self.assertEqual(self.replies(), [])
+        self.assertEqual(sum("保持当前模型" in x["text"] for x in self.api("GET")["messages"]), 1)
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/release", {})
+        self.wait_replies(1)
+        self.assertEqual(len(self.replies()), 1)
+        self.assertIn("本轮合成最终答案", self.replies()[0]["text"])
+        self.assertNotIn("Keep current model", self.replies()[0]["text"])
+        self.assertEqual(self.terminal(tid)["keys"], ["Down", "Enter"])
+
+    def test_partial_codex_menu_pauses_without_keys_and_preserves_owner_queue(self):
+        self.create_group()
+        member = self.invite("合成不确定成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.next_turn(tid, "held synthetic answer", hold=True)
+        self.api("POST", "/messages", {"text": "current"})
+        self.until("current accepted", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        current = self.api("GET")["members"][0]
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/model-menu", {"partial": True, "selected": 2})
+        self.until("owner menu hold", lambda: self.api("GET")["members"][0].get("model_menu_needs_owner"))
+        self.api("POST", "/messages", {"text": "later owner instruction"})
+        self.until("owner queued", lambda: self.api("GET")["members"][0]["queued_count"] == 1)
+        reads = self.terminal(tid)["status_reads"]
+        self.until("hold repeats safely", lambda: self.terminal(tid)["status_reads"] >= reads + 4)
+        after = self.api("GET")["members"][0]
+        self.assertEqual(after["delivery_id"], current["delivery_id"])
+        self.assertFalse(after["can_retry"])
+        self.assertEqual(len(self.terminal(tid)["inputs"]), 1)
+        self.assertEqual(self.terminal(tid).get("keys", []), [])
+        self.assertEqual(self.replies(), [])
+        self.assertEqual(sum("模型菜单未能安全确认" in x["text"] for x in self.api("GET")["messages"]), 1)
+
     def test_clear_outbox_http_defaults_counts_and_keeps_active_token(self):
         self.create_group()
         member = self.invite("合成成员", "codex", "developer")
@@ -448,17 +492,18 @@ class IntegrationTests(unittest.TestCase):
         # Labels from installed 0.164.0; these rendered numbers are synthetic.
         menu = "Approaching rate limits\n  1. Switch to another model\n› 2. Keep current model\n  3. Keep current model (never show again)"
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota", {"prompt": menu, "status": "waiting_user_answer"})
-        self.until("exact menu keys", lambda: self.terminal(tid).get("keys") == ["2", "Enter"])
+        self.until("exact menu keys", lambda: self.terminal(tid).get("keys") == ["Enter"])
+        # The exact keep option is already selected; verify it before Enter.
         # /key leaves FIFO history; normal readiness only appends a fresh prompt.
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {})
         self.api("POST", "/messages", {"text": "菜单关闭后继续"})
         self.wait_replies(1)
-        self.assertEqual(self.terminal(tid)["keys"], ["2", "Enter"])
+        self.assertEqual(self.terminal(tid)["keys"], ["Enter"])
         budget = self.api("GET", "/automation")["runtime"]["deliveries_used"]
         unknown = "PRIVATE_MENU_SNIPPET\n" + menu.replace("2. Keep current model", "2. Keep the current model")
         self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/quota", {"prompt": unknown, "status": "waiting_user_answer"})
-        self.until("unknown menu waits for owner", lambda: self.api("GET")["members"][0].get("quota_needs_owner"))
-        self.assertEqual(self.terminal(tid)["keys"], ["2", "Enter"])
+        self.until("unknown menu waits for owner", lambda: self.api("GET")["members"][0].get("model_menu_needs_owner"))
+        self.assertEqual(self.terminal(tid)["keys"], ["Enter"])
         self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], budget)
         self.assertNotIn("PRIVATE_MENU_SNIPPET", self.api("GET", "/log")["content"])
         self.assertNotIn("PRIVATE_MENU_SNIPPET", (self.data / "groups.json").read_text())

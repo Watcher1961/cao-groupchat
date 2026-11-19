@@ -44,7 +44,7 @@
 
 成员 `quota_state` 为 ok、near（接近阈值）或 exhausted（等额度），`quota_resets_at` 已知时填写。near/exhausted 卡片显示预计重置时间或“重置时间未知”，需要人工处理时明确提示。near 只暂停新派发，当前轮仍能完成。
 
-优先读取 Codex 账号共享 rate_limits、已开启采集群的 Claude statusLine 快照（含 spend_limit）。任一有效窗口达到 100% 且 resets_at 在未来则 exhausted；可选 `quota_pause_percent` 默认 null，设阈值时达到即 near。终端检测仅支持有本机实际字符串依据的 Codex/Claude，其他 provider 特征待验证。Codex 仅在菜单标题、唯一的 Keep current model 文字及当前编号精确匹配时按键；无法确定时不按键，提示群主。
+优先读取 Codex 账号共享 rate_limits、已开启采集群的 Claude statusLine 快照（含 spend_limit）。任一有效窗口达到 100% 且 resets_at 在未来则 exhausted；可选 `quota_pause_percent` 默认 null，设阈值时达到即 near。终端检测仅支持有本机实际字符串依据的 Codex/Claude，其他 provider 特征待验证。Codex 模型菜单独立于额度开关保护：只有已知标题、唯一 Keep current model 文字/编号和当前选择标记精确匹配，才导航并重新读屏确认后 Enter；残缺/不确定/失败时暂停成员并提示群主，菜单不作为回复。
 
 暂停期间保留原队列，不告警“可能未送达”、不发该成员空闲提醒，不因等待消耗预算或提醒次数。等待累计秒数保存在 automation_state，按成员统计。每次等待只发一次进入等待的系统提示；恢复另发说明，探测到上限时仅追加一次群主处理提示。
 
@@ -71,3 +71,5 @@ Antigravity CLI 的候选若仅是可精确匹配的已发送输入片段，或�
 2. 单行状态/明确无新内容的短确认继续显示，但不触发成员接力。每位成员待发队列只合并同发送者、从未尝试过的自动消息，保留最新并注明合并条数；群主消息保留且优先，原重试任务与当前投递不合并。群内 60 秒达到 12 条非静默回复时持久暂停自动转发和空闲提醒，一次提示群主；群主非空新指令恢复。群主消息不被本机制合并、丢弃或拦截，仍遵守已有 CLI 忙/额度/投递预算边界。
 
 3. 成员卡片有待投递消息时提供“清队列”；确认框默认勾选保留群主消息，可取消勾选清除全部队列，返回清理/保留数并写固定计数日志。只处理 outbox，当前 active_delivery 在 sent/failed/uncertain/not_ready 下均不动，重试令牌有效性不变。演示模式同步，空队列不显示按钮。
+
+4. Codex 模型菜单不进入成员发言或接力。精确匹配后只导航至不带 never show again 的 Keep current model，另一次读屏核对选中项后才 Enter；确认菜单退出后发一次简短系统提示，继续等本轮最终回复。不确定/按键或读屏失败时保持队列和当前轮，提示群主在 CLI 处理；确认新屏幕就绪/工作后恢复观察。菜单安全保护始终生效，quota_enabled 只控制结构化/硬限额调度，选择保持模型不解除真实额度耗尽。

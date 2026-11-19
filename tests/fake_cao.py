@@ -72,6 +72,17 @@ class Handler(BaseHTTPRequestHandler):
             return "────────────\n❯ \x1b[0;38;5;240;3mSynthetic next action?\x1b[0m\n────────────"
         return "Ready\n> "
 
+    @staticmethod
+    def model_menu(terminal):
+        sim = terminal["model_menu_sim"]
+        labels = ("Switch to another model", "Keep current model", "Keep current model (never show again)")
+        rows = [("› " if i == sim.get("selected", 1) else "  ") + f"{i}. {label}" for i, label in enumerate(labels, 1)]
+        if sim.get("partial"):
+            rows = rows[1:]
+        else:
+            rows.insert(0, "Approaching rate limits")
+        return "\n".join(rows) + "\nenter select · esc back"
+
     def write_raw(self, terminal, content):
         raw = (terminal["full_out"] + content).encode()
         terminal["full_out"] = raw[-self.server.buffer_limit:].decode(errors="ignore")
@@ -212,12 +223,19 @@ class Handler(BaseHTTPRequestHandler):
                                    not any(t.get("deferred_init_failure") for t in terminals)):
                     return self.respond(404, {"detail": "session missing"})
                 return self.respond(200, {"session": session, "terminals": terminals})
-            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress|quota|quota-clear)", path)
+            control = re.fullmatch(r"/_test/terminals/(\w+)/(next-turn|release|advance|ready|progress|quota|quota-clear|model-menu)", path)
             if control and method == "POST":
                 terminal = self.server.terminals.get(control[1])
                 if terminal is None:
                     return self.respond(404, {"detail": "terminal missing"})
-                if control[2] in ("quota", "quota-clear"):
+                if control[2] == "model-menu":
+                    terminal["model_menu_sim"] = self.body()
+                    terminal["full_out"] = self.model_menu(terminal)
+                    terminal["out"] = terminal["full_out"]
+                    terminal["status"] = terminal["model_menu_sim"].get("status", "idle")
+                    terminal["output_generation"] += 1
+                    terminal["status_generation"] = terminal["output_generation"]
+                elif control[2] in ("quota", "quota-clear"):
                     options = self.body()
                     terminal["full_out"] = options.get("prompt", "") if control[2] == "quota" else self.prompt(terminal["provider"])
                     terminal["out"] = ""
@@ -282,7 +300,25 @@ class Handler(BaseHTTPRequestHandler):
                 if sub == "/exit" and method == "POST":
                     return self.respond(200, {"success": True})
                 if sub == "/key" and method == "POST":
-                    terminal.setdefault("keys", []).append(query["key"])
+                    key = query["key"]
+                    terminal.setdefault("keys", []).append(key)
+                    sim = terminal.get("model_menu_sim")
+                    if sim is not None:
+                        terminal.setdefault("selection_checks", []).append({"key": key, "selected": sim.get("selected", 1)})
+                        if key == "Enter":
+                            if sim.get("selected", 1) != 2:
+                                return self.respond(400, {"detail": "synthetic wrong selection"})
+                            terminal["model_menu_sim"] = None
+                            terminal["full_out"] = "\x1b]7501;state=working:app=codex\x1b\\working"
+                            terminal["out"] = ""
+                            terminal["status"] = "processing"
+                        elif key in ("Down", "Up"):
+                            if not sim.get("ignore_navigation"):
+                                sim["selected"] = sim.get("selected", 1) + (1 if key == "Down" else -1)
+                            terminal["full_out"] = self.model_menu(terminal)
+                            terminal["out"] = terminal["full_out"]
+                        terminal["output_generation"] += 1
+                        terminal["status_generation"] = terminal["output_generation"]
                     return self.respond(200, {"success": True})
                 if sub == "/input" and method == "POST":
                     message = query["message"]

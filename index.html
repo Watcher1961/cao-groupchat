@@ -703,6 +703,8 @@ async function saveQuotaSettings(settings){
   catch(e){alert(e.message);renderPane();}
 }
 function statusOf(m){
+  if(m.model_menu_needs_owner)return {st:"等待群主处理模型菜单",dc:"bad"};
+  if(["verify","enter_sent"].includes(m.model_menu?.phase))return {st:"正在保持当前模型",dc:"busy"};
   if(quotaCaption(m)) return {st:quotaCaption(m),dc:"busy"};
   const delivery={uncertain:"delivery_uncertain",not_ready:"not_ready",failed:"delivery_failed",waiting_ready:"waiting_ready",waiting_user:"waiting_user_answer"};
   const st=delivery[m.delivery_state]||(m.pending&&!['processing','running','waiting_user_answer'].includes(m.status)?"processing":m.status);
@@ -847,7 +849,7 @@ function renderPane(){
         ${effortCaption(m)?`<div class="note">${esc(effortCaption(m))}</div>`:""}
         <div class="tools">${toolChips(m)}</div>${enf}${usageHTML(m)}
         ${m.queued_count?`<div class="note">待投递：${m.queued_count} 条</div>`:""}
-        <div class="mact">${m.queued_count?`<button class="mini" data-clear-outbox="${m.id}">清队列</button>`:""}${!g.automation?.quota_enabled?"":quotaCaption(m)?`<button class="mini" data-quota-resume="${m.id}">恢复</button>`:`<button class="mini" data-quota-pause="${m.id}">标记为等额度</button>`}${m.can_retry&&!quotaCaption(m)?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
+        <div class="mact">${m.queued_count?`<button class="mini" data-clear-outbox="${m.id}">清队列</button>`:""}${!g.automation?.quota_enabled?"":quotaCaption(m)?`<button class="mini" data-quota-resume="${m.id}">恢复</button>`:`<button class="mini" data-quota-pause="${m.id}">标记为等额度</button>`}${m.can_retry&&!m.model_menu_needs_owner&&!["verify","enter_sent"].includes(m.model_menu?.phase)&&!quotaCaption(m)?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
       </div>`;}).join("")}
     <button class="addm" id="invite">${ico("plus")}邀请模型进群</button>
     <p class="note" style="margin:12px 4px 0">修改权限或职责会重启该成员（新会话），以便新的 profile 生效。</p>`;
@@ -913,7 +915,7 @@ async function refresh(){
     const top=S.msgs.length?S.msgs.at(-1).seq:0;
     const fresh=g.messages.filter(m=>m.seq>top);
     S.group=g; S.msgs=S.msgs.concat(fresh);
-    const sig=JSON.stringify([g.automation?.quota_enabled,g.automation?.quota_pause_percent,g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort,m.delivery_state,m.can_retry,m.delivery_id,m.delivery_attempt,m.queued_count,m.quota_state,m.quota_resets_at,m.quota_needs_owner,Math.floor(Date.now()/60000)])]);
+    const sig=JSON.stringify([g.automation?.quota_enabled,g.automation?.quota_pause_percent,g.members.map(m=>[m.id,m.status,m.pending,m.role,m.tools,m.duty,m.name,m.provider,m.model,m.effort,m.delivery_state,m.can_retry,m.delivery_id,m.delivery_attempt,m.queued_count,m.quota_state,m.quota_resets_at,m.quota_needs_owner,m.model_menu?.phase,m.model_menu_needs_owner,Math.floor(Date.now()/60000)])]);
     if(fresh.length){ renderMsgs(); await loadGroups(); renderGroups(); if(S.tab==="log") loadLog();
       if(fresh.some(m=>m.kind==="agent")) setTimeout(loadUsage,1500); }
     if(sig!==lastSig){ lastSig=sig; renderHead(); renderComposer(); if(S.tab==="members") renderPane(); }

@@ -15,9 +15,10 @@
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
+| `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、15 项菜单隔离回归；全部合成数据 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 41 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
-| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 20 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
+| `tests/test_integration.py` | 46 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 24 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
 
@@ -123,7 +124,7 @@
 
 `automation` 增加 `quota_enabled=false`、`quota_pause_percent=null`、`quota_reset_grace_seconds=120`、`quota_probe_interval_seconds=900`、`quota_probe_max_failures=8`。开关严格 bool，阈值有限且 0–100 或 null，宽限非负、间隔正数、失败上限正整数。`GET/PUT /api/groups/{id}/automation` 沿用部分更新；成员面板开关与阈值直接调用此接口，Mock 只模拟手动状态/队列，不模拟真实账号额度。未开启时不读取新额度信号，不显示操作按钮，原只读 usage 不受影响。
 
-`quota_windows` 复用账号共享 Codex rollout 和本群可选 Claude 快照；只接受合法百分比与未来重置时间。阻塞窗口合并取最晚 reset，避免一个窗口恢复而另一个仍耗尽。`terminal_quota_signal` 仅返回状态、百分比、reset、来源及匹配提示的 SHA-256 摘要；排除围栏/四空格代码与引用示例。Codex done 可能关闭错误轮，不单凭 done 吞掉硬限额；后续原生 reply bullet 和 done 才可淘汰历史错误。`codex_quota_menu` 要求已知标题、唯一选项和编号，不猜固定编号；操作前先持久化已尝试标记，然后经 CAO `/key` 发送数字和 Enter，不走 input 或预算，失败不重复按键。来源见 [任务记录](TASKS.md)。
+`quota_windows` 复用账号共享 Codex rollout 和本群可选 Claude 快照；只接受合法百分比与未来重置时间。阻塞窗口合并取最晚 reset，避免一个窗口恢复而另一个仍耗尽。`terminal_quota_signal` 仅返回状态、百分比、reset、来源及匹配提示的 SHA-256 摘要；排除围栏/四空格代码与引用示例。Codex done 可能关闭错误轮，不单凭 done 吞掉硬限额；后续原生 reply bullet 和 done 才可淘汰历史错误。`codex_menu_control` 独立于 quota_enabled，要求已知标题、唯一选项/编号及选择标记；经 `/key` 导航后重新读屏确认精确 Keep current model 才 Enter，不用数字直接选择，不走 input 或预算。导航/Enter 意图均先持久化，失败等待群主，不重复按键。来源见 [任务记录](TASKS.md)。
 
 暂停沿用成员投递锁：flush 和真正 dispatch 前都复核额度/控制菜单，未派发作业留原 outbox，不增加 attempt 或预算预留；预算仍由原全局锁统一预留。near/exhausted 都抑制 watchdog，near 仍提取当前轮回复；被硬限额中断的轮次不能因空 idle 输入框当作完成。暂停成员从空闲协调候选中排除；全员暂停则重置群 idle_since。状态转换和累计等待计数使用全局状态锁，网络探测在其外；成员锁在全局锁之前。设置关闭清理强制覆盖，写盘失败恢复额度字段、排队时钟和累计值。
 
@@ -170,3 +171,13 @@ member_ready/flush 对 Claude/Hermes 每次派发重验当前 composer，正向�
 `POST /api/groups/{gid}/members/{mid}/outbox/clear` 接收可选 `{keep_owner:true}`，严格 bool、默认 true，返回 `{cleared,retained}`。使用同一成员投递锁再全局状态锁，避免把已从队列移出的在途 job 一并清掉；群主来源沿用显式/旧前缀判定。保留 job 的 ID/attempt/顺序不改，active_delivery 始终不动（即使 failed/uncertain/not_ready），不消耗预算、不按任何键；只在既无队列又无 active 时清理陈旧投递等待状态。重复调用安全，日志只记录 ID、计数和保留选项。
 
 前端队列计数非零时显示按钮，中央确认模态框默认保留群主并明确当前投递/令牌不变，提交中防重复点击，失败保留确认框；演示 API 同样清理/计数/日志，不取消当前回复计时器。Node 使用真实内联脚本验证默认、选择、取消、错误和演示；不代替真实浏览器验收。
+
+## 第三轮：模型菜单控制屏
+
+菜单保护在 Codex 轮询/派发前及 last 回复入口生效，独立于 quota_enabled，覆盖上游 status=idle/processing/waiting_user_answer；不把“关闭额度调度”解释为允许模型切换。旧 quota 数字直选路径删除。精确菜单需要已知标题、多个唯一编号、唯一不带后缀的 Keep current model、唯一当前选中标记；残缺的 2/3 选项加 enter select/esc back 可识别为控制屏，但不具备自动选择证据。代码/引用与已有菜单之下的新原生标记、正文 bullet/就绪屏不作为活动菜单。
+
+来源：本机 @openai/codex 0.164.0 vendor 原生二进制只读确认 Approaching rate limits、Usage limit reached、Keep current model、Keep current model (never show again)；编号/箭头布局为合成渲染，底部控制词来自群主 11-19 授权中的实际现象，不宣称已真实复测。CAO api/main.py:4740–4759 的 /key 接受 tmux 特殊键；只使用 Up/Down/Enter，标签/编号/当前选项不确定时没有任何按键。
+
+成员 model_menu 仅保存 phase、时间、目标编号、菜单选项摘要、屏幕摘要和通知标记。phase=verify 先持久化导航意图，按相对位置发 Up/Down（已在目标时零次导航），下一次 full 读屏必须看到同一菜单且选中精确目标才把 Enter 意图持久化并发送；2 秒未到目标或菜单变化则等待群主。phase=enter_sent 等菜单退出且出现原生工作/完成标记或就绪特征，10 秒仍在菜单即等待群主，重启不重发箭头/Enter。成功只通知一次并继续等待本轮 done，不把选择菜单当完成。
+
+phase=owner 停止新派发、提取、重试按钮、watchdog 和空闲提醒，保留原 active_delivery/队列/attempt/预算。群主在 CLI 处理后，只有屏幕已改变且明确退出菜单才恢复；若菜单来自 last 回退，还要复查 last 不再是菜单。model_menu_needs_owner 供卡片显示，不复用 quota_state，因此手动额度恢复不绕过控制屏。导航等待仍读取结构化额度，真实 exhausted/near 保持原暂停/计时/续接规则；模型菜单按键不算投递、不消耗预算，恢复重置无进展时钟。所有新诊断为固定动作，原终端正文不进状态/日志。
