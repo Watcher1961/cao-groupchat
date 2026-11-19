@@ -167,6 +167,37 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_uncached_waiting_menu_gui_reply_preserves_active_and_sends_no_input(self):
+        self.create_group()
+        member = self.invite("合成确认成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.api("PUT", "/automation", {"delivery_budget": 10})
+        self.next_turn(tid, "held current turn", hold=True)
+        self.api("POST", "/messages", {"text": "current task"})
+        self.until("current input accepted", lambda: len(self.terminal(tid)["inputs"]) == 1)
+        current = self.until("current is sent", lambda: (m if (m := self.api("GET")["members"][0])["delivery_state"] == "sent" else None))
+        self.stopped_server = self.server
+        self.stop_process(self.server)
+        stored = json.loads((self.data / "groups.json").read_text())
+        cached = stored[self.group_path.rsplit("/", 1)[1]]["members"][0]
+        cached["status"] = "waiting_user_answer"
+        cached.pop("model_menu", None)
+        cached.pop("model_menu_needs_owner", None)
+        (self.data / "groups.json").write_text(json.dumps(stored))
+        self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/model-menu", {"selected": 0, "status": "waiting_user_answer"})
+        self.env["GROUPCHAT_POLL_SECONDS"] = "60"
+        self.start_server()  # No poll has discovered this menu before the GUI answer.
+        self.api("POST", "/messages", {"text": "@合成确认成员 2"})
+        held = self.until("GUI answer waits for owner", lambda: (m if (m := self.api("GET")["members"][0]).get("model_menu_needs_owner") else None))
+        self.assertEqual(held["delivery_id"], current["delivery_id"])
+        self.assertEqual(held["delivery_attempt"], current["delivery_attempt"])
+        self.assertTrue(held["pending"])
+        self.assertEqual(held["queued_count"], 1)
+        self.assertEqual(len(self.terminal(tid)["inputs"]), 1)
+        self.assertEqual(self.terminal(tid).get("menu_input_violations", 0), 0)
+        self.assertEqual(self.terminal(tid).get("keys", []), [])
+        self.assertEqual(self.api("GET", "/automation")["runtime"]["deliveries_used"], 1)
+
     def test_menu_appears_after_first_dispatch_read_never_receives_input(self):
         self.create_group()
         member = self.invite("合成晚菜单", "codex", "developer")

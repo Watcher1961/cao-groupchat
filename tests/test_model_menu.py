@@ -266,6 +266,75 @@ class ModelMenuTests(ServerTestCase):
             self.server.flush_outbox(self.group, self.m)
         self.assertEqual(observed, [(False, 0, 0)])
 
+    def test_uncached_menu_owner_answers_never_replace_current_delivery(self):
+        parent = self.m["active_delivery"]
+        self.group["members"] = [self.m]
+        self.group["automation"] = {"delivery_budget": 20}
+        self.server.automation_state(self.group)["deliveries_used"] = 0
+        for path in ("send_to", "post_message", "queue_delivery"):
+            for reported in ("idle", "completed", "waiting_user_answer"):
+                with self.subTest(path=path, reported=reported):
+                    self.m.update(active_delivery=parent, pending=True, status="waiting_user_answer", delivery_state="sent", outbox=[])
+                    self.m.pop("model_menu", None)
+                    self.m["model_menu_needs_owner"] = False
+                    self.raw, self.status, self.selected, self.keys = menu(0), reported, 0, []
+                    before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+                    if path == "send_to":
+                        self.server.send_to(self.group, self.m, "[群主] @开发 2", 0)
+                    elif path == "post_message":
+                        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
+                            self.server.post_message(self.group, "@开发 2")
+                    else:
+                        with self.server.delivery_lock(self.group, self.m), self.server.lock:
+                            self.server.queue_delivery(self.group, self.m, self.server.new_delivery("[群主] @开发 2", 0))
+                        self.tick()
+                    self.assertIs(self.m["active_delivery"], parent)
+                    self.assertTrue(self.m["pending"])
+                    self.assertEqual(self.m["outbox"][0]["text"], "[群主] @开发 2")
+                    self.assertEqual(self.m["outbox"][0]["attempt"], 0)
+                    self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before)
+                    self.assertEqual(self.keys, [])
+                    self.assertEqual(self.server.automation_state(self.group)["deliveries_used"], 0)
+
+    def test_real_non_model_confirmation_still_accepts_owner_answer(self):
+        self.m.update(status="waiting_user_answer")
+        self.raw, self.status = "Approval required\n1. Allow\n2. Deny", "waiting_user_answer"
+        self.group["members"] = [self.m]
+        before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
+            self.server.post_message(self.group, "@开发 continue")
+        self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before + 1)
+        self.assertEqual(self.m["active_delivery"]["text"], "[群主] @开发 continue")
+        self.assertEqual(self.keys, [])
+
+    def test_unreadable_confirmation_keeps_original_turn_and_owner_answer(self):
+        parent = self.m["active_delivery"]
+        self.m.update(status="waiting_user_answer")
+        self.group["members"] = [self.m]
+        original = self.response
+        def unreadable(method, path, query=None, **kwargs):
+            if path.endswith("/output"):
+                raise self.server.CaoError(503, "synthetic confirmation screen unavailable")
+            return original(method, path, query, **kwargs)
+        self.cao.side_effect = unreadable
+        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
+            self.server.post_message(self.group, "@开发 2")
+        self.assertIs(self.m["active_delivery"], parent)
+        self.assertEqual(self.m["outbox"][0]["attempt"], 0)
+        self.assertTrue(self.m["model_menu_needs_owner"])
+
+    def test_stale_waiting_status_does_not_preempt_current_working_turn(self):
+        parent = self.m["active_delivery"]
+        self.m.update(status="waiting_user_answer")
+        self.raw, self.status = W + "current work", "processing"
+        self.group["members"] = [self.m]
+        before = sum(c.args[1].endswith("/input") for c in self.cao.call_args_list)
+        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
+            self.server.post_message(self.group, "@开发 queued")
+        self.assertIs(self.m["active_delivery"], parent)
+        self.assertEqual(self.m["outbox"][0]["attempt"], 0)
+        self.assertEqual(sum(c.args[1].endswith("/input") for c in self.cao.call_args_list), before)
+
     def test_last_mode_menu_fragment_is_never_posted_as_member_reply(self):
         self.raw = W + "• final\n" + D + "\n? for shortcuts"
         self.last = "2. Keep current model\n3. Keep current model (never show again)\nenter select · esc back"

@@ -15,9 +15,9 @@
 | `tests/test_server.py` | 74 个标准库 unittest：子进程导入隔离、临时 HOME/数据/日志、模拟 CAO 的群聊行为、输出清洗、effort/profile 和 Codex 完成判定 |
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
-| `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、19 项菜单隔离回归；全部合成数据 |
+| `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、23 项菜单隔离回归；全部合成数据 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 48 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 49 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 24 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -189,3 +189,9 @@ phase=owner 停止新派发、提取、重试按钮、watchdog 和空闲提醒�
 fake 在首检的响应已取值、但返回前使屏幕出现默认选项 1 菜单；若旧版继续 POST，则计数并模拟附带 Enter 吞消息/切换模型，不向真实 CLI 发送任何材料。晚弹场景加四种作业来源、读屏失败、导航前回滚、重启后恰好一次恢复，以及菜单可见期间群主/转发都只排队的 HTTP 回归。
 
 边界：CAO 的 GET output 与 POST input 是两个独立 HTTP 操作，本修复关闭首检至落盘的可复现间隙；最后读屏后 CLI 自身变化到 POST 的极短窗口仍不具原子保证，GUI 成员锁不控制 CLI。严格消除这一窗口需要 CAO 层提供检查并发送的原子能力，当前授权不改 CAO；本项不声称模拟测试证明绝对原子性，真实复测须覆盖弹窗时机。GUI 需重启进程才加载新版本，开发提交本身不会热更新正在运行的进程。
+
+### 第 4 项补充：确认回复不能越过菜单保护
+
+queue_delivery 对 Codex 仅入队，不再凭缓存 waiting_user_answer 释放 active_delivery。send_to 与群主后台 deliver_owner 共用 prepare_owner_answer：在成员锁内、状态锁外读取当前 terminal 和 full，先拦模型菜单/读屏失败，再确认当前状态仍 waiting_user_answer，最后在状态锁内重验后才允许普通确认接答。CLI 已恢复 processing/idle/completed 时不使用过期 waiting 缓存，不替换当前轮。其他 provider 的原确认分支保持。
+
+GUI 群主“@成员 2”等文本不是模型菜单控制命令，全部保留队列，不发送 input、也不替换原投递；菜单等待提示明确这一点。人工选择仅在 CLI 内完成，GUI 自动操作仍只允许精确 Keep current model 的受控按键。普通非模型确认保留 GUI 接答功能，后续真实 input 仍过首次和末次菜单闸门。GET/POST 非原子性边界同前，不用缓存就绪作为绕过依据。

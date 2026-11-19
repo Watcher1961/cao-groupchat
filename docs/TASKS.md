@@ -38,11 +38,19 @@
 
 本补充提交前全量（2026-11-19，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 304 tests in 49.579s`、OK，退出 0，无跳过/资源警告；232 后端、48 HTTP、24 Node 全部实际执行。本轮只跑一次全量，生产仅 dispatch_delivery 增补末次闸门。8 个授权文件，AST/文档链接围栏/隐私模式/`git diff --check`/GROUP_LOG 忽略通过。原四提交不改写，与本补充一起交 Claude 审查；源码提交不重启旧 GUI，真实部署/CLI 弹窗时机复测仍由群主安排。
 
+### 第 4 项补充：waiting_user_answer 群主回复（实现完成，待统一审查）
+
+按 Claude 新增核对点发现：1c3d6bb 已能在菜单时挡住 input，但未知菜单缓存下 queue_delivery/deliver_owner 可能先清原 active，再到派发闸门才拦截。Codex 入队现改为仅入队，由 send_to/群主后台共用当前状态+屏幕预检；发现菜单/读屏失败/CLI 已工作则保留原 active ID/attempt/pending，不冒充新的回答。群主直接在 CLI 操作模型菜单仍允许；GUI 群聊回复只排队，不作为模型菜单输入；正常非模型确认在新鲜 waiting_user_answer 状态且无菜单时仍可接答。该规则已写系统提示，原其他 provider 行为不变。
+
+先补四项合成单测，旧生产 4 项中 11 个失败子项（0.126 秒）：三种入口乘 idle/completed/waiting_user_answer 三种报告值，正常确认、读屏失败、过期 waiting 状态；修复后菜单/原投递/预算/额度 167 项通过（3.944 秒）。再加 HTTP 关轮询、载入未知菜单缓存的真实后台场景，GUI 回“2”保持原 active、只新增一条队列、零 input/按键/新预算；最终相关 169 项通过（5.468 秒）。夹具均合成、不读实样或真实会话。
+
+本补充提交前全量（2026-11-19，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 309 tests in 49.207s`、OK，退出 0，无跳过/资源警告；236 后端、49 HTTP、24 Node 全部执行。本补充迭代仅跑相关文件，提交前一次全量。6 个授权文件、AST/文档链接围栏/隐私模式/`git diff --check`/GROUP_LOG 忽略通过。原五提交保留，本补充一起统一交审，不重启真实 GUI、不推送。
+
 ### 统一提交前验证
 
 最终全量（2026-11-19，codex）：`python3 -B -W error::ResourceWarning -m unittest discover -s tests -v`，实际 `Ran 298 tests in 46.732s`、OK，退出 0，无跳过/资源警告；228 后端、46 HTTP、24 Node 全部执行。首次全量为 298 项、1 个旧 HTTP 数字直选预期失败（61.661 秒），297 项通过；适配为“已选精确目标时核对后仅 Enter”和 model_menu_needs_owner 后，单独 HTTP 1 项通过（0.516 秒），再完成上述必要全量复验。未把首次失败计为通过，也未因迭代重复全量。四个分项提交据各自索引快照生成并统一交 Claude。
 
-分项提交：第 1 项 `1a169e3`；第 2 项 `1601651`；第 3 项 `ef7196f`；第 4 项 `8ff4fd8`（模型菜单导航确认）。原四项及菜单发送拦截补充全部待 Claude 统一独立审查，不进入后续任务。静态核对：18 个授权文件，AST/文档链接与围栏/新增隐私模式/`git diff --check`/GROUP_LOG 忽略通过；profile、effort、采集、价格用量、原输出清洗、原 Hermes 边界及 retry_delivery/额度核心算法保持。前次 4e43e11 的已通过结论已如实补记，其他历史任务状态不变。
+分项提交：第 1 项 `1a169e3`；第 2 项 `1601651`；第 3 项 `ef7196f`；第 4 项 `8ff4fd8`（模型菜单导航确认）。原四项、`1c3d6bb` 发送拦截补充及本次确认回复保护全部待 Claude 统一独立审查，不进入后续任务。静态核对：18 个授权文件，AST/文档链接与围栏/新增隐私模式/`git diff --check`/GROUP_LOG 忽略通过；profile、effort、采集、价格用量、原输出清洗、原 Hermes 边界及 retry_delivery/额度核心算法保持。前次 4e43e11 的已通过结论已如实补记，其他历史任务状态不变。
 
 真实复测仍待群主审查后安排：Claude 占位样式、Hermes 真实轮次/原始重绘、真实高频协作熔断阈值、浏览器清队列确认及 Codex 菜单实际导航。未向真实 CLI 发任务/按键，不改 CAO/全局/provider 配置，不推送。
 

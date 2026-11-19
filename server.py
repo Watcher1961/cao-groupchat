@@ -710,6 +710,8 @@ def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False, *, sen
                 job.update(origin="relay", sender_id=sender_id)
             queue_delivery(g, m, job)
             save_state()
+        if m.get("provider") == "codex" and hops == 0 and not silent:
+            prepare_owner_answer(g, m, job["id"])
         flush_outbox(g, m)
 
 
@@ -814,7 +816,8 @@ def relay_allowed(g: dict, text: str) -> bool:
 
 def queue_delivery(g: dict, m: dict, job: dict) -> None:
     # Caller holds this member's delivery lock, then the global state lock.
-    if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m) and not model_menu_blocked(m):
+    if (m.get("provider") != "codex" and m.get("pending") and m.get("status") == "waiting_user_answer"
+            and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m) and not model_menu_blocked(m)):
         m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
         m.setdefault("outbox", []).insert(0, job)
     else:
@@ -1657,14 +1660,37 @@ def create_group(body: dict) -> dict:
     return g
 
 
+def prepare_owner_answer(g: dict, m: dict, delivery_id: str) -> None:
+    # Caller holds the member lock. Never read the terminal under the global lock.
+    with lock:
+        queued = any(job["id"] == delivery_id for job in m.get("outbox", []))
+        if (not queued or not m.get("pending") or m.get("status") != "waiting_user_answer"
+                or quota_waiting(g, m) or model_menu_blocked(m)):
+            return
+    if m.get("provider") == "codex":
+        try:
+            terminal = cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
+            raw = get_full_output(m)
+        except CaoError:
+            model_menu_hold(g, m, "")
+            return
+        if codex_menu_control(g, m, raw):
+            return  # The GUI text stays queued; only verified menu keys are allowed.
+        current_status = str(terminal.get("status", "")).lower()
+        with lock:
+            m["status"] = current_status
+        if current_status != "waiting_user_answer":
+            return
+    with lock:
+        if (any(job["id"] == delivery_id for job in m.get("outbox", [])) and m.get("pending")
+                and m.get("status") == "waiting_user_answer" and not quota_waiting(g, m) and not model_menu_blocked(m)):
+            m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+            save_state()
+
+
 def deliver_owner(g: dict, m: dict, delivery_id: str) -> None:
     with delivery_lock(g, m):
-        with lock:
-            queued = any(job["id"] == delivery_id for job in m.get("outbox", []))
-            if (queued and m.get("pending") and m.get("status") == "waiting_user_answer"
-                    and not quota_waiting(g, m) and not model_menu_blocked(m)):
-                m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
-                save_state()
+        prepare_owner_answer(g, m, delivery_id)
         flush_outbox(g, m)
 
 
@@ -1906,7 +1932,7 @@ def model_menu_hold(g: dict, m: dict, raw: str, *, from_reply: bool = False) -> 
     m.update(model_menu=state, model_menu_needs_owner=True)
     if not state.get("notified"):
         state["notified"] = True
-        add_msg(g, "system", "系统", f"{m['name']} 的模型菜单未能安全确认，已暂停该成员；请 @群主 在终端选择 Keep current model，菜单退出后继续等待本轮完成。", log=False)
+        add_msg(g, "system", "系统", f"{m['name']} 的模型菜单未能安全确认，已暂停该成员；请 @群主 在终端选择 Keep current model，菜单退出后继续等待本轮完成。群聊回复仅排队，不作为模型菜单回答。", log=False)
         append_log(g, "系统", "model_menu_action=await_owner")
     save_state()
 
