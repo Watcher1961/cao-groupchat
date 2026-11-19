@@ -23,6 +23,15 @@ class FrontendEffortTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "OK\n")
 
+    def test_clear_outbox_card_and_confirmation_default(self):
+        self.check_ui("cards", "frontend_outbox.js")
+
+    def test_clear_outbox_confirmation_payload_and_error(self):
+        self.check_ui("submit", "frontend_outbox.js")
+
+    def test_clear_outbox_demo_preserves_owner_and_active(self):
+        self.check_ui("demo", "frontend_outbox.js")
+
     def test_quota_switch_and_disabled_actions(self):
         self.check_ui("settings", "frontend_quota.js")
 

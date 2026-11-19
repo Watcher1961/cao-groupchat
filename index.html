@@ -495,7 +495,7 @@ class Mock {
   mentions(g,text,ex){ return g.members.filter(x=>x.id!==ex && text.includes("@"+x.name)); }
   drain(g,m){if(m.status!=="processing"&&m.outbox?.length&&(!g.automation?.quota_enabled||m.quota_state==="ok")){const job=m.outbox.shift();this.deliver(g,m,job.text,job.hops);}}
   deliver(g,m,text,hops){
-    if(g.automation?.quota_enabled&&(m.quota_state==="exhausted"||m.quota_state==="near"||m.status==="processing")){(m.outbox??=[]).push({text,hops});return;}
+    if(m.status==="processing"||(g.automation?.quota_enabled&&(m.quota_state==="exhausted"||m.quota_state==="near"))){(m.outbox??=[]).push({text,hops});return;}
     m.status="processing";
     setTimeout(()=>{ m.status="idle"; const reply=this.fake(g,m,text,hops); this.msg(g,"agent",m.name,reply,m.id);
       (reply.match(/^\s*\[日志\]\s*(.+)$/gm)||[]).forEach(l=>this.log(g,m.name,l.replace(/^\s*\[日志\]\s*/,"")));
@@ -543,6 +543,14 @@ class Mock {
     if(method==="DELETE"){ g.members.splice(g.members.indexOf(m),1); this.log(g,"群主",`将 ${m.name} 移出群`); this.msg(g,"system","系统",`${m.name} 已被移出群。`); return {ok:true}; }
     if(method==="PUT"){ const n=this.member({...body,id:m.id},g); g.members[g.members.indexOf(m)]=n;
       this.log(g,"群主",`调整 ${n.name} 的配置并重启：角色=${n.role}，权限=${eff(n).join(",")}，推理强度=${n.effort||"CLI 默认"}`); this.boot(g,n); return n; }
+    if(r[2]==="outbox"&&r[3]==="clear"&&method==="POST"){
+      const keep=body?.keep_owner===undefined?true:body.keep_owner;if(typeof keep!=="boolean")throw new Error("keep_owner 必须为布尔值");
+      const queue=m.outbox||[],kept=queue.filter(j=>keep&&(j.origin==="owner"||(!j.origin&&j.hops===0&&j.text.startsWith("[群主] "))));
+      const cleared=queue.length-kept.length;m.outbox=kept;
+      if(!m.active_delivery&&!kept.length&&!m.pending&&m.status!=="processing")m.delivery_state="completed";
+      this.log(g,"系统",`outbox_action=clear member=${m.id} cleared=${cleared} retained=${kept.length} keep_owner=${keep}`);
+      return {cleared,retained:kept.length};
+    }
     if(r[2]==="quota"){
       if(!g.automation?.quota_enabled)throw new Error("请先开启本群按额度调度");
       m.quota_state=body.action==="pause"?"exhausted":"ok";m.quota_resets_at=null;
@@ -551,7 +559,7 @@ class Mock {
     }
     if(r[2]==="restart"){ m.status="starting"; this.boot(g,m); return {ok:true}; }
   }
-  pub(g,since){ return {...g,log_file:g.workdir+"/GROUP_LOG.md",members:g.members.map(m=>({...m,effective_tools:eff(m)})),messages:g.messages.filter(m=>m.seq>since)}; }
+  pub(g,since){ return {...g,log_file:g.workdir+"/GROUP_LOG.md",members:g.members.map(m=>({...m,effective_tools:eff(m),queued_count:(m.outbox||[]).length})),messages:g.messages.filter(m=>m.seq>since)}; }
 }
 function eff(m){ return (m.tools&&m.tools.length)?m.tools:(ROLES[m.role]||ROLES.developer); }
 
@@ -839,7 +847,7 @@ function renderPane(){
         ${effortCaption(m)?`<div class="note">${esc(effortCaption(m))}</div>`:""}
         <div class="tools">${toolChips(m)}</div>${enf}${usageHTML(m)}
         ${m.queued_count?`<div class="note">待投递：${m.queued_count} 条</div>`:""}
-        <div class="mact">${!g.automation?.quota_enabled?"":quotaCaption(m)?`<button class="mini" data-quota-resume="${m.id}">恢复</button>`:`<button class="mini" data-quota-pause="${m.id}">标记为等额度</button>`}${m.can_retry&&!quotaCaption(m)?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
+        <div class="mact">${m.queued_count?`<button class="mini" data-clear-outbox="${m.id}">清队列</button>`:""}${!g.automation?.quota_enabled?"":quotaCaption(m)?`<button class="mini" data-quota-resume="${m.id}">恢复</button>`:`<button class="mini" data-quota-pause="${m.id}">标记为等额度</button>`}${m.can_retry&&!quotaCaption(m)?`<button class="mini" data-retry="${m.id}">${m.delivery_state==="uncertain"?"重发":"重试投递"}</button>`:""}<button class="mini" data-edit="${m.id}">编辑</button><button class="mini" data-restart="${m.id}">重启</button><button class="mini del" data-kick="${m.id}">移出</button></div>
       </div>`;}).join("")}
     <button class="addm" id="invite">${ico("plus")}邀请模型进群</button>
     <p class="note" style="margin:12px 4px 0">修改权限或职责会重启该成员（新会话），以便新的 profile 生效。</p>`;
@@ -849,10 +857,28 @@ function renderPane(){
   pane.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openMemberModal(g.members.find(m=>m.id===b.dataset.edit)));
   pane.querySelectorAll("[data-quota-resume]").forEach(b=>b.onclick=()=>changeQuota(b.dataset.quotaResume,"resume"));
   pane.querySelectorAll("[data-quota-pause]").forEach(b=>b.onclick=()=>changeQuota(b.dataset.quotaPause,"pause"));
+  pane.querySelectorAll("[data-clear-outbox]").forEach(b=>b.onclick=()=>openClearOutbox(b.dataset.clearOutbox));
   pane.querySelectorAll("[data-retry]").forEach(b=>b.onclick=()=>retryDelivery(b.dataset.retry));
   pane.querySelectorAll("[data-restart]").forEach(b=>b.onclick=async()=>{ await api("POST",`/groups/${g.id}/members/${b.dataset.restart}/restart`); refresh(); });
   pane.querySelectorAll("[data-kick]").forEach(b=>b.onclick=async()=>{ const m=g.members.find(x=>x.id===b.dataset.kick);
     if(!ask(`把 ${m.name} 移出群并关闭它的终端？`)) return; await api("DELETE",`/groups/${g.id}/members/${m.id}`); refresh(); });
+}
+function openClearOutbox(id){
+  const g=S.group,m=g?.members.find(x=>x.id===id);if(!m)return;
+  modalOrigin=document.activeElement;
+  $("#modal").innerHTML=`<header>清理 ${esc(m.name)} 的待投递队列<button class="x">×</button></header>
+    <div class="body"><p>只清理尚未派发的队列。当前投递及其重试令牌保持不变。</p>
+    <label><input type="checkbox" id="keepOwner" checked> 保留群主消息</label></div>
+    <footer><button class="btn" data-close>取消</button><button class="btn danger" id="clearQueue">确认清理</button></footer>`;
+  $("#keepOwner").checked=true;
+  let clearing=false;const button=$("#clearQueue");
+  button.onclick=async()=>{
+    if(clearing)return;clearing=true;button.disabled=true;
+    try{const result=await api("POST",`/groups/${g.id}/members/${id}/outbox/clear`,{keep_owner:$("#keepOwner").checked});
+      closeModal();alert(`已清理 ${result.cleared} 条，保留 ${result.retained} 条。`);lastSig="";if(S.group?.id===g.id)await refresh();}
+    catch(e){alert(e.message);}finally{clearing=false;button.disabled=false;}
+  };
+  bindClose();$("#mask").classList.add("on");button.focus();syncDrawers();
 }
 const retrying=new Set();
 async function retryDelivery(id){

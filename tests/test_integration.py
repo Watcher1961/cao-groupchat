@@ -167,6 +167,45 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_clear_outbox_http_defaults_counts_and_keeps_active_token(self):
+        self.create_group()
+        member = self.invite("合成成员", "codex", "developer")
+        tid = member["terminal_id"]
+        self.until("intro done", lambda: not self.api("GET")["members"][0].get("pending"))
+        before = len(self.terminal(tid)["inputs"])
+        self.next_turn(tid, "held synthetic task", hold=True)
+        self.api("POST", "/messages", {"text": "active"})
+        self.until("held input accepted", lambda: len(self.terminal(tid)["inputs"]) == before + 1)
+        active = self.until("active input", lambda: (m if (m := self.api("GET")["members"][0]).get("delivery_state") == "sent" else None))
+        self.stopped_server = self.server
+        self.stop_process(self.server)
+        stored = json.loads((self.data / "groups.json").read_text())
+        current = stored[self.group_path.rsplit("/", 1)[1]]["members"][0]
+        current["outbox"] = [{"id": f"q{i}", "attempt": 0, "queued_at": time.time(), "text": text, "hops": hops, "silent": False}
+                             for i, (text, hops) in enumerate((("[来自 评审] PRIVATE_OLD", 1), ("[群主] PRIVATE_KEEP", 0), ("[来自 开发] PRIVATE_OLD2", 1)))]
+        (self.data / "groups.json").write_text(json.dumps(stored))
+        self.start_server()
+        loaded = self.api("GET")["members"][0]
+        self.assertEqual(loaded["delivery_id"], active["delivery_id"])
+        self.assertEqual(loaded["queued_count"], 3)
+        result = self.api("POST", f"/members/{member['id']}/outbox/clear", {})
+        self.assertEqual(result, {"cleared": 2, "retained": 1})
+        result = self.api("POST", f"/members/{member['id']}/outbox/clear", {"keep_owner": False})
+        self.assertEqual(result, {"cleared": 1, "retained": 0})
+        now = self.api("GET")["members"][0]
+        self.assertEqual((now["delivery_id"], now["delivery_attempt"]), (active["delivery_id"], active["delivery_attempt"]))
+        self.assertTrue(now["pending"])
+        self.assertEqual(now["queued_count"], 0)
+        for suffix, body, code in ((f"/members/{member['id']}/outbox/clear", {"keep_owner": "false"}, 400),
+                                   ("/members/missing/outbox/clear", {}, 404)):
+            with self.assertRaises(error.HTTPError) as failed:
+                self.api("POST", suffix, body)
+            with failed.exception as response:
+                self.assertEqual(response.code, code)
+        lines = [line for line in self.api("GET", "/log")["content"].splitlines() if "outbox_action=clear" in line]
+        self.assertEqual(len(lines), 2)
+        self.assertFalse(any("PRIVATE_" in line for line in lines))
+
     def test_relay_storm_circuit_stops_real_http_chain_and_owner_resumes(self):
         self.create_group()
         a = self.invite("合成甲", "codex", "developer")

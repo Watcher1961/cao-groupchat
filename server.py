@@ -755,6 +755,25 @@ def compact_outbox(g: dict, m: dict) -> None:
         append_log(g, "系统", f"relay_action=merge member={m['id']} removed={removed}")
 
 
+def clear_outbox(g: dict, m: dict, options: dict) -> dict:
+    if not isinstance(options, dict) or type(options.get("keep_owner", True)) is not bool:
+        raise ValueError("keep_owner 必须为布尔值")
+    keep_owner = options.get("keep_owner", True)
+    with delivery_lock(g, m):
+        with lock:
+            queue = m.get("outbox", [])
+            kept = [job for job in queue if keep_owner and delivery_origin(g, job)[0] == "owner"]
+            cleared = len(queue) - len(kept)
+            m["outbox"] = kept
+            if not m.get("active_delivery") and not kept:
+                m.update(pending=False, delivery_state="completed", delivery_warned=False)
+            if "automation_state" in g:
+                g["automation_state"]["idle_since"] = None
+            save_state()
+            append_log(g, "系统", f"outbox_action=clear member={m['id']} cleared={cleared} retained={len(kept)} keep_owner={keep_owner}")
+            return {"cleared": cleared, "retained": len(kept)}
+
+
 def relay_paused(g: dict, job: dict) -> bool:
     return bool(g.get("relay_control", {}).get("paused") and delivery_origin(g, job)[0] == "relay")
 
@@ -2882,6 +2901,11 @@ class H(BaseHTTPRequestHandler):
                                              f"职责={new['duty'] or '未指定'}")
                         run_bg(bootstrap_members, g, [new], False)
                         return self._json(200, new)
+                if len(rest) == 4 and rest[0] == "members" and rest[2:] == ["outbox", "clear"] and method == "POST":
+                    m = next((x for x in g["members"] if x["id"] == rest[1]), None)
+                    if not m:
+                        return self._json(404, {"error": "成员不存在"})
+                    return self._json(200, clear_outbox(g, m, self._body()))
                 if len(rest) == 3 and rest[0] == "members" and rest[2] == "quota" and method == "POST":
                     m = next((x for x in g["members"] if x["id"] == rest[1]), None)
                     if not m:
