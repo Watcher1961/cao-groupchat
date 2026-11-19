@@ -20,6 +20,8 @@ class AutonomyTests(ServerTestCase):
         self.cao.side_effect = self.response
 
     def response(self, method, path, query=None, **kwargs):
+        if method == "GET":
+            return {"output": "────────────\n❯ \n────────────"} if path.endswith("/output") else {"status": "idle"}
         self.assertEqual(method, "POST")
         self.inputs.append((path, query["message"]))
         return {"dispatch_boundary": len(self.inputs)}
@@ -149,7 +151,11 @@ class AutonomyTests(ServerTestCase):
 
     def test_uncertain_input_and_explicit_retry_consume_separate_slots(self):
         self.configure(delivery_budget=1)
-        self.cao.side_effect = self.server.CaoError(0, "input response lost")
+        def lost_input(method, path, query=None, **kwargs):
+            if method == "POST":
+                raise self.server.CaoError(0, "input response lost")
+            return self.response(method, path, query, **kwargs)
+        self.cao.side_effect = lost_input
         self.server.send_to(self.group, self.developer, "原消息", 0)
         self.assertEqual(self.server.automation_view(self.group)["runtime"]["deliveries_used"], 1)
         job = self.developer["active_delivery"]

@@ -6,7 +6,7 @@ from test_server import ServerTestCase
 
 
 def hermes_frame(body, footer="─ 2.7s · read 1 file · 01:02 PM"):
-    return "☤ Hermes\n\n" + body + "\n" + footer + "\n────────────\n❯ synthetic prompt\n────────────\n ☤ sample-model · 1/10 · [█░]\n"
+    return "☤ Hermes\n\n" + body + "\n" + footer + "\n────────────\n❯ \x1b[0;38;5;240;3mSynthetic prompt?\x1b[0m\n────────────\n ☤ sample-model · 1/10 · [█░]\n"
 
 
 def fallback(raw):

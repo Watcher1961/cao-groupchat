@@ -439,7 +439,7 @@ class DeliveryTests(ServerTestCase):
         def response(method,path,*args,**kwargs):
             if method=="POST":
                 raise self.server.CaoError(0,"input response timed out")
-            return {"output":"旧回复"} if path.endswith("/output") else {
+            return {"output":"旧回复\n────────────\n❯ \n────────────"} if path.endswith("/output") else {
                 "status":"completed","status_generation":10,"output_generation":10}
         self.cao.side_effect=response
         self.server.send_to(self.group,self.developer,"新消息",0)
@@ -490,10 +490,9 @@ class DeliveryTests(ServerTestCase):
         self.assertTrue(self.server.public_group(restored)["members"][0]["can_retry"])
         self.cao.assert_not_called()
 
-    def test_claude_placeholder_box_is_ready_in_plain_and_dim_output(self):
+    def test_claude_placeholder_box_is_ready_in_dim_output_and_empty_box(self):
         self.cao.side_effect=None
-        for prompt in ('❯ Try "fix typecheck errors"',
-                       '❯ \x1b[2mTry "fix typecheck errors"\x1b[22m',
+        for prompt in ('❯ \x1b[2mTry "fix typecheck errors"\x1b[22m',
                        '❯'):
             with self.subTest(prompt=prompt):
                 self.developer.update(provider="claude_code",terminal_id="dev-terminal",ready_terminal=None)
@@ -502,7 +501,8 @@ class DeliveryTests(ServerTestCase):
                 for now,expected in ((1000,False),(1000.3,False),(1000.8,True)):
                     with patch.object(self.server.time,"time",return_value=now):
                         self.assertEqual(self.server.member_ready(self.developer,{"status":"idle"}),expected)
-        for raw in ('────────────\n❯ fix typecheck errors\n────────────',
+        for raw in ('────────────\n❯ Try "fix typecheck errors"\n────────────',
+                    '────────────\n❯ fix typecheck errors\n────────────',
                     '────────────\n❯ Try "fix typecheck errors"\nnot a bottom rail'):
             self.developer.update(ready_terminal=None)
             self.developer.pop("ready_candidate",None)

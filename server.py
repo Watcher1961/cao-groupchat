@@ -559,22 +559,94 @@ def delivery_lock(g: dict, m: dict):
         return delivery_locks.setdefault((g["id"], m["id"]), threading.RLock())
 
 
-# CAO's composer extractor treats Try "..." as empty input, including dim ANSI.
+# Only an empty composer is ready; styled suggestions are removed before matching.
 CLAUDE_INPUT_BOX = re.compile(
     r'─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯]'
-    r'(?:[ \t\xa0]+Try "[^"\n]*")?[ \t\xa0]*\n'
+    r'[ \t\xa0]*\n'
     r'(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}', re.M)
 CODEX_READY_FOOTER = re.compile(r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[~/])")
+
+
+def composer_text(raw: str, provider: str) -> str:
+    """Remove SGR placeholders only inside a provider composer, before stripping ANSI."""
+    if provider not in ("claude_code", "hermes"):
+        return ANSI.sub("", raw).replace("\r", "\n")
+    dim, italic, foreground = False, False, None
+    output = []
+    for line in raw.replace("\r", "\n").splitlines(keepends=True):
+        plain = ANSI.sub("", line)
+        prompt = re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", plain)
+        pos, end, parts = 0, 0, []
+        for token in list(ANSI.finditer(line)) + [None]:
+            stop = token.start() if token else len(line)
+            chunk = line[end:stop]
+            placeholder = dim if provider == "claude_code" else False
+            placeholder = placeholder or (italic and (foreground == 90 or foreground in range(240, 248)))
+            if prompt and placeholder:
+                keep = max(0, prompt.end() - pos)
+                parts.append(chunk[:keep] + ("\n" if chunk.endswith("\n") and keep < len(chunk) else ""))
+            else:
+                parts.append(chunk)
+            pos += len(chunk)
+            if token is None:
+                break
+            sgr = re.fullmatch(r"\x1b\[([0-9;]*)m", token.group())
+            if sgr:
+                codes = [int(x or 0) for x in sgr[1].split(";")]
+                i = 0
+                while i < len(codes):
+                    code = codes[i]
+                    if code == 0:
+                        dim, italic, foreground = False, False, None
+                    elif code == 2:
+                        dim = True
+                    elif code == 22:
+                        dim = False
+                    elif code == 3:
+                        italic = True
+                    elif code == 23:
+                        italic = False
+                    elif code == 38 and i + 2 < len(codes) and codes[i + 1] == 5:
+                        foreground = codes[i + 2]
+                        i += 2
+                    elif code == 38 and i + 4 < len(codes) and codes[i + 1] == 2:
+                        foreground = None
+                        i += 4
+                    elif code == 39:
+                        foreground = None
+                    elif 30 <= code <= 37 or 90 <= code <= 97:
+                        foreground = code
+                    i += 1
+            end = token.end()
+        output.append("".join(parts))
+    return "".join(output)
+
+
+def composer_empty(text: str) -> bool:
+    rows = [line for line in text.splitlines() if re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯]", line)]
+    return bool(rows and re.fullmatch(r"[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", rows[-1]))
+
+
+def hermes_idle(raw: str) -> bool:
+    text = composer_text(raw, "hermes")
+    _, working = hermes_blocks(raw)
+    return (not working and any(HERMES_END.fullmatch(line.strip()) for line in hermes_text(raw).splitlines())
+            and composer_empty("\n".join(text.splitlines()[-12:])))
 
 
 def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bool:
     tid = m.get("terminal_id")
     if not tid:
         return False
-    if m.get("ready_terminal") == tid:
+    provider = m.get("provider")
+    if m.get("ready_terminal") == tid and provider not in ("claude_code", "hermes"):
         return True
     status = str(terminal.get("status", "")).lower()
+    raw = get_full_output(m) if provider == "hermes" and status in BUSY else None
+    if raw is not None and hermes_idle(raw):
+        status = "completed"
     if status not in DONE:
+        m.pop("ready_terminal", None)
         m.pop("ready_candidate", None)
         return False
     if allow_status_only:
@@ -582,21 +654,25 @@ def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bo
         # Keep two observations, stable status and the minimum elapsed interval.
         fingerprint = "manual-status:" + status
     else:
-        raw = get_full_output(m)
-        tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
-        provider = m.get("provider")
+        raw = get_full_output(m) if raw is None else raw
+        tail = "\n".join(composer_text(raw, provider).splitlines()[-12:])
         states = codex_states(raw)
         if provider == "codex":
             positive = bool(CODEX_READY_FOOTER.search(tail)) and not (states and states[-1] == "working")
         elif provider == "claude_code":
             legacy = (not re.search(r"─{8,}", tail) and
                       re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
-            positive = bool(CLAUDE_INPUT_BOX.search(tail) or legacy)
+            positive = bool(CLAUDE_INPUT_BOX.search(tail) or legacy) and composer_empty(tail)
+        elif provider == "hermes":
+            positive = composer_empty(tail)
         else:
             positive = bool(tail.strip())
         if not positive:
+            m.pop("ready_terminal", None)
             m.pop("ready_candidate", None)
             return False
+        if m.get("ready_terminal") == tid:
+            return True
         fingerprint = hashlib.sha256(tail.encode()).hexdigest()
     candidate = m.get("ready_candidate", {})
     now = time.time()
@@ -669,7 +745,8 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
             ready = False
         else:
             try:
-                if m.get("ready_terminal") == m.get("terminal_id") and m.get("terminal_id"):
+                if (m.get("ready_terminal") == m.get("terminal_id") and m.get("terminal_id")
+                        and m.get("provider") not in ("claude_code", "hermes")):
                     ready = True
                 elif m.get("terminal_id"):
                     observation = terminal if terminal is not None else cao("GET", f"/terminals/{m['terminal_id']}", timeout=5)
@@ -921,7 +998,7 @@ def get_codex_reply(m: dict, output_generation: int | None = None) -> str | None
 
 
 HERMES_TITLE = re.compile(r"^☤ Hermes$")
-HERMES_END = re.compile(r"^─+ \d+(?:\.\d+)?s(?: · [^\n]+)? · \d{1,2}:\d{2} (?:AM|PM)$")
+HERMES_END = re.compile(r"^─+ \d+(?:\.\d+)?[hms](?:\s*\d+(?:\.\d+)?[hms])*(?: · [^\n]+)? · \d{1,2}:\d{2} (?:AM|PM)$")
 HERMES_BAR = re.compile(r"^─{2,}\s*[\u2800-\u28ff]")
 HERMES_STATUS = re.compile(r"^☤\s+.*·.*(?:\d|[█░])")
 
@@ -1241,6 +1318,15 @@ def poll_member(g: dict, m: dict) -> None:
             handle_reply(g, m, reply)
     elif st in BUSY:
         m["saw_busy"] = True
+        if m.get("provider") == "hermes" and fresh:
+            try:
+                reply = get_hermes_reply(m)
+                if hermes_idle(get_full_output(m)):
+                    m["status"] = "completed"
+                    t = {**t, "status": "completed"}
+                    handle_reply(g, m, reply)
+            except (CaoError, ReplyNotReady, ReplyExtractionError):
+                pass
     elif st == "waiting_user_answer" and prev != st and fresh:
         try:
             tail = get_reply(m)[-800:]
@@ -1658,11 +1744,11 @@ def quota_windows(g: dict, m: dict, now: float) -> tuple[dict | None, bool]:
 def quota_prompt_ready(m: dict, terminal: dict, raw: str) -> bool:
     if str(terminal.get("status", "")).lower() not in DONE:
         return False
-    tail = "\n".join(ANSI.sub("", raw).replace("\r", "\n").splitlines()[-12:])
+    tail = "\n".join(composer_text(raw, m.get("provider")).splitlines()[-12:])
     if m.get("provider") == "codex":
         return bool(CODEX_READY_FOOTER.search(tail))
     if m.get("provider") == "claude_code":
-        return bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+        return composer_empty(tail) and bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
     return False
 
 

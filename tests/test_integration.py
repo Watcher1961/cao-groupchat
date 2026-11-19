@@ -167,13 +167,30 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_styled_composers_and_hermes_stale_busy_complete_then_drain(self):
+        self.create_group()
+        for name, provider in (("合成甲", "claude_code"), ("合成乙", "hermes")):
+            member = self.invite(name, provider, "developer")
+            tid = member["terminal_id"]
+            self.until("intro complete", lambda: not next(m for m in self.api("GET")["members"] if m["id"] == member["id"]).get("pending"))
+            before = len(self.terminal(tid)["inputs"])
+            self.next_turn(tid, "独立合成答案", complete_on_input=True,
+                           completion_status="processing" if provider == "hermes" else "completed")
+            self.api("POST", "/messages", {"text": "@" + name + " first"})
+            self.until("first input accepted", lambda: len(self.terminal(tid)["inputs"]) == before + 1)
+            self.next_turn(tid, "第二轮合成答案", complete_on_input=True)
+            self.api("POST", "/messages", {"text": "@" + name + " second"})
+            self.until("both inputs drain", lambda: len(self.terminal(tid)["inputs"]) == before + 2)
+            self.until("completed after placeholder", lambda: not next(m for m in self.api("GET")["members"] if m["id"] == member["id"]).get("pending"))
+            self.assertEqual(len([x for x in self.replies() if x["sender"] == name and x["text"] == "独立合成答案"]), 1)
+
     def test_hermes_fallback_extracts_only_final_answer_and_suppresses_failed_extraction(self):
         self.create_group()
         member = self.invite("合成成员", "hermes", "developer")
         tid = member["terminal_id"]
         self.until("initial Hermes turn", lambda: not self.api("GET")["members"][0].get("pending"))
         answer = "合成最终答复。\n状态：已交付"
-        frame = "☤ Hermes\n\n" + answer + "\n─ 3.5s · read 2 files · 02:03 PM\n❯ synthetic prompt\n"
+        frame = "☤ Hermes\n\n" + answer + "\n─ 3.5s · read 2 files · 02:03 PM\n❯ \x1b[0;38;5;240;3mSynthetic hint?\x1b[0m\n"
         huge = "PRIVATE_TERMINAL_NOISE\n" * 7000 + frame
         self.next_turn(tid, answer, full_output=frame, last_output="[NO RESPONSE - agent completed without producing a text response (999 lines in buffer)]\n" + huge)
         self.api("POST", "/messages", {"text": "synthetic task"})

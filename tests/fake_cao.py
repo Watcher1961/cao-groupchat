@@ -65,6 +65,8 @@ class Handler(BaseHTTPRequestHandler):
             return "codex>\n? for shortcuts"
         if provider == "claude_code":
             return '────────────\n❯ \x1b[2mTry "fix typecheck errors"\x1b[22m\n────────────\n? for shortcuts'
+        if provider == "hermes":
+            return "────────────\n❯ \x1b[0;38;5;240;3mSynthetic next action?\x1b[0m\n────────────"
         return "Ready\n> "
 
     def write_raw(self, terminal, content):
@@ -81,10 +83,10 @@ class Handler(BaseHTTPRequestHandler):
     def complete(self, terminal, turn):
         terminal["output_generation"] += 1
         terminal["status_generation"] = terminal["output_generation"]
-        terminal["status"] = "completed"
+        terminal["status"] = turn.get("completion_status") or "completed"
         terminal["out"] = self.rendered_reply(terminal, turn["reply"])
         if terminal["provider"] == "hermes":
-            frame = ("☤ Hermes\n\n" + turn["reply"] + f"\n─ {terminal['output_generation']}.1s · read 1 file · 01:02 PM\n❯ synthetic prompt\n")
+            frame = ("☤ Hermes\n\n" + turn["reply"] + f"\n─ {terminal['output_generation']}.1s · read 1 file · 01:02 PM\n" + self.prompt("hermes"))
             self.write_raw(terminal, frame)
             terminal["out"] = "[NO RESPONSE - agent completed without producing a text response (99 lines in buffer)]\n" + terminal["full_out"]
         elif terminal["provider"] == "codex":
@@ -290,6 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                     turn = {
                         "message": message, "dispatch_boundary": boundary, "target_bytes": len(self.path.encode("ascii")),
                         "full_output": options.get("full_output"), "last_output": options.get("last_output"),
+                        "completion_status": options.get("completion_status"),
                         "reply": options.get("reply", self.default_reply(terminal, message)),
                         "held": options.get("hold", False),
                         "stale_remaining": options.get("stale_polls", 2) if stale else 0,
