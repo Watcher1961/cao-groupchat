@@ -357,6 +357,45 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.terminal(a["terminal_id"])["inputs"][-1]["message"], "[群主] @合成甲 owner priority")
         self.assertFalse(self.api("GET")["relay_control"]["paused"])
 
+    def test_cursor_redraw_composers_dispatch_cold_and_prediction_but_block_real_input(self):
+        self.create_group()
+        self.http(self.cao_url, "POST", "/_test/config", {"startup_hold": True})
+        esc, rail = "\x1b[", "─" * 32
+        for name, provider, style in (("合成屏甲", "claude_code", "2"), ("合成屏乙", "hermes", "38;5;240;3")):
+            with self.subTest(provider=provider):
+                member = self.api("POST", "/members", {"name": name, "provider": provider, "role": "developer"})
+                current = lambda: next(m for m in self.api("GET")["members"] if m["id"] == member["id"])
+                tid = self.until("cold terminal allocated", lambda: current().get("terminal_id"))
+                self.next_turn(tid, "合成冷启动回复", complete_on_input=True)
+                self.api("POST", "/messages", {"text": "@" + name + " cold"})
+                self.until("cold message queued", lambda: current()["queued_count"] == 1)
+                self.assertEqual(self.terminal(tid)["inputs"], [])
+                cold = (esc + "2J" + esc + "5;1H" + rail + "\r\n❯ " + esc + style + "mSynthetic hint" + esc + "0m\r\n" + rail +
+                        "".join(esc + "1;1H" + esc + "2KLOGO FRAME " + str(i) + "\r\n" for i in range(25)))
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {"prompt": cold})
+                self.until("first input without retry", lambda: len(self.terminal(tid)["inputs"]) == 1)
+                self.until("first reply complete", lambda: not current().get("pending"))
+                prediction = esc + "48;1H❯\xa0" + esc + "50;1H" + esc + "H" + esc + "47B" + esc + "2C" + esc + style + "mSynthetic forecast" + esc + "0m" + esc + "50;1H"
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {"prompt": prediction})
+                self.next_turn(tid, "合成预测占位回复", complete_on_input=True)
+                self.api("POST", "/messages", {"text": "@" + name + " prediction"})
+                self.until("prediction input delivered", lambda: len(self.terminal(tid)["inputs"]) == 2)
+                self.until("prediction reply complete", lambda: not current().get("pending"))
+                real = esc + "48;1H" + esc + "2K❯ " + esc + "0mSynthetic forecast"
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {"prompt": real})
+                self.api("POST", "/messages", {"text": "@" + name + " queued behind real input"})
+                reads = self.terminal(tid)["full_reads"]
+                self.until("real input observed repeatedly", lambda: self.terminal(tid)["full_reads"] >= reads + 3)
+                self.assertEqual(len(self.terminal(tid)["inputs"]), 2)
+                self.assertEqual(current()["queued_count"], 1)
+                cleared = esc + "48;1H" + esc + "2K❯ " + esc + style + "mSynthetic forecast" + esc + "0m"
+                self.next_turn(tid, "合成清除后回复", complete_on_input=True)
+                self.http(self.cao_url, "POST", f"/_test/terminals/{tid}/ready", {"prompt": cleared})
+                self.until("erased real input releases queue", lambda: len(self.terminal(tid)["inputs"]) == 3)
+                self.until("final reply complete", lambda: not current().get("pending"))
+                self.assertEqual(current()["queued_count"], 0)
+                self.assertEqual(self.terminal(tid)["early_inputs"], 0)
+
     def test_styled_composers_and_hermes_stale_busy_complete_then_drain(self):
         self.create_group()
         for name, provider in (("合成甲", "claude_code"), ("合成乙", "hermes")):

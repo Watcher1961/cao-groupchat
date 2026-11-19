@@ -16,8 +16,9 @@
 | `tests/test_permission_mode.py`、`tests/test_autonomy.py` | 6 项权限模式和 22 项自主运行隔离回归，含真实线程及注入时钟 |
 | `tests/test_quota.py`、`tests/test_reply_safety.py` | 48 项额度回归与 21 项回复/长度安全回归；合成帧、注入时钟，私有实样不作为夹具 |
 | `tests/test_composer.py`、`tests/test_relay_guard.py`、`tests/test_outbox.py`、`tests/test_model_menu.py` | 第三轮新增 7 项 composer、11 项防循环、5 项清队列、23 项菜单隔离回归；全部合成数据 |
+| `tests/test_terminal_screen.py` | 16 项合成 VT/单格 SGR/输入框与真实输入、动画稳定、资源边界回归；不加载私有样本 |
 | `tests/fake_cao.py` | 可导入、可选随机端口的 HTTP 模拟服务，按查询推进状态代际，input 默认清空 raw FIFO，可显式追加，支持同步快速完成及 idle_stream/advance 分阶段输出 7501，Codex last/full 回复均模拟 bullet/两空格续行；不包含验收断言 |
-| `tests/test_integration.py` | 49 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
+| `tests/test_integration.py` | 50 个真实子进程 HTTP 集成测试：入群、收发接力、残留状态、恢复、effort 编辑/重启的 profile 安装以及 Codex idle 流式回复/接力 |
 | `tests/test_frontend.py`、`tests/frontend_effort.js`、`tests/frontend_drawers.js`、`tests/frontend_limits.js`（共用 `frontend_dom.js`） | 可选 Node VM 的 24 个前端行为回归，执行页面真实内联脚本；无 npm 包，不替代浏览器排版验收 |
 
 默认数据目录为 `~/.cao-groupchat`，可用 `GROUPCHAT_DATA` 覆盖。profile 安装降级文件在数据目录的 `profiles/`，自定义价格在 `prices.json`。以上均为本机运行数据；共享日志保持 Git 忽略。消息和日志可能含正文与私人路径，当前并未实现自动脱敏。
@@ -52,7 +53,7 @@
 
 1. 浏览器经 `/api/groups` 创建群，提交工作目录与成员配置；后端保存群并异步启动成员。
 2. 每位成员生成独立 agent profile；非空 effort 对 Codex 写入 `codexConfig.model_reasoning_effort`，对 Claude Code 写入 `claudeConfig.effort`，由 CAO 转为对应 CLI 配置；缺字段或空值不写配置。一个群对应一个 CAO session，一位成员对应一个 terminal。权限与职责写入 profile，实际执行由 provider 决定。
-3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时覆盖所有成员。每位成员有持久化 outbox 和 active_delivery，以及进程内的投递锁；未取得 terminal 或未证明初次就绪前不 POST input，按成员队列顺序处理。自动就绪须 idle/completed、provider 正向提示特征及两次至少间隔 READY_SECONDS 的稳定观察（Claude 输入框可为空或带 Try 占位文字，先清除 ANSI）；terminal 更换或手动重试重新检查。另有按群的启动锁，覆盖会话查询/创建/加入直到发布 terminal_id；profile 安装在锁外，不同群不互相等待。读取原生 session.status：会话存活就加入，即使全体离线；404 或 terminated 才创建。GET 200 可仅为失败记录，并不证明后端存活。精确同名重复 400 转加入，加入 404 后最多直接创建一次，异常释放群锁。
+3. 群主消息经 `/api/groups/{id}/messages` 进入后端。匹配成员提及则定向发送；无匹配提及或广播时覆盖所有成员。每位成员有持久化 outbox 和 active_delivery，以及进程内的投递锁；未取得 terminal 或未证明初次就绪前不 POST input，按成员队列顺序处理。自动就绪须 idle/completed、provider 正向提示特征及两次至少间隔 READY_SECONDS 的稳定观察（Claude/Hermes 先还原当前屏幕与单格 SGR，再判空输入；不按 raw 尾行截断）；terminal 更换或手动重试重新检查。另有按群的启动锁，覆盖会话查询/创建/加入直到发布 terminal_id；profile 安装在锁外，不同群不互相等待。读取原生 session.status：会话存活就加入，即使全体离线；404 或 terminated 才创建。GET 200 可仅为失败记录，并不证明后端存活。精确同名重复 400 转加入，加入 404 后最多直接创建一次，异常释放群锁。
 4. 其他 provider 将 input 响应的 `dispatch_boundary` 记为边界，轮询按 `status_generation` 判断；字段缺失时仍降级为 busy 或发送后等待时间。Codex 原生 OSC 标记为 state=working/done:app=codex，以 ST 结束；解析兼容 BEL 和无 app 旧格式，未知/拆分末状态保留。状态与 full 起点共用同一解析规则。Codex 发送前读取 raw full 标记基线，排除旧轮 done；只有本轮最后一个 OSC 7501 为 done 才读取最终回复，无标记、working 或探测失败继续等待，不回退相信 idle。发送前只存长度/哈希和标记元数据；前缀改变或缩短时将有效边界归零，同一轮首次读取的 working+done 可完成。相同字节的短回复结合新 output_generation 确认新输出；若 raw 已重置、发送时非 working 且 output_generation > dispatch_boundary，首次轮询只剩 done 也能完成（working 可能已被 32KB 重绘挤出）；发送时旧轮 working 的保护仍要求本轮 working 证据，并保持发送时原状态不变。显式追加兼容仍以原前缀及标记数区分旧轮，full 降级使用当前轮起点；原等待确认/错误路径保留。
 5. 读取并清洗回复：去除 ANSI/OSC 控制序列，末尾整行匹配 Claude `✻ <单个字母词> for <时长> · done <时:分> AM/PM` 或 Codex `Worked for <时长> • <时:分>` 格式时去除；Claude 动词支持带重音字母，不写死具体词；引用、代码和非尾部示例保留。同轮回复只处理一次，成功发送下一轮时重置标记；静默通知回复直接丢弃。收下回复时即标 delivery_started=True，即使首次轮询前已完成、未见中间 busy/working 状态。普通回复写入群消息，行首非空 `[日志]` 仅在同一行代写；成员提及按最长已知名字解析，最多接力 6 跳。
 6. 启动等待超时保留队列并暂停投递；从 not_ready 人工重试时，在用户确认 CLI 可输入后允许仅凭稳定 idle/completed 状态投递，仍需两次观察、最小时长，busy 等状态重置候选。其他自动投递及未开启此兜底的 uncertain/failed 重试仍走原特征检查。已投递后记录本轮工作证据（Codex working；其他 provider 的 fresh busy/等待确认），只有实际新输出刷新无进展时钟，重复状态不续期；超时标 uncertain、系统提示“可能未送达”，仍轮询迟到完成，不自动重发。input 网络响应丢失也属 uncertain：Codex 保留发送前基线，其他 provider 未获 dispatch 确认须先有工作证据，不复用旧完成。重试校验投递 ID/次数，同一成员锁内只接受一次，保留原文、静默属性和接力跳数，不重写群主消息。
@@ -152,9 +153,13 @@ Gemini 次要问题：已安装 providers/antigravity_cli.py:985–1068 以最�
 
 ## 第三轮：输入框样式与完成证据
 
-`composer_text` 只在 Claude/Hermes 提示符行保留 SGR 状态并剔除占位片段：Hermes 为灰色 240–247（或 90）加斜体；Claude 兼容 dim（包括 dim+灰色），以及同类灰斜体。依据是仓库外 11-19 Hermes full/last 的样式码；没有读取样本正文到夹具，Claude 样本当前未确认占位，dim/灰色按合理推断合成，真实复测待验证。普通灰色而无 dim/斜体、占位后真实输入、最近一行真实输入均不判空，不再凭 Try 词句豁免。
+11-19 的真实复测证明“去 ANSI 后按行”不是当前屏幕：冷启动动画把输入框挤出 raw 尾部 12 行，预测文字又用 CUP/相对移动补画，输入框和分隔线在流中不相邻。TerminalScreen 因此先重放 raw 到仅内存的稀疏单元格画布，每格保存字符、显示宽度和不可变 SGR 属性；composer_view 在当前输入区域按这些属性移除占位，再执行判空。Claude/Hermes 共用此路径，解析失败不回退到线性 raw；Codex 仍沿用原有 OSC/就绪路径。
 
-member_ready/flush 对 Claude/Hermes 每次派发重验当前 composer，正向屏幕仍保持两次稳定观察；已缓存就绪也不能跳过真实非空输入。Hermes 若已观察最终页脚、无后续 Working 且最近 composer 为空，可纠正上游 processing；收回复仍必须通过原投递 ID/attempt 的双快照与新帧边界，不用历史页脚单独归属新回复。Codex 原完成标记逻辑不变。Hermes 最终页脚支持单秒、紧连或空格分隔的 h/m/s 时长，依据 11-19 实样的时长形状；不把耗时或正文原样作为夹具。
+支持 CR（只回列首）、LF（换行并保留列，LNM 开启时回列首）、BS、TAB；CUP H/f、CHA G、VPA d、CUU/CUD/CUF/CUB、CNL/CPL，EL K 和 ED J 的标准模式；保存/恢复光标、滚动区 r、IND/RI、常见设备/焦点/鼠标/键盘查询。SGR 保存 dim/斜体/粗体/下划线/反色等及基础、索引、RGB 前背景色；擦除/重绘真正替换原格，宽字符与组合字符不按字节截断。没有输出尺寸元数据时不猜实际终端宽度、也不猜软换行；以明确绘制的坐标和区域为证据，这是有限 VT 子集而非完整 xterm。画布上限 512 行、4096 列、131072 格，输入至多 100 万字符；超限、不完整或未知的普通 CSI 屏幕修改失败关闭。终端正文不进持久状态或新日志。
+
+已知占位为 Claude dim 与灰斜体、Hermes 灰色 240–247（或 90）加斜体，只在当前 composer 内掩去相应格，普通灰色真实输入、同文真实输入与真实续行仍非空。冷启动 JSON 含完整分隔线，重建后按框判定；预测 JSON 不含任何分隔线，不能凭空补框，使用还原屏上经绝对定位绘制、含占位格的空提示符兼容。原旧 CLI 的还原后裸提示符兼容仍保留；这不是 raw 尾行兜底。无边框时下方未知真实内容会阻止判空。
+
+member_ready 初次仍要求两次稳定观察，但指纹只取输入区域，不取无关动画；缓存就绪也复查当前屏的真实内容。quota_prompt_ready 的 Claude 分支同样走屏幕判定。Hermes 的 idle/当前 working 证据也来自重建屏，最终页脚支持 h/m/s 时长；最终答案的历史帧归属与投递 ID/attempt 双快照保持原协议，未改成从任意旧画面取答案。真实 Hermes 启动磁盘提示属环境问题，本修复不干预。
 
 ## 第三轮：自动转发防循环
 

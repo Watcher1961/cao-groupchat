@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -569,75 +570,345 @@ def delivery_lock(g: dict, m: dict):
 CLAUDE_INPUT_BOX = re.compile(
     r'─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯]'
     r'[ \t\xa0]*\n'
-    r'(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}', re.M)
+    r'(?:[ \t\xa0]*\n)*[ \t]*─{8,}', re.M)
 CODEX_READY_FOOTER = re.compile(r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[~/])")
 
 
-def composer_text(raw: str, provider: str) -> str:
-    """Remove SGR placeholders only inside a provider composer, before stripping ANSI."""
-    if provider not in ("claude_code", "hermes"):
-        return ANSI.sub("", raw).replace("\r", "\n")
-    dim, italic, foreground = False, False, None
-    output = []
-    for line in raw.replace("\r", "\n").splitlines(keepends=True):
-        plain = ANSI.sub("", line)
-        prompt = re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", plain)
-        pos, end, parts = 0, 0, []
-        for token in list(ANSI.finditer(line)) + [None]:
-            stop = token.start() if token else len(line)
-            chunk = line[end:stop]
-            placeholder = dim if provider == "claude_code" else False
-            placeholder = placeholder or (italic and (foreground == 90 or foreground in range(240, 248)))
-            if prompt and placeholder:
-                keep = max(0, prompt.end() - pos)
-                parts.append(chunk[:keep] + ("\n" if chunk.endswith("\n") and keep < len(chunk) else ""))
+class TerminalScreenError(ValueError):
+    pass
+
+
+class TerminalScreen:
+    """Bounded sparse VT canvas. Cells retain their text, width and SGR snapshot."""
+    ROWS, COLS, CELLS = 512, 4096, 131072
+    CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+
+    def __init__(self, raw: str):
+        self.cells, self.count = {}, 0
+        self.row = self.col = 0
+        self.top, self.bottom = 0, self.ROWS - 1
+        self.attrs, self.style = {}, ()
+        self.saved = (0, 0, {})
+        self.positioned = self.newline = False
+        if len(raw) > 1_000_000:
+            raise TerminalScreenError()
+        self.feed(raw)
+
+    def erase_cell(self, row: int, col: int) -> None:
+        line = self.cells.get(row, {})
+        cell = line.get(col)
+        if cell is None:
+            return
+        start = col - 1 if cell[2] == 0 else col
+        width = line.get(start, ("", (), 1))[2]
+        for x in range(start, start + max(1, width)):
+            if x in line:
+                del line[x]
+                self.count -= 1
+
+    def erase_row(self, row: int, begin: int = 0, end: int = COLS) -> None:
+        for col in list(self.cells.get(row, {})):
+            if begin <= col < end:
+                self.erase_cell(row, col)
+
+    def scroll(self, reverse: bool = False) -> None:
+        old = self.cells
+        self.cells = {row: cells for row, cells in old.items() if not self.top <= row <= self.bottom}
+        if reverse:
+            self.cells.update({row + 1: cells for row, cells in old.items() if self.top <= row < self.bottom})
+        else:
+            self.cells.update({row - 1: cells for row, cells in old.items() if self.top < row <= self.bottom})
+        self.count = sum(len(line) for line in self.cells.values())
+
+    def linefeed(self) -> None:
+        if self.row == self.bottom:
+            self.scroll()
+        elif self.row < self.ROWS - 1:
+            self.row += 1
+        else:
+            raise TerminalScreenError()
+        if self.newline:
+            self.col = 0
+
+    def paint(self, char: str) -> None:
+        if unicodedata.combining(char) or char in ("\u200d", "\ufe0e", "\ufe0f"):
+            line = self.cells.get(self.row, {})
+            x = self.col - 1
+            if line.get(x, (None, None, None))[2] == 0:
+                x -= 1
+            if x in line:
+                text, style, width = line[x]
+                line[x] = (text + char, style, width)
+            return
+        width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if self.col + width > self.COLS:
+            raise TerminalScreenError()
+        for x in range(self.col, self.col + width):
+            self.erase_cell(self.row, x)
+        line = self.cells.setdefault(self.row, {})
+        line[self.col] = (char, self.style, width)
+        if width == 2:
+            line[self.col + 1] = ("", self.style, 0)
+        self.count += width
+        if self.count > self.CELLS:
+            raise TerminalScreenError()
+        self.col += width
+
+    def sgr(self, codes: list[int]) -> None:
+        i = 0
+        flags = {1: "bold", 2: "dim", 3: "italic", 4: "underline", 5: "blink", 6: "blink", 7: "inverse", 8: "conceal", 9: "strike"}
+        resets = {22: ("bold", "dim"), 23: ("italic",), 24: ("underline",), 25: ("blink",), 27: ("inverse",), 28: ("conceal",), 29: ("strike",), 39: ("fg",), 49: ("bg",), 59: ("underline_color",)}
+        while i < len(codes):
+            code = codes[i]
+            if code == 0:
+                self.attrs.clear()
+            elif code in flags:
+                self.attrs[flags[code]] = True
+            elif code in resets:
+                for key in resets[code]:
+                    self.attrs.pop(key, None)
+            elif code in (38, 48, 58):
+                key = {38: "fg", 48: "bg", 58: "underline_color"}[code]
+                if i + 2 < len(codes) and codes[i + 1] == 5:
+                    self.attrs[key] = ("index", codes[i + 2])
+                    i += 2
+                elif i + 4 < len(codes) and codes[i + 1] == 2:
+                    self.attrs[key] = ("rgb", *codes[i + 2:i + 5])
+                    i += 4
+                else:
+                    raise TerminalScreenError()
+            elif 30 <= code <= 37 or 90 <= code <= 97:
+                self.attrs["fg"] = ("basic", code)
+            elif 40 <= code <= 47 or 100 <= code <= 107:
+                self.attrs["bg"] = ("basic", code)
             else:
-                parts.append(chunk)
-            pos += len(chunk)
-            if token is None:
-                break
-            sgr = re.fullmatch(r"\x1b\[([0-9;]*)m", token.group())
-            if sgr:
-                codes = [int(x or 0) for x in sgr[1].split(";")]
-                i = 0
-                while i < len(codes):
-                    code = codes[i]
-                    if code == 0:
-                        dim, italic, foreground = False, False, None
-                    elif code == 2:
-                        dim = True
-                    elif code == 22:
-                        dim = False
-                    elif code == 3:
-                        italic = True
-                    elif code == 23:
-                        italic = False
-                    elif code == 38 and i + 2 < len(codes) and codes[i + 1] == 5:
-                        foreground = codes[i + 2]
-                        i += 2
-                    elif code == 38 and i + 4 < len(codes) and codes[i + 1] == 2:
-                        foreground = None
-                        i += 4
-                    elif code == 39:
-                        foreground = None
-                    elif 30 <= code <= 37 or 90 <= code <= 97:
-                        foreground = code
-                    i += 1
-            end = token.end()
-        output.append("".join(parts))
-    return "".join(output)
+                self.attrs["sgr_" + str(code)] = True
+            i += 1
+        if len(self.attrs) > 64:
+            raise TerminalScreenError()
+        self.style = tuple(sorted(self.attrs.items()))
+
+    def control(self, params: str, intermediate: str, code: str) -> None:
+        if params.startswith(("?", ">", "<", "=")):
+            if code in ("h", "l") and params[1:] in ("1047", "1049"):
+                self.cells.clear()
+                self.count = self.row = self.col = 0
+            return  # Device/keyboard queries and nonvisual DEC modes do not draw.
+        if intermediate:
+            if code == "q":
+                return  # Cursor shape.
+            raise TerminalScreenError()
+        if not re.fullmatch(r"[0-9;]*", params) or any(len(part) > 6 for part in params.split(";")):
+            raise TerminalScreenError()
+        values = [int(part or 0) for part in params.split(";")]
+        n = values[0] or 1
+        if code == "m":
+            self.sgr(values)
+        elif code in ("H", "f", "d", "G", "A", "B", "C", "D", "E", "F"):
+            self.positioned = self.positioned or code in ("H", "f")
+            if code in ("H", "f"):
+                self.row, self.col = n - 1, (values[1] or 1) - 1 if len(values) > 1 else 0
+            elif code == "d":
+                self.row = n - 1
+            elif code == "G":
+                self.col = n - 1
+            elif code in ("A", "F"):
+                self.row = max(0, self.row - n)
+                if code == "F":
+                    self.col = 0
+            elif code in ("B", "E"):
+                self.row += n
+                if code == "E":
+                    self.col = 0
+            elif code == "C":
+                self.col += n
+            else:
+                self.col = max(0, self.col - n)
+            if not (0 <= self.row < self.ROWS and 0 <= self.col < self.COLS):
+                raise TerminalScreenError()
+        elif code in ("J", "K"):
+            mode = values[0]
+            if mode not in ((0, 1, 2, 3) if code == "J" else (0, 1, 2)):
+                raise TerminalScreenError()
+            if code == "J":
+                for row in list(self.cells):
+                    if mode in (2, 3) or (mode == 0 and row > self.row) or (mode == 1 and row < self.row):
+                        self.erase_row(row)
+            if mode in (2, 3):
+                if code == "K":
+                    self.erase_row(self.row)
+            elif mode == 0:
+                self.erase_row(self.row, self.col)
+            else:
+                self.erase_row(self.row, 0, self.col + 1)
+        elif code == "s":
+            self.saved = (self.row, self.col, dict(self.attrs))
+        elif code == "u":
+            self.row, self.col, attrs = self.saved
+            self.attrs, self.style = dict(attrs), tuple(sorted(attrs.items()))
+        elif code == "r":
+            top, bottom = values[0] or 1, values[1] if len(values) > 1 else self.ROWS
+            if not 1 <= top < bottom <= self.ROWS:
+                raise TerminalScreenError()
+            self.top, self.bottom = top - 1, bottom - 1
+            self.row = self.col = 0
+        elif code in ("h", "l"):
+            if 20 in values:
+                self.newline = code == "h"
+        elif code not in ("c", "n", "t"):
+            raise TerminalScreenError()  # Unknown screen mutation must not prove readiness.
+
+    def feed(self, raw: str) -> None:
+        i = 0
+        while i < len(raw):
+            char = raw[i]
+            if char == "\x1b":
+                if i + 1 >= len(raw):
+                    raise TerminalScreenError()
+                kind = raw[i + 1]
+                if kind == "[":
+                    match = self.CSI.match(raw, i)
+                    if not match:
+                        raise TerminalScreenError()
+                    self.control(*match.groups())
+                    i = match.end()
+                    continue
+                if kind in ("]", "P", "_", "^"):
+                    stop = re.search(r"\x07|\x1b\\", raw[i + 2:])
+                    if not stop:
+                        raise TerminalScreenError()
+                    i += 2 + stop.end()
+                    continue
+                if kind in ("7", "8"):
+                    self.control("", "", "s" if kind == "7" else "u")
+                elif kind in ("(", ")"):
+                    if i + 2 >= len(raw):
+                        raise TerminalScreenError()
+                    i += 1  # Character-set designation; input uses UTF-8 glyphs.
+                elif kind == "M":
+                    if self.row == self.top:
+                        self.scroll(reverse=True)
+                    else:
+                        self.row = max(0, self.row - 1)
+                elif kind == "D":
+                    self.linefeed()
+                elif kind == "E":
+                    self.col = 0
+                    self.linefeed()
+                elif kind == "c":
+                    self.cells.clear()
+                    self.count = self.row = self.col = 0
+                    self.attrs, self.style = {}, ()
+                elif kind != "=":
+                    raise TerminalScreenError()
+                i += 2
+                continue
+            if char == "\r":
+                self.col = 0
+            elif char in ("\n", "\v", "\f"):
+                self.linefeed()
+            elif char == "\b":
+                self.col = max(0, self.col - 1)
+            elif char == "\t":
+                self.col = (self.col // 8 + 1) * 8
+                if self.col >= self.COLS:
+                    raise TerminalScreenError()
+            elif ord(char) >= 32 and char != "\x7f":
+                self.paint(char)
+            i += 1
+
+    def text(self, masked: set[tuple[int, int]] | None = None) -> str:
+        masked = masked or set()
+        last = max((row for row, cells in self.cells.items() if cells), default=-1)
+        lines = []
+        for row in range(last + 1):
+            cells, chars = self.cells.get(row, {}), []
+            for col in range(max(cells, default=-1) + 1):
+                char, _, width = cells.get(col, (" ", (), 1))
+                if width:
+                    chars.append(" " * width if (row, col) in masked else char)
+            lines.append("".join(chars).rstrip(" \t"))
+        return "\n".join(lines).rstrip("\n")
+
+
+def composer_region(text: str) -> tuple[str, bool, tuple[int, int, int] | None]:
+    lines = text.splitlines()
+    prompts = [(i, re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", line)) for i, line in enumerate(lines)]
+    prompts = [(i, match) for i, match in prompts if match]
+    if not prompts:
+        return "", False, None
+    row, prompt = prompts[-1]
+    rail = lambda line: bool(re.match(r"^[ \t]*─{8,}", line))
+    top = next((i for i in range(row - 1, -1, -1) if rail(lines[i])), None)
+    bottom = next((i for i in range(row + 1, len(lines)) if rail(lines[i])), None)
+    if top is not None and bottom is not None:
+        return "\n".join(lines[top:bottom + 1]), True, (top + 1, row, bottom)
+    return lines[row], False, (row, row, row + 1)
+
+
+def composer_view(raw: str, provider: str) -> dict:
+    if provider not in ("claude_code", "hermes"):
+        return {"text": ANSI.sub("", raw).replace("\r", "\n"), "field": "", "boxed": False, "hint": False, "positioned": False}
+    try:
+        screen = TerminalScreen(raw)
+    except TerminalScreenError:
+        return {"text": "", "field": "", "boxed": False, "hint": False, "positioned": False}
+    plain = screen.text()
+    _, boxed, bounds = composer_region(plain)
+    masked, hint, styles = set(), False, {}
+    if bounds:
+        first, prompt_row, end = bounds
+        prompt = re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", plain.splitlines()[prompt_row])
+        for row in range(first, end):
+            for col, (char, style, width) in screen.cells.get(row, {}).items():
+                if row == prompt_row and col < prompt.end():
+                    continue
+                if style not in styles:
+                    attrs = dict(style)
+                    fg = attrs.get("fg")
+                    grey = fg == ("basic", 90) or (fg and fg[0] == "index" and 240 <= fg[1] <= 247)
+                    styles[style] = bool((provider == "claude_code" and attrs.get("dim")) or (attrs.get("italic") and grey))
+                if styles[style]:
+                    masked.add((row, col))
+                    hint = hint or bool(char.strip())
+    text = screen.text(masked)
+    field, boxed, _ = composer_region(text)
+    return {"text": text, "field": field, "boxed": boxed, "hint": hint, "positioned": screen.positioned}
+
+
+def composer_text(raw: str, provider: str) -> str:
+    return composer_view(raw, provider)["text"]
 
 
 def composer_empty(text: str) -> bool:
-    rows = [line for line in text.splitlines() if re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯]", line)]
-    return bool(rows and re.fullmatch(r"[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", rows[-1]))
+    field, boxed, bounds = composer_region(text)
+    if not bounds:
+        return False
+    rows = field.splitlines()
+    prompt_rows = [i for i, line in enumerate(rows) if re.match(r"^[ \t]*(?:☤[ \t]*)?[>❯]", line)]
+    if not prompt_rows or not re.fullmatch(r"[ \t]*(?:☤[ \t]*)?[>❯][ \t\xa0]*", rows[prompt_rows[-1]]):
+        return False
+    if not boxed:
+        after = text.splitlines()[bounds[1] + 1:]
+        return all(not line.strip() or HERMES_STATUS.match(line.strip()) for line in after)
+    return all(not line.strip() for i, line in enumerate(rows[1:-1], 1) if i != prompt_rows[-1])
+
+
+def claude_composer_ready(view: dict) -> bool:
+    if not composer_empty(view["text"]):
+        return False
+    if view["boxed"]:
+        return bool(CLAUDE_INPUT_BOX.search(view["field"]))
+    # Some FIFO windows contain only a positioned prediction redraw, without rails.
+    legacy = bool(re.search(r"(?:^|\n)[ \t]*[>❯][ \t\xa0]*$", view["text"]))
+    return legacy or bool(view["positioned"] and view["hint"])
 
 
 def hermes_idle(raw: str) -> bool:
     text = composer_text(raw, "hermes")
-    _, working = hermes_blocks(raw)
-    return (not working and any(HERMES_END.fullmatch(line.strip()) for line in hermes_text(raw).splitlines())
-            and composer_empty("\n".join(text.splitlines()[-12:])))
+    _, working = hermes_blocks(text)
+    return (not working and any(HERMES_END.fullmatch(line.strip()) for line in text.splitlines())
+            and composer_empty(text))
 
 
 def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bool:
@@ -661,14 +932,13 @@ def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bo
         fingerprint = "manual-status:" + status
     else:
         raw = get_full_output(m) if raw is None else raw
-        tail = "\n".join(composer_text(raw, provider).splitlines()[-12:])
+        view = composer_view(raw, provider)
+        tail = view["text"] if provider in ("claude_code", "hermes") else "\n".join(view["text"].splitlines()[-12:])
         states = codex_states(raw)
         if provider == "codex":
             positive = bool(CODEX_READY_FOOTER.search(tail)) and not (states and states[-1] == "working")
         elif provider == "claude_code":
-            legacy = (not re.search(r"─{8,}", tail) and
-                      re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
-            positive = bool(CLAUDE_INPUT_BOX.search(tail) or legacy) and composer_empty(tail)
+            positive = claude_composer_ready(view)
         elif provider == "hermes":
             positive = composer_empty(tail)
         else:
@@ -679,7 +949,7 @@ def member_ready(m: dict, terminal: dict, allow_status_only: bool = False) -> bo
             return False
         if m.get("ready_terminal") == tid:
             return True
-        fingerprint = hashlib.sha256(tail.encode()).hexdigest()
+        fingerprint = hashlib.sha256((view["field"] if provider in ("claude_code", "hermes") else tail).encode()).hexdigest()
     candidate = m.get("ready_candidate", {})
     now = time.time()
     if candidate.get("terminal") != tid or candidate.get("hash") != fingerprint:
@@ -1272,7 +1542,7 @@ def get_hermes_reply(m: dict) -> str:
             raise
         raw = result.get("output", "") if isinstance(result, dict) else str(result)
         blocks, working = hermes_blocks(raw)
-        if mode == "full" and working:
+        if mode == "full" and hermes_blocks(composer_text(raw, "hermes"))[1]:
             raise ReplyNotReady()
         if mode == "full" and "\b" in raw:
             continue  # Raw FIFO erasure cannot be reconstructed by stripping ANSI.
@@ -2101,11 +2371,12 @@ def quota_windows(g: dict, m: dict, now: float) -> tuple[dict | None, bool]:
 def quota_prompt_ready(m: dict, terminal: dict, raw: str) -> bool:
     if str(terminal.get("status", "")).lower() not in DONE:
         return False
-    tail = "\n".join(composer_text(raw, m.get("provider")).splitlines()[-12:])
+    view = composer_view(raw, m.get("provider"))
+    tail = "\n".join(view["text"].splitlines()[-12:])
     if m.get("provider") == "codex":
         return bool(CODEX_READY_FOOTER.search(tail))
     if m.get("provider") == "claude_code":
-        return composer_empty(tail) and bool(CLAUDE_INPUT_BOX.search(tail) or re.search(r"(?:^|\n)[>❯][ \t\xa0]*$", tail))
+        return claude_composer_ready(view)
     return False
 
 

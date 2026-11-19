@@ -84,6 +84,8 @@ class Handler(BaseHTTPRequestHandler):
         return "\n".join(rows) + "\nenter select · esc back"
 
     def write_raw(self, terminal, content):
+        if terminal["provider"] in ("claude_code", "hermes"):
+            content = re.sub(r"(?<!\r)\n", "\r\n", content)
         raw = (terminal["full_out"] + content).encode()
         terminal["full_out"] = raw[-self.server.buffer_limit:].decode(errors="ignore")
 
