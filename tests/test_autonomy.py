@@ -229,8 +229,10 @@ class AutonomyTests(ServerTestCase):
         with self.assertRaises(ValueError):
             self.server.post_message(self.group, "   ")
         self.assertTrue(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
-        with patch.object(self.server, "run_bg"):
+        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
             self.server.post_message(self.group, "继续当前范围")
+        for member in self.group["members"]:
+            self.finish(member)
         self.assertFalse(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
         self.assertFalse(self.server.check_idle_reminder(self.group, now=2001))
         self.assertTrue(self.server.check_idle_reminder(self.group, now=2061))
@@ -248,8 +250,10 @@ class AutonomyTests(ServerTestCase):
         self.assertTrue(self.server.automation_view(self.group)["runtime"]["awaiting_owner"])
         self.configure(relay_limit=10)
         self.assertFalse(self.server.check_idle_reminder(self.group, now=2000))
-        with patch.object(self.server, "run_bg"):
+        with patch.object(self.server, "run_bg", side_effect=lambda fn,*args: fn(*args)):
             self.server.post_message(self.group, "开始新一轮审查")
+        for member in self.group["members"]:
+            self.finish(member)
         self.assertFalse(self.server.check_idle_reminder(self.group, now=2001))
         self.assertTrue(self.server.check_idle_reminder(self.group, now=2061))
 

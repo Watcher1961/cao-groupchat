@@ -211,7 +211,7 @@ class ReplyTests(ServerTestCase):
         self.developer["hops"] = self.server.MAX_RELAY_HOPS - 1
         with patch.object(self.server, "send_to") as send:
             self.server.handle_reply(self.group, self.developer, "@评审 请看")
-        send.assert_called_once_with(self.group, self.reviewer, "[来自 开发] @评审 请看", 6)
+        send.assert_called_once_with(self.group, self.reviewer, "[来自 开发] @评审 请看", 6, sender_id="dev")
         self.assertEqual([m["kind"] for m in self.group["messages"]], ["agent"])
 
     def test_at_or_above_limit_stops_relay_and_shows_notice(self):

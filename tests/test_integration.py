@@ -167,6 +167,30 @@ class IntegrationTests(unittest.TestCase):
             self.http(self.server_url,"GET",path)["members"]))
         return old
 
+    def test_relay_storm_circuit_stops_real_http_chain_and_owner_resumes(self):
+        self.create_group()
+        a = self.invite("合成甲", "codex", "developer")
+        b = self.invite("合成乙", "claude_code", "reviewer")
+        self.until("intro turns complete", lambda: all(not m.get("pending") for m in self.api("GET")["members"]))
+        self.api("PUT", "/automation", {"relay_limit": 30, "delivery_budget": 40})
+        baseline = {m["id"]: len(self.terminal(m["terminal_id"])["inputs"]) for m in (a, b)}
+        self.http(self.cao_url, "POST", "/_test/config", {"provider_replies": {
+            "codex": "@合成乙 请检查合成任务。", "claude_code": "@合成甲 请继续合成步骤。"}})
+        self.api("POST", "/messages", {"text": "@合成甲 begin synthetic chain"})
+        group = self.until("relay circuit pauses", lambda: (g if (g := self.api("GET")).get("relay_control", {}).get("paused") else None))
+        self.assertEqual(len([x for x in group["messages"] if x["kind"] == "agent"]), 12)
+        self.assertEqual(sum("已暂停自动转发" in x["text"] for x in group["messages"]), 1)
+        totals = [len(self.terminal(m["terminal_id"])["inputs"]) for m in (a, b)]
+        reads = self.terminal(a["terminal_id"])["status_reads"]
+        self.until("paused polling continues", lambda: self.terminal(a["terminal_id"])["status_reads"] >= reads + 4)
+        self.assertEqual([len(self.terminal(m["terminal_id"])["inputs"]) for m in (a, b)], totals)
+        self.assertEqual(sum(totals) - sum(baseline.values()), 12)
+        self.http(self.cao_url, "POST", "/_test/config", {"provider_replies": {"codex": "新指令已处理。", "claude_code": "新指令已处理。"}})
+        self.api("POST", "/messages", {"text": "@合成甲 owner priority"})
+        self.until("owner input bypasses circuit", lambda: len(self.terminal(a["terminal_id"])["inputs"]) == totals[0] + 1)
+        self.assertEqual(self.terminal(a["terminal_id"])["inputs"][-1]["message"], "[群主] @合成甲 owner priority")
+        self.assertFalse(self.api("GET")["relay_control"]["paused"])
+
     def test_styled_composers_and_hermes_stale_busy_complete_then_drain(self):
         self.create_group()
         for name, provider in (("合成甲", "claude_code"), ("合成乙", "hermes")):

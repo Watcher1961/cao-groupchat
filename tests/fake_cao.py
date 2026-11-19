@@ -52,6 +52,9 @@ class Handler(BaseHTTPRequestHandler):
     def default_reply(self, terminal, message):
         if "只需回复“收到”" in message:
             return "收到"
+        fixed = self.server.config.get("provider_replies", {}).get(terminal["provider"])
+        if fixed is not None:
+            return fixed
         profile = self.server.profiles[terminal["profile"]]
         if "**统筹**" in profile:
             return "收到，@开发 请实现登录接口。\n[日志] 分派任务"

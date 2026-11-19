@@ -61,6 +61,8 @@ POLL_SECONDS = seconds_setting("GROUPCHAT_POLL_SECONDS", 2.0)
 READY_SECONDS = seconds_setting("GROUPCHAT_READY_SECONDS", 0.75)
 STARTUP_TIMEOUT = seconds_setting("GROUPCHAT_STARTUP_TIMEOUT", 180)
 DELIVERY_TIMEOUT = seconds_setting("GROUPCHAT_DELIVERY_TIMEOUT", 120)
+RELAY_BURST_SECONDS = 60
+RELAY_BURST_LIMIT = 12
 MAX_RELAY_HOPS = 6          # 一条群主消息最多引发多少次 agent 之间的 @ 转发，防止无限对话
 LOG_FILENAME = "GROUP_LOG.md"
 
@@ -696,10 +698,13 @@ def runtime_notice(g: dict, m: dict, text: str, exc: Exception) -> None:
         print(f"group={g['id']} member={m['id']} persistence_error={type(persist_error).__name__}", flush=True)
 
 
-def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False) -> None:
+def send_to(g: dict, m: dict, text: str, hops: int, silent: bool = False, *, sender_id: str | None = None) -> None:
     with delivery_lock(g, m):
         with lock:
-            queue_delivery(g, m, new_delivery(text, hops, silent))
+            job = new_delivery(text, hops, silent)
+            if sender_id is not None:
+                job.update(origin="relay", sender_id=sender_id)
+            queue_delivery(g, m, job)
             save_state()
         flush_outbox(g, m)
 
@@ -709,6 +714,81 @@ def new_delivery(text: str, hops: int, silent: bool = False) -> dict:
             "text": text, "hops": hops, "silent": silent}
 
 
+def delivery_origin(g: dict, job: dict) -> tuple[str, str | None]:
+    if job.get("origin") in ("owner", "relay"):
+        return job["origin"], job.get("sender_id")
+    if job["text"].startswith("[群主] ") and job.get("hops", 0) == 0:
+        return "owner", None
+    match = re.match(r"^\[来自 ([^]\n]+)\] ", job["text"])
+    if match and job.get("hops", 0) > 0:
+        sender = next((member["id"] for member in g["members"] if member["name"] == match[1]), None)
+        return "relay", sender or "legacy:" + hashlib.sha256(match[1].encode()).hexdigest()
+    return "direct", None
+
+
+def delivery_text(job: dict) -> str:
+    merged = job.get("relay_merged", 0)
+    note = f"[队列合并：合并了 {merged} 条旧消息，仅保留最新]\n" if merged else ""
+    return note + job["text"]
+
+
+def compact_outbox(g: dict, m: dict) -> None:
+    """Keep the latest unattempted relay per sender; never merge owner/retry work."""
+    queue, latest, removed = m.get("outbox", []), {}, 0
+    for i, job in enumerate(queue):
+        origin, sender = delivery_origin(g, job)
+        if origin != "relay" or not sender or job.get("attempt", 0) != 0:
+            continue
+        if sender in latest:
+            previous = queue[latest[sender]]
+            job["relay_merged"] = job.get("relay_merged", 0) + previous.get("relay_merged", 0) + 1
+            removed += 1
+        latest[sender] = i
+    kept = [job for i, job in enumerate(queue) if delivery_origin(g, job)[0] != "relay"
+            or job.get("attempt", 0) != 0 or latest.get(delivery_origin(g, job)[1], i) == i]
+    # New owner instructions never wait behind automatic backlog; owner FIFO is stable.
+    owners = [job for job in kept if delivery_origin(g, job)[0] == "owner"]
+    others = [job for job in kept if delivery_origin(g, job)[0] != "owner"]
+    continuations = [job for job in others if job.get("quota_continuation")]
+    m["outbox"] = continuations + owners + [job for job in others if not job.get("quota_continuation")]
+    if removed:
+        append_log(g, "系统", f"relay_action=merge member={m['id']} removed={removed}")
+
+
+def relay_paused(g: dict, job: dict) -> bool:
+    return bool(g.get("relay_control", {}).get("paused") and delivery_origin(g, job)[0] == "relay")
+
+
+def substantive_reply(g: dict, text: str) -> bool:
+    if len(text) > 180 or "```" in text or "~~~" in text:
+        return True
+    body = text
+    for name in [member["name"] for member in g["members"]] + ["群主"]:
+        body = re.sub(r"@" + re.escape(name) + r"(?![\w一-鿿])", "", body)
+    body = re.sub(r"(?m)^\s*状态[：:]\s*(?:进行中|等对方|等群主|阻塞|已交付)\s*$", "", body)
+    body = re.sub(r"[\s。，,！!；;：:、…·-]+", "", body)
+    if not body:
+        return False
+    return not re.fullmatch(r"(?:收到|已收到|好的|确认收到|确认|旧消息|没有新内容|无新内容|暂无新内容|无新增内容|等待对方|等对方|无需操作|不重复处理){1,6}", body)
+
+
+def relay_allowed(g: dict, text: str) -> bool:
+    with lock:
+        state = g.setdefault("relay_control", {"paused": False, "events": []})
+        now = time.time()
+        state["events"] = [stamp for stamp in state.get("events", []) if now - RELAY_BURST_SECONDS < stamp <= now]
+        if not state.get("paused"):
+            state["events"].append(now)
+            if len(state["events"]) >= RELAY_BURST_LIMIT:
+                state["paused"] = True
+                if "automation_state" in g:
+                    g["automation_state"].update(awaiting_owner=True, idle_since=None)
+                add_msg(g, "system", "系统", "@群主 成员短时间回复过密，已暂停自动转发；群主发送新指令后恢复，可先清理待投递队列。", log=False)
+                append_log(g, "系统", "relay_action=circuit_pause")
+        save_state()
+        return not state.get("paused") and substantive_reply(g, text)
+
+
 def queue_delivery(g: dict, m: dict, job: dict) -> None:
     # Caller holds this member's delivery lock, then the global state lock.
     if m.get("pending") and m.get("status") == "waiting_user_answer" and job["hops"] == 0 and not job["silent"] and not quota_waiting(g, m):
@@ -716,6 +796,7 @@ def queue_delivery(g: dict, m: dict, job: dict) -> None:
         m.setdefault("outbox", []).insert(0, job)
     else:
         m.setdefault("outbox", []).append(job)
+    compact_outbox(g, m)
     if not m.get("active_delivery") and m.get("delivery_state") not in ("not_ready", "budget_paused"):
         m["delivery_state"] = "waiting_ready"
     if "automation_state" in g:
@@ -724,8 +805,13 @@ def queue_delivery(g: dict, m: dict, job: dict) -> None:
 
 def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
     with delivery_lock(g, m):
+        with lock:
+            compact_outbox(g, m)
         queue = m.get("outbox", [])
         if not queue or m.get("active_delivery") or m.get("delivery_state") == "not_ready":
+            return False
+        if relay_paused(g, queue[0]):
+            save_state()
             return False
         blocked_screen = quota_refresh(g, m, terminal)
         if blocked_screen or quota_waiting(g, m):
@@ -762,17 +848,27 @@ def flush_outbox(g: dict, m: dict, terminal: dict | None = None) -> bool:
             save_state()
             return False
         with lock:
+            queue = m.get("outbox", [])  # Owner registration may have replaced it during I/O.
+            if not queue or relay_paused(g, queue[0]):
+                return False
             job = queue.pop(0)
             m["active_delivery"] = job
         return dispatch_delivery(g, m, job)
 
 
 def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
+    if relay_paused(g, job):
+        with lock:
+            m.setdefault("outbox", []).insert(0, job)
+            m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+            save_state()
+        return False
     blocked_screen = quota_refresh(g, m)
     if blocked_screen or quota_waiting(g, m):
-        m.setdefault("outbox", []).insert(0, job)
-        m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
-        save_state()
+        with lock:
+            m.setdefault("outbox", []).insert(0, job)
+            m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+            save_state()
         return False
     with lock:
         job["attempt"] += 1
@@ -781,7 +877,7 @@ def dispatch_delivery(g: dict, m: dict, job: dict) -> bool:
     charged = False
     try:
         raw = get_full_output(m) if m.get("provider") == "codex" else None
-        wire = bounded_input_query(f"/terminals/{m['terminal_id']}/input", {"message": job["text"]})["message"]
+        wire = bounded_input_query(f"/terminals/{m['terminal_id']}/input", {"message": delivery_text(job)})["message"]
         m["input_wire_chars"] = len(wire)
         if m.get("provider") == "hermes":
             snapshot_hermes_reply(m, job)
@@ -1194,7 +1290,7 @@ def get_reply(m: dict) -> str:
             raise ReplyExtractionError()
         if m.get("provider") == "antigravity_cli" and m.get("active_delivery"):
             job = m["active_delivery"]
-            wire = (bounded_input_query(f"/terminals/{tid}/input", {"message": job["text"]})["message"]
+            wire = (bounded_input_query(f"/terminals/{tid}/input", {"message": delivery_text(job)})["message"]
                     if "input_wire_chars" in m else job["text"])
             text = strip_gemini_echo(clean_output(text), wire)
         with lock:
@@ -1246,9 +1342,11 @@ def handle_reply(g: dict, m: dict, text: str) -> None:
         add_msg(g, "agent", m["name"], shown, mid=m["id"], full_text=text)
     for line in re.findall(r"^[^\S\r\n]*\[日志\][^\S\r\n]*(\S[^\r\n]*)\r?$", text, flags=re.M):
         append_log(g, m["name"], line)
+    if not relay_allowed(g, text):
+        return
     if targets and hops < relay_limit:
         for t in targets:
-            send_to(g, t, f"[来自 {m['name']}] {text}", hops + 1)
+            send_to(g, t, f"[来自 {m['name']}] {text}", hops + 1, sender_id=m["id"])
     elif targets:
         add_msg(g, "system", "系统",
                 f"已达到自动转发上限（{relay_limit} 次），请群主决定下一步。", log=False)
@@ -1471,6 +1569,17 @@ def create_group(body: dict) -> dict:
     return g
 
 
+def deliver_owner(g: dict, m: dict, delivery_id: str) -> None:
+    with delivery_lock(g, m):
+        with lock:
+            queued = any(job["id"] == delivery_id for job in m.get("outbox", []))
+            if (queued and m.get("pending") and m.get("status") == "waiting_user_answer"
+                    and not quota_waiting(g, m)):
+                m.update(active_delivery=None, pending=False, delivery_state="waiting_ready")
+                save_state()
+        flush_outbox(g, m)
+
+
 def post_message(g: dict, text: str) -> dict:
     text = text.strip()
     if not text:
@@ -1478,12 +1587,27 @@ def post_message(g: dict, text: str) -> dict:
     targets = find_mentions(g, text)
     if re.search(r"@(所有人|all)\b", text, flags=re.I) or not targets:
         targets = list(g["members"])
+    jobs = []
     with lock:
+        # Register every recipient before releasing the relay circuit or launching I/O.
+        for target in targets:
+            job = new_delivery(f"[群主] {text}", 0)
+            job["origin"] = "owner"
+            target.setdefault("outbox", []).append(job)
+            compact_outbox(g, target)
+            if not target.get("active_delivery") and target.get("delivery_state") not in ("not_ready", "budget_paused"):
+                target["delivery_state"] = "waiting_ready"
+            jobs.append((target, job["id"]))
+        was_paused = g.get("relay_control", {}).get("paused", False)
+        g["relay_control"] = {"paused": False, "events": []}
+        if was_paused:
+            add_msg(g, "system", "系统", "群主已发新指令，自动转发已恢复。", log=False)
+            append_log(g, "系统", "relay_action=circuit_resume")
         if "automation_state" in g:
             g["automation_state"].update(awaiting_owner=False, idle_since=None)
         msg = add_msg(g, "owner", "群主", text, to=[t["name"] for t in targets])
-    for t in targets:
-        run_bg(send_to, g, t, f"[群主] {text}", 0)
+    for target, delivery_id in jobs:
+        run_bg(deliver_owner, g, target, delivery_id)
     return msg
 
 
@@ -1901,13 +2025,14 @@ def quota_continue(g: dict, m: dict, terminal: dict) -> bool:
                 "额度已恢复，请从中断处继续刚才的任务，完成后按规则在末行写状态。")
         continuation = new_delivery(text, job["hops"], job["silent"])
         continuation.update(id=token, quota_continuation=True)
-        m.setdefault("outbox", []).insert(0, continuation)
-        m.update(quota_continuation_token=token, active_delivery=None, pending=False,
-                 delivery_state="waiting_ready", ready_terminal=None)
-        m.pop("ready_candidate", None)
-        m.pop("quota_interrupted_delivery", None)
-        m.pop("quota_interrupted_attempt", None)
-        save_state()
+        with lock:
+            m.setdefault("outbox", []).insert(0, continuation)
+            m.update(quota_continuation_token=token, active_delivery=None, pending=False,
+                     delivery_state="waiting_ready", ready_terminal=None)
+            m.pop("ready_candidate", None)
+            m.pop("quota_interrupted_delivery", None)
+            m.pop("quota_interrupted_attempt", None)
+            save_state()
     flush_outbox(g, m, terminal)
     return True
 
@@ -2099,6 +2224,8 @@ def reply_work_state(text: str) -> str:
 
 
 def idle_coordinator(g: dict, settings: dict) -> dict | None:
+    if g.get("relay_control", {}).get("paused"):
+        return None
     if g.get("automation_state", {}).get("awaiting_owner"):
         return None
     members = [m for m in g["members"] if not quota_waiting(g, m) and not
